@@ -1,0 +1,148 @@
+From cc5680a4a813653524454bbad980b9cfa87cffd3 Mon Sep 17 00:00:00 2001
+From: duck-brain <duck-brain@localhost>
+Date: Sun, 8 Nov 2026 16:11:39 +0000
+Subject: [PATCH] duck-brain P27: FallSafe ending off the floor relaxes the
+ duck, not stand-up
+
+Alex's bench of 08.11: grabbed sharply while walking (20 deg, 327 deg/s), the
+duck took the grab for a fall, held FallSafe for 2 s in the hand, and was
+handed to the stand-up network there - the pick-up classifier runs on
+walking only. At the end of FallSafe the trunk height above its lowest
+sole along gravity tells the two apart: lying after the real falls of that
+day read 42-43 mm (26-62 at HOME on any side, 45-48 on rollers, per the
+stance model), held at 40 deg 130 mm (103-127 at HOME), standing >= 105. So a
+duck neither standing nor lower than 85 mm is relaxed in that tick, as for
+a pick-up (P26), and nothing stands it up: Options does.
+---
+ robotd/src/control.rs | 51 +++++++++++++++++++++++++++++++++++++++++++
+ robotd/src/main.rs    | 17 +++++++++++++++
+ 2 files changed, 68 insertions(+)
+
+diff --git a/robotd/src/control.rs b/robotd/src/control.rs
+index 070c434..140a64c 100644
+--- a/robotd/src/control.rs
++++ b/robotd/src/control.rs
+@@ -152,6 +152,12 @@ const STAND_HEIGHT_ROLLERS_M: f64 = 0.127;
+ const STAND_HOLD_S: f64 = 0.5;
+ /// The skill that is FallSafe.
+ pub const FALLSAFE_SKILL: &str = "fallsafe";
++/// After FallSafe, a trunk higher than this above its lowest sole or tyre (along gravity) is not
++/// lying on the floor — somebody is holding the duck — and it is relaxed rather than stood up in
++/// the hand (duck-brain P27). Lying is low whatever the side: 26–62 mm at HOME on its front, back
++/// or sides (45–48 on rollers; `stance::trunk_height`), 42–43 mm measured after real falls on
++/// 08.11; held at 40° it read 130 mm (103–127 at HOME), and standing is ≥ 105.
++const LYING_MAX_HEIGHT_M: f64 = 0.085;
+ /// On rollers, the skill that brakes (P5 set, 22.10, Alex's rule): "stop" brakes only a robot that is
+ /// rolling, `cmd[0] = ±0.3` by the sign of its speed, for the skill's `duration`; then — and for a
+ /// robot that was not rolling — the ride with a zero command, which stands on both skates. A speed
+@@ -331,6 +337,8 @@ pub struct Controller {
+     /// The `brake` skill's index on rollers, and where the robot is between riding and stopping.
+     brake: Option<usize>,
+     roll: Roll,
++    /// FallSafe ended with the duck neither standing nor lying (P27): the loop relaxes it.
++    held_after_fall: bool,
+ }
+ 
+ impl Controller {
+@@ -373,6 +381,7 @@ impl Controller {
+             feet: duck_control::stance::Feet::Legs,
+             brake: None,
+             roll: Roll::Stopped,
++            held_after_fall: false,
+         }
+     }
+ 
+@@ -397,6 +406,11 @@ impl Controller {
+         self.fall_chain.is_some()
+     }
+ 
++    /// FallSafe ended off the floor this step (P27): the loop is to relax the duck. Once.
++    pub fn take_held_after_fall(&mut self) -> bool {
++        std::mem::take(&mut self.held_after_fall)
++    }
++
+     /// Plain walking or riding on the main network: no skill, no fall chain step, no sit, no pick
+     /// (duck-brain P25 — when the lift rule may look at the legs' load).
+     pub fn walking_plain(&self) -> bool {
+@@ -447,6 +461,15 @@ impl Controller {
+                 tracing::info!(tilt_deg = tilt.to_degrees(), height_mm = height * 1000.0, "fallsafe done, standing: walk");
+                 Recovery::Off
+             }
++            Recovery::FallSafe if height > LYING_MAX_HEIGHT_M => {
++                tracing::warn!(
++                    tilt_deg = tilt.to_degrees(),
++                    height_mm = height * 1000.0,
++                    "fallsafe done, not on the floor — held? relax, not getting up"
++                );
++                self.held_after_fall = true;
++                Recovery::Off
++            }
+             Recovery::FallSafe => {
+                 tracing::info!(tilt_deg = tilt.to_degrees(), height_mm = height * 1000.0, "fallsafe done: getting up");
+                 Recovery::StandUp { steady: 0.0 }
+@@ -1386,6 +1409,34 @@ mod tests {
+         assert!(duck_control::stance::trunk_height(&low, &[0.0, 0.0, -1.0], duck_control::stance::Feet::Legs) < 0.105);
+     }
+ 
++    /// P27: FallSafe triggered by a grab (tilting fast at 20°), its 2 s spent in the hand at 40° —
++    /// the trunk well above its soles — ends in a relax, not the stand-up; lying, as in the test
++    /// above, still gets up. Alex's bench of 08.11: held, 130 mm at 40°; lying, 42–43 mm.
++    #[test]
++    #[ignore = "requires ONNX Runtime >= 1.23 and DUCK_BRAIN_POLICIES"]
++    fn duck_brain_p5_held_after_fallsafe_is_not_stood_up() {
++        let mut c = p5_chain();
++        let home = c.home();
++        let go = Command::default();
++        c.step(&at(home, 0.0, 0.0), &go, false, 0.02, 1.0).unwrap();
++        // 20° at 327°/s, as the grab on 08.11 read.
++        let grab = c.step(&at(home, 20.0, 327f64.to_radians()), &go, false, 0.02, 1.0).unwrap();
++        assert_eq!(grab.label, FALLSAFE_SKILL);
++        let held = at(home, 40.0, 0.0);
++        assert!(duck_control::stance::trunk_height(&home, &held.imu.gravity, duck_control::stance::Feet::Legs) > LYING_MAX_HEIGHT_M);
++        let mut labels = Vec::new();
++        let mut relaxed_at = None;
++        for k in 0..110 {
++            labels.push(c.step(&held, &go, false, 0.02, 1.0).unwrap().label.into_owned());
++            if c.take_held_after_fall() {
++                relaxed_at.get_or_insert(k);
++            }
++        }
++        assert!(relaxed_at.is_some_and(|k| (95..=101).contains(&k)), "{relaxed_at:?}: once FallSafe's 2 s are over");
++        assert!(!labels.iter().any(|l| l == "standup"), "never stood up in the hand: {labels:?}");
++        assert!(!c.take_held_after_fall(), "said once");
++    }
++
+     /// P18: a P5 network and one without a runtime manifest (`[feetech]`'s P/D) in one set is refused
+     /// at load, naming the file. No 32/40 network is left (22.10), so the second is the walk itself,
+     /// copied where its manifest is not.
+diff --git a/robotd/src/main.rs b/robotd/src/main.rs
+index e7c1069..b4c8445 100644
+--- a/robotd/src/main.rs
++++ b/robotd/src/main.rs
+@@ -4040,6 +4040,23 @@ async fn control_loop<T: RobotIo>(
+             ),
+             _ => (hold, policy_cfg.gain, false, "held".into()),
+         };
++        // duck-brain P27: FallSafe ended with the duck held off the floor — relax it now, before
++        // anything is written, as for a pick-up (P26): what this step commanded reaches no servo.
++        if controller.as_mut().is_some_and(Controller::take_held_after_fall) {
++            intents.request_relax();
++            let _ = intents.take_power_request();
++            match safety.set_torque(false) {
++                Ok(()) => {
++                    tracing::warn!("robot.relax: torque off (held after a fall)");
++                    bringup = Bringup::Limp;
++                    was_driving = false;
++                    if let Some(controller) = controller.as_mut() {
++                        controller.forget();
++                    }
++                }
++                Err(e) => tracing::error!(error = %e, "held after a fall: torque off did not take everywhere"),
++            }
++        }
+         state.moving.store(moving, Ordering::Relaxed);
+ 
+         // The theremin: a hand's distance in front of the beak, turned into a note and a
+-- 
+2.43.0
+

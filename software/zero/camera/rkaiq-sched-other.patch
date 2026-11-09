@@ -1,0 +1,96 @@
+--- a/CMakeLists.txt	2026-11-08 15:33:21.624526700 +0500
++++ b/CMakeLists.txt	2026-11-08 17:13:02.878700416 +0500
+@@ -13,12 +13,12 @@
+     set(AIQ_DIR ${PROJECT_SOURCE_DIR}/rkaiq)
+     message(WARNING "use rkaiq dir:${PROJECT_SOURCE_DIR}/rkaiq")
+ endif()
+-add_subdirectory(rkisp_demo)
+-add_subdirectory(IspFec)
+-add_subdirectory(smart_ir)
+-add_subdirectory(media_enquiry)
+-add_subdirectory(rk_stream)
+-add_subdirectory(rkaiq_tool_server)
++#add_subdirectory(rkisp_demo)
++#add_subdirectory(IspFec)
++#add_subdirectory(smart_ir)
++#add_subdirectory(media_enquiry)
++#add_subdirectory(rk_stream)
++#add_subdirectory(rkaiq_tool_server)
+ #add_subdirectory(rkisp_parser_demo)
+ if(EXISTS ${PROJECT_SOURCE_DIR}/rkaiq_3A_server)
+     add_subdirectory(rkaiq_3A_server)
+--- a/rkaiq/cmake/CompileOptions.cmake	2026-11-08 15:33:22.375961200 +0500
++++ b/rkaiq/cmake/CompileOptions.cmake	2026-11-08 17:13:02.876764259 +0500
+@@ -1,10 +1,10 @@
+-set(CMAKE_C_FLAGS                  "${CMAKE_C_FLAGS} -Wall -Wextra -Werror -fPIC")
++set(CMAKE_C_FLAGS                  "${CMAKE_C_FLAGS} -Wall -Wextra -fPIC")
+ set(CMAKE_C_FLAGS_DEBUG          "-O0 -g -gdwarf -fexceptions -funwind-tables")
+ set(CMAKE_C_FLAGS_MINSIZEREL     "-Os -DNDEBUG")
+ set(CMAKE_C_FLAGS_RELEASE        "-O4 -DNDEBUG")
+ set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g -gdwarf -fexceptions -funwind-tables")
+ 
+-set(CMAKE_CXX_FLAGS                "${CMAKE_CXX_FLAGS} -Wall -Wextra -Werror -fPIC")
++set(CMAKE_CXX_FLAGS                "${CMAKE_CXX_FLAGS} -Wall -Wextra -fPIC")
+ set(CMAKE_CXX_FLAGS_DEBUG          "-O0 -g -gdwarf -fexceptions -funwind-tables")
+ set(CMAKE_CXX_FLAGS_MINSIZEREL     "-Os -DNDEBUG")
+ set(CMAKE_CXX_FLAGS_RELEASE        "-O4 -DNDEBUG")
+--- a/rkaiq/hwi/isp20/RawStreamProcUnit.cpp	2026-11-08 15:33:22.398602100 +0500
++++ b/rkaiq/hwi/isp20/RawStreamProcUnit.cpp	2026-11-08 17:30:19.041809078 +0500
+@@ -103,7 +103,7 @@
+     _isp_hdr_fid2ready_map.clear();
+     _buf_mutex.unlock();
+ 
+-    _raw_proc_thread->set_policy(SCHED_RR);
++    _raw_proc_thread->set_policy(SCHED_OTHER)  /* no RT: CONFIG_RT_GROUP_SCHED */;
+     _raw_proc_thread->set_priority(20);
+     _raw_proc_thread->start();
+     return XCAM_RETURN_NO_ERROR;
+--- a/rkaiq/hwi/isp20/Stream.cpp	2026-11-08 15:33:22.398602100 +0500
++++ b/rkaiq/hwi/isp20/Stream.cpp	2026-11-08 17:30:19.040586209 +0500
+@@ -388,7 +388,7 @@
+     if (_dev_type == ISP_POLL_3A_STATS || \
+         _dev_type == ISP_POLL_TX || \
+         _dev_type == ISP_POLL_RX) {
+-        _poll_thread->set_policy(SCHED_RR);
++        _poll_thread->set_policy(SCHED_OTHER)  /* no RT: CONFIG_RT_GROUP_SCHED */;
+         _poll_thread->set_priority(20);
+     }
+     _poll_thread->start();
+@@ -401,7 +401,7 @@
+     if (_dev_type == ISP_POLL_3A_STATS || \
+         _dev_type == ISP_POLL_TX || \
+         _dev_type == ISP_POLL_RX) {
+-        _poll_thread->set_policy(SCHED_RR);
++        _poll_thread->set_policy(SCHED_OTHER)  /* no RT: CONFIG_RT_GROUP_SCHED */;
+         _poll_thread->set_priority(20);
+     }
+     _poll_thread->start();
+--- a/rkaiq/hwi_c/aiq_rawStreamProcUnit.c	2026-11-08 15:33:22.410143500 +0500
++++ b/rkaiq/hwi_c/aiq_rawStreamProcUnit.c	2026-11-08 17:30:32.300812264 +0500
+@@ -308,7 +308,7 @@
+ #endif
+ 
+     pRawStrProcUnit->_raw_proc_thread = aiqThread_init("RawProc", raw_buffer_proc, pRawStrProcUnit);
+-    aiqThread_setPolicy(pRawStrProcUnit->_raw_proc_thread, SCHED_RR);
++    aiqThread_setPolicy(pRawStrProcUnit->_raw_proc_thread, SCHED_OTHER); /* no RT: CONFIG_RT_GROUP_SCHED */
+     aiqThread_setPriority(pRawStrProcUnit->_raw_proc_thread, 20);
+ 
+     aiqMutex_init(&pRawStrProcUnit->_buf_mutex);
+--- a/rkaiq/hwi_c/aiq_stream.c	2026-11-08 15:33:22.411149800 +0500
++++ b/rkaiq/hwi_c/aiq_stream.c	2026-11-08 17:30:32.301140939 +0500
+@@ -421,7 +421,7 @@
+     AiqPollThread_setCamPhyId(pStream->_poll_thread, pStream->mCamPhyId);
+     if (pStream->_dev_type == ISP_POLL_3A_STATS || pStream->_dev_type == ISP_POLL_TX ||
+         pStream->_dev_type == ISP_POLL_RX) {
+-        aiqThread_setPolicy(pStream->_poll_thread->_thread, SCHED_RR);
++        aiqThread_setPolicy(pStream->_poll_thread->_thread, SCHED_OTHER); /* no RT: CONFIG_RT_GROUP_SCHED */
+         aiqThread_setPriority(pStream->_poll_thread->_thread, 20);
+     }
+     pStream->_poll_thread->start(pStream->_poll_thread);
+--- a/rkaiq/ipc_server/MessageParser.cpp	2026-11-08 15:33:22.512895400 +0500
++++ b/rkaiq/ipc_server/MessageParser.cpp	2026-11-08 17:13:02.881574203 +0500
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ /*
+  * Copyright (c) 2019-2021 Rockchip Eletronics Co., Ltd.
+  *

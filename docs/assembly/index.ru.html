@@ -1,0 +1,575 @@
+<meta charset="utf-8">
+<title>Сборка Microduck</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: workshop manual — sticky 3D bench on the left, step sheet on the right; stacks on phones */
+:root{
+  --bg:#f3f4f2; --panel:#ffffff; --ink:#1d2321; --muted:#5d6763; --line:#d7dcd9;
+  --accent:#e2731e; --accent-ink:#9a4708; --warn-bg:#fff3df; --warn-line:#e7b45c; --ok:#2f7d5b;
+  --viewer:#e6e9e7; --chip:#eef0ee;
+  --f-display:"Barlow Condensed","Arial Narrow",Arial,sans-serif;
+  --f-body:"IBM Plex Sans","Segoe UI",Roboto,Arial,sans-serif;
+  --f-mono:"IBM Plex Mono",Consolas,"Courier New",monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#151917; --panel:#1d2220; --ink:#e7ebe9; --muted:#9aa5a0; --line:#2f3633;
+  --accent:#f08a3a; --accent-ink:#f7b27a; --warn-bg:#2d2518; --warn-line:#8a6a2c; --ok:#5fbf92;
+  --viewer:#232927; --chip:#262d2a; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#151917; --panel:#1d2220; --ink:#e7ebe9; --muted:#9aa5a0; --line:#2f3633;
+  --accent:#f08a3a; --accent-ink:#f7b27a; --warn-bg:#2d2518; --warn-line:#8a6a2c; --ok:#5fbf92;
+  --viewer:#232927; --chip:#262d2a; color-scheme:dark}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{background:var(--bg);color:var(--ink);font-family:var(--f-body);font-size:15px;line-height:1.5}
+.wrap{max-width:1280px;margin:0 auto;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:20px 48px}
+h1,h2,h3{font-family:var(--f-display);font-weight:600;letter-spacing:.01em;text-wrap:balance;margin:0}
+h1{font-size:2.4rem;line-height:1.05}
+h2{font-size:1.6rem}
+h3{font-size:1.25rem}
+.lede{color:var(--muted);max-width:68ch;margin:.4rem 0 0}
+.mono{font-family:var(--f-mono)}
+header.top{display:flex;flex-wrap:wrap;gap:12px 24px;align-items:flex-end;justify-content:space-between;border-bottom:2px solid var(--ink);padding-bottom:12px}
+.meta{font-family:var(--f-mono);font-size:.78rem;color:var(--muted)}
+nav.phases{display:flex;flex-wrap:wrap;gap:6px;margin:16px 0}
+nav.phases button{font:600 1rem var(--f-display);letter-spacing:.03em;text-transform:uppercase;background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:6px 12px;cursor:pointer}
+nav.phases button[aria-current="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+nav.phases button:focus-visible,.stepnav button:focus-visible,.steplist button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.bench{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);gap:20px;align-items:start}
+@media (max-width:860px){.bench{grid-template-columns:minmax(0,1fr)}}
+.viewer{position:sticky;top:calc(env(safe-area-inset-top,0px) + 8px);background:var(--viewer);border:1px solid var(--line);border-radius:6px;overflow:hidden}
+@media (max-width:860px){.viewer{position:relative;top:0}}
+#gl{display:block;width:100%;aspect-ratio:4/3.2;max-width:100%;touch-action:none}
+.vbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between;padding:8px 10px;border-top:1px solid var(--line);background:var(--panel);font-size:.82rem}
+.legend{display:flex;gap:12px;flex-wrap:wrap;color:var(--muted)}
+.sw{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:-1px;margin-right:4px}
+.vbar button{font:500 .8rem var(--f-body);background:var(--chip);color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:4px 9px;cursor:pointer}
+#tip{position:absolute;pointer-events:none;background:var(--ink);color:var(--bg);font:500 .75rem var(--f-mono);padding:3px 6px;border-radius:3px;white-space:nowrap}
+.lab{position:absolute;left:0;top:0;pointer-events:none;transform:translate(-50%,-50%);background:var(--panel);color:var(--ink);border-left:5px solid;font:600 .8rem var(--f-body);padding:2px 7px;border-radius:3px;white-space:nowrap;box-shadow:0 1px 3px #0006}
+#loading{position:absolute;inset:0;display:grid;place-items:center;color:var(--muted);font-family:var(--f-mono);font-size:.85rem}
+.sheet{display:flex;flex-direction:column;gap:14px;min-width:0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:16px 18px}
+.stephead{display:flex;gap:14px;align-items:baseline}
+.stepno{font:700 2.6rem/1 var(--f-display);color:var(--accent)}
+.stepnav{display:flex;gap:8px;justify-content:space-between}
+.stepnav button{font:600 .95rem var(--f-display);letter-spacing:.03em;text-transform:uppercase;background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:8px 14px;cursor:pointer;flex:1}
+.stepnav button:disabled{opacity:.4;cursor:default}
+.body p{margin:.5rem 0;max-width:68ch}
+.body ol{margin:.5rem 0;padding-left:1.3rem}
+.body li{margin:.25rem 0}
+.side{font-size:.85rem;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.86rem}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font:600 .72rem var(--f-body);text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+td.n{font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+.tscroll{overflow-x:auto}
+.spec{font-family:var(--f-mono);font-weight:500;white-space:nowrap}
+.warn{background:var(--warn-bg);border:1px solid var(--warn-line);border-radius:5px;padding:9px 12px;font-size:.88rem}
+.warn b{color:var(--accent-ink)}
+.src{font-family:var(--f-mono);font-size:.72rem;color:var(--muted);word-break:break-all}
+.steplist{display:flex;flex-direction:column;gap:2px;max-height:none}
+.steplist button{display:flex;gap:10px;align-items:baseline;text-align:left;background:none;border:0;border-radius:4px;padding:5px 8px;color:var(--ink);font:400 .88rem var(--f-body);cursor:pointer}
+.steplist button span.k{font-family:var(--f-mono);color:var(--muted);min-width:2.2em}
+.steplist button[aria-current="true"]{background:var(--chip);font-weight:600}
+section.ref{margin-top:36px;display:flex;flex-direction:column;gap:16px}
+section.ref{display:none}body.tables section.ref{display:flex;margin-top:20px}body.tables .lcol{display:none}.pgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr));gap:16px;align-items:start}.pgrid .tscroll{margin-top:0}.pgrid.stack{grid-template-columns:minmax(0,1fr)}.lcol{display:flex;flex-direction:column;gap:20px;min-width:0}body.tables .bench{grid-template-columns:minmax(0,1fr)}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,380px),1fr));gap:16px}
+.q li{margin:.35rem 0}
+@media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
+</style>
+
+<div class="wrap">
+  <header class="top">
+    <div>
+      <h1>Сборка Microduck</h1>
+      <p class="lede">Пошаговая сборка утки на сервах HD-1910.</p>
+    </div>
+    
+  </header>
+
+  <nav class="phases" id="phases" aria-label="Фазы сборки"></nav>
+
+  <div class="bench">
+    <div class="lcol">
+    <div class="viewer" id="viewer">
+      <canvas id="gl" aria-label="3D-модель шага"></canvas>
+      <div id="loading">Загружаю модель…</div>
+      <div id="labs"></div>
+      <div id="tip" hidden></div>
+      <div class="vbar">
+        <div class="legend"><span><i class="sw" style="background:var(--accent)"></i>ставим сейчас</span><span><i class="sw" style="background:#9aa3a0"></i>уже собрано</span><span id="sclegend" style="display:contents"></span></div>
+        <div style="display:flex;gap:6px"><button id="replay" type="button">Повторить</button><button id="fit" type="button">Вписать</button><button id="ctx" type="button" aria-pressed="true">Окружение</button></div>
+      </div>
+    </div>
+
+    <div class="card" id="partscard" hidden></div>
+    </div>
+
+    <div class="sheet">
+      <div class="card" id="stepcard" aria-live="polite"></div>
+      <div class="card" id="imgcard" hidden></div>
+      <div class="stepnav"><button id="prev" type="button">← Назад</button><button id="next" type="button">Дальше →</button></div>
+      <div class="card"><h3 id="phtitle">Шаги фазы</h3><div class="steplist" id="steplist"></div></div>
+    </div>
+  </div>
+
+  <section class="ref" id="ref">
+    <div class="grid2">
+      <div class="card"><h2>Крепёж на всю утку</h2><p class="side">Сумма по шагам; шаги ног и роликов посчитаны на две стороны. Цвет — как у винтов на 3D-сцене.</p><div class="tscroll"><table id="fasttbl"></table></div></div>
+      <div class="card"><h2>Подшипники и покупное</h2><div class="tscroll"><table id="buytbl"></table></div></div>
+    </div>
+    <div class="grid2">
+      <div class="card"><h2>Сервы: ID и место</h2><div class="tscroll"><table id="servotbl"></table></div><p class="side">Середина 2048 — качалка выровнена по калибровочной пластине (hardware/servo_setup.md).</p></div>
+      <div class="card"><h2>Кабели шины</h2><div class="tscroll"><table id="cabletbl"></table></div><p class="side">9 кабелей 15 см — из коробок серв, остальные — по списку закупки (hardware/cables.md).</p></div>
+    </div>
+    <div class="card"><h2>Печатные детали в сборке</h2><div class="tscroll"><table id="printtbl"></table></div></div>
+  </section>
+</div>
+
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+<script type="module">
+import * as THREE from 'three';
+import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+
+/* ---------- parts (instance keys from main.step / roller.step) ---------- */
+const S={yawL:'hd1910_servo_simplified#13',yawR:'hd1910_servo_simplified#12',rollL:'hd1910_servo_simplified#14',rollR:'hd1910_servo_simplified#8',
+ pitchL:'hd1910_servo_simplified#5',pitchR:'hd1910_servo_simplified#15',kneeL:'hd1910_servo_simplified#7',kneeR:'hd1910_servo_simplified#2',
+ ankL:'hd1910_servo_simplified#9',ankR:'hd1910_servo_simplified#3',s069:'hd1910_servo_simplified#4',s049:'hd1910_servo_simplified#1',
+ s035:'hd1910_servo_simplified#10',s040:'hd1910_servo_simplified#6',s005:'hd1910_servo_simplified#11'};
+const B={yawL:'bearing_22x16x4_simplified#11',yawR:'bearing_22x16x4_simplified#8',rollL:'bearing_22x16x4_simplified#3',rollR:'bearing_22x16x4_simplified#4',
+ pitchL:'bearing_22x16x4_simplified#6',pitchR:'bearing_22x16x4_simplified#5',kneeL:'bearing_22x16x4_simplified#7',kneeR:'bearing_22x16x4_simplified#10',
+ b012:'bearing_22x16x4_simplified#1',b003:'bearing_22x16x4_simplified#2',b014:'bearing_22x16x4_simplified#9',
+ ankL:'bearing_15x10x3_simplified#3',ankR:'bearing_15x10x3_simplified#1',b050:'bearing_15x10x3_simplified#2'};
+const L={leg:'leg#1',axle:'ankle_axle#2',ankle:'ankle_left#1',foot:'foot_left#1',sole:'sole_left#1',upper:'upper_leg_left#1',plate:'rigidity_plate#2',
+ hip:'hip#2',y2r:'yaw2roll#2',broll:'bearing_roll#2'};
+const R={roller:'R:roller#1',rimA:'R:rim#2',rimB:'R:rim#3',tireA:'R:tire#4',tireB:'R:tire#1',bushA:'R:bushing#1',bushB:'R:bushing#4',
+ brg:['R:bearing_12x6x4_simplified#1','R:bearing_12x6x4_simplified#2','R:bearing_12x6x4_simplified#3','R:bearing_12x6x4_simplified#4']};
+const trunkCore=[S.yawL,S.yawR,'trunk_base#1','power_support#1','power_board_simplified#1','imu_lsm6dsv16x_module_simplified#1'];
+const neckSet=[S.s069,S.s049,'neck#1','neck#2'];
+const thighL=[S.pitchL,S.kneeL,L.upper,L.plate,B.kneeL];
+const shinL=[S.ankL,L.leg,L.ankle,L.axle,B.ankL,L.foot,L.sole];
+const legL=[...thighL,...shinL,L.hip,B.pitchL,B.rollL];
+const labThigh=[{k:S.pitchL,t:'Бедро: 22 (правая нога 12)',c:'#2f7fc1'},{k:S.kneeL,t:'Колено: 23 (правая нога 13)',c:'#2f9e6e'}];
+const headBase=['bottom_head_shell#1',S.s040,S.s005,B.b003,B.b014,B.b050];
+
+/* ---------- steps ---------- */
+/* f: fasteners {s:spec, k:kind, n:count per side/once, w:where}; x2: leg/roller step repeated for the right side */
+const PHASES=[
+{id:'prep',name:'Подготовка',steps:[
+ {t:'Что понадобится',tables:true,show:[],ctx:[],
+  p:['Крепёж на всю утку, подшипники и покупное, сервы, кабели шины, пины Zero 3W и печатные детали — в таблицах ниже.'],
+  f:[]},
+ {t:'UC-01: пайка',img:[{t:'Вилки на UC-01',src:'img/uc01_plugs.ru.png'}],buy:[['Гребёнка угловая 2.54 мм',1],['Вилка AMP 2.0-3P',2]],show:['uc01_simple#1'],ctx:[],
+  p:['На UC-01 выпаяй заводские разъёмы серв и прямую гребёнку. Впаяй угловую гребёнку и две вилки AMP 2.0-3P открытой частью вилки к ближнему краю платы.'],
+  f:[]},
+ {t:'Сервы: ID, ноль, задние качалки',parts:[['Серва HD-1910',15],['UC-01',1],['calibration_plate',1]],show:[S.yawL],ctx:[],
+  p:['Настрой каждую серву по hardware/servo_setup.md: ID, ноль по калибровочной пластине cad/calibration_plate.step. Новые сервы отвечают с ID 1 — подключай их по одной.',
+     'ID. Левая нога: 20 рыскание бедра, 21 крен бедра, 22 тангаж бедра, 23 колено, 24 голеностоп. Правая нога: 10, 11, 12, 13, 14 в том же порядке. Шея и голова: 30 тангаж шеи, 31 тангаж головы, 32 рыскание головы, 33 крен головы, 34 клюв.',
+     'Подпиши на каждой серве её ID.',
+     'Сними задние пассивные качалки у серв 10–14, 20–24, 32, 33 и 34. Задние диски оставь у серв 30 и 31: в них идут винты.',
+     ],
+  f:[]},
+ {t:'Термовставки: стопы',show:['foot_left#1','foot_right#1'],ctx:[],ins:['toe'],insMirror:[['foot_left#1','foot_right#1']],
+  p:['Вставки вплавляются до сборки, вровень с гранью детали. Места вставок на сцене отмечены жёлтыми цилиндрами.',
+     'Стопа: 1 вставка M2×4×Ø3 в носок, на каждую стопу.'],
+  f:[{s:'вставка M2×4×Ø3',n:2,w:'носки стоп'}]},
+ {t:'Термовставки: top_head_shell',show:['top_head_shell#1'],ctx:[],ins:['headjoin','uc01'],
+  p:['top_head_shell: 3 вставки M2×4×Ø3 в бобышки и 2 в стойки UC-01.'],
+  f:[{s:'вставка M2×4×Ø3',n:5,w:'бобышки 3, стойки UC-01 2'}]},
+ {t:'Термовставки: face_part',show:['face_part#1'],ctx:[],ins:['zero','cam','tof'],
+  p:['face_part: 4 вставки M2×4×Ø3 под стойки Zero 3W, 4 вставки M2×3×Ø3.2 под камеру и 2 под ToF.'],
+  f:[{s:'вставка M2×4×Ø3',n:4,w:'стойки Zero 3W'},{s:'вставка M2×3×Ø3.2',n:6,w:'камера 4, ToF 2'}]},
+ {t:'Термовставки: motor_support',show:['motor_support#1'],ctx:[],ins:['amp'],
+  p:['motor_support: 2 вставки M2×3×Ø3.2 под усилитель.'],
+  f:[{s:'вставка M2×3×Ø3.2',n:2,w:'усилитель'}]},
+ {t:'Термовставки: right_shell',show:['right_shell#1'],ctx:[],ins:['shelljoin'],
+  p:['right_shell: 1 вставка M2×3×Ø3.2 в стык половин.'],
+  f:[{s:'вставка M2×3×Ø3.2',n:1,w:'стык половин'}]},
+ {t:'Термовставки: ролики',x2:true,show:['R:roller#1'],ctx:[],ins:['rtoe'],
+  p:['Ролик: 1 вставка M2×4×Ø3 в носок, на каждый ролик.'],
+  f:[{s:'вставка M2×4×Ø3',n:1,w:'носок ролика'}]},
+ {t:'Стопа: подошва',show:['sole_left#1','sole_right#1'],ctx:['foot_left#1','foot_right#1'],
+  p:['Надень подошву sole на стопу foot.'],
+  f:[]},
+ {t:'PCB и контакты батареи',buy:[['Вилка AMP 2.0-3P',5],['Контакт батареи NP-F (с зарядного устройства)',2],['Провод 16 (18) AWG, 5 см',2],['Кабель 9 см с одной вилкой',1]],img:[{t:'Контакты вилок PCB',src:'img/pinout.ru.png'},{t:'Вилки на PCB, вид спереди',src:'img/pcb_3d.ru.png'}],show:['power_board_simplified#1'],ctx:['power_support#1'],
+  p:['Впаяй в PCB 5 вилок AMP 2.0-3P открытой частью к переду утки. Контакты вилок — на картинке hardware/power_board/pinout.ru.png.',
+     'Припаяй к двум контактам батареи NP-F провода 16 (18) AWG и вкрути контакты саморезами в power_support.',
+     'Возьми кабель 9 см с одной вилкой. Прозвони по вилке L PWR, какие провода V и G, а S отрежь. V и G припаяй к площадкам питания шеи; разъём потом уйдёт к серве 30.',
+     'Проверь мультиметром по схеме hardware/power_board/pinout.ru.png: нет замыкания между BAT+ и BAT−; на всех разъёмах + и − стоят по схеме; сигнальные контакты S не замкнуты ни на землю, ни на +, а между разъёмами сигнал прозванивается.',
+     'PCB пока отложи: она встанет вместе с power_support на винты M2×8 в фазе «Туловище».'],
+  f:[{s:'саморез Ø1.36×3.3',n:2,w:'контакты батареи'}]},
+]},
+{id:'legs',name:'Ноги',steps:[
+ {t:'Голень на серву голеностопа',buy:[['Кабель 15 см',1],['Кабель 20 см',1]],show:[L.leg],ctx:[S.ankL],x2:true,sc:['legback'],
+  p:['Ноги собираются снизу вверх. На сцене левая нога (сервы 24, 23, 22). Правая (14, 13, 12) — так же, только лодыжка и upper_leg зеркальные.',
+     'Подключи к серве голеностопа (левая нога 24, правая 14) два кабеля: 15 см и 20 см.',
+     'Приложи голень к задней стороне сервы голеностопа. Задняя бобышка сервы входит в круглое отверстие голени.',
+     'Оба провода уложи в зазор между голенью и крышкой сервы и вытяни через окно в leg.',
+     'Закрепи голень 2 винтами в задние отверстия корпуса.'],
+  f:[{s:'M2×8',n:2,w:'голень → задняя стенка сервы голеностопа'}]},
+ {t:'Лодыжка: подшипник',show:[B.ankL],ctx:[L.ankle],x2:true,
+  p:['Вставь подшипник 6700 10×15×3 в гнездо лодыжки снаружи.'],
+  f:[]},
+ {t:'Лодыжка на качалку голеностопа',show:[L.ankle,B.ankL],ctx:[S.ankL,L.leg],x2:true,sc:['ankhorn'],
+  p:['Подключи серву к UC-01, выставь в пульте серв середину (2048) и включи момент.',
+     'Заведи серву с голенью (левая нога 24, правая 14) между щёк лодыжки: качалка — к щеке с четырьмя отверстиями, задняя бобышка — к подшипнику.',
+     'Закрепи лодыжку 4 винтами в качалку. После этого серву можно отключить от UC-01.'],
+  f:[{s:'M2×6',n:4,w:'лодыжка → качалка голеностопа'}]},
+ {t:'Ось лодыжки',show:[L.axle],ctx:[L.ankle,B.ankL,S.ankL,L.leg],x2:true,sc:['axle'],
+  p:['Вставь ось ankle_axle снаружи через подшипник лодыжки и голень на заднюю бобышку сервы (левая нога 24, правая 14).',
+     'Закрепи ось саморезом по центру в заднюю бобышку сервы.'],
+  f:[{s:'M2.3×6 саморез',n:1,w:'ось → задняя бобышка сервы'}]},
+ {t:'Стопа на лодыжку',show:[L.foot,L.sole],ctx:[L.ankle,B.ankL,S.ankL,L.leg,L.axle],x2:true,sc:['toe'],
+  p:['Заведи пятку стопы на клин лодыжки, носок опусти на 5–10°, поверни вверх до места и затяни потайной винт в носке.'],
+  f:[{s:'M2×6 потай',n:1,w:'носок лодыжки → вставка стопы'}]},
+ {t:'Пластина жёсткости',buy:[['Кабель 6 см',1],['Кабель 15 см',1]],show:[S.pitchL,S.kneeL,L.plate],ctx:[],lab:labThigh,x2:true,sc:['plate'],
+  p:['Левая нога: сервы тангажа бедра 22 и колена 23. Правая нога: сервы тангажа бедра 12 и колена 13. Наложи rigidity_plate на их верхние крышки и закрепи 4 винтами в угловые отверстия корпусов.',
+     'Соедини кабелем 6 см сервы 22 и 23 (на правой ноге 12 и 13) и уложи провода.',
+     'Подключи новый кабель 15 см к серве 22 (на правой ноге 12).'],
+  f:[{s:'M2×6',n:4,w:'пластина → верхние крышки серв бедра и колена'}]},
+ {t:'Голень на колено',show:[...shinL,B.kneeL],ctx:[S.pitchL,S.kneeL,L.plate],lab:labThigh,x2:true,sc:['legknee'],
+  p:['Просунь кабель 15 см от узла из шага {#Стопа на лодыжку} в отверстие над сервой колена и подключи к серве колена: на левой ноге 23, на правой 13.',
+     'Надень подшипник колена MR2216-2RS 16×22×4 на бобышку колена собранной голени.',
+     'Подключи серву 22 к UC-01, выставь в пульте серв середину (2048) сервы 23 и включи на ней момент (на правой ноге 12 и 13).',
+     'Подведи голень к пластине так, чтобы наружное кольцо подшипника упёрлось в пластину, и закрепи голень 4 винтами в качалку сервы колена: на левой ноге 23, на правой 13.'],
+  f:[{s:'M2×6',n:4,w:'голень → качалка колена'}]},
+ {t:'hip на тангаж бедра',show:[L.hip,B.pitchL,B.rollL],ctx:[S.pitchL,S.kneeL,L.plate,B.kneeL,...shinL],lab:labThigh,x2:true,sc:['hippitch'],
+  p:['Запрессуй в hip два подшипника MR2216-2RS 16×22×4: тангажа бедра и крена.',
+     'Выставь в пульте серв середину (2048) сервы 22 и включи на ней момент (на правой ноге 12).',
+     'Закрепи hip 4 винтами на качалке сервы тангажа бедра: на левой ноге 22, на правой 12. После этого ногу можно отключить от UC-01.'],
+  f:[{s:'M2×6',n:4,w:'hip → качалка тангажа'}]},
+ {t:'Бедро: сервы в upper_leg',buy:[['Хомут нейлоновый',1]],show:[L.upper],ctx:[S.pitchL,S.kneeL,L.plate,B.kneeL,...shinL,L.hip,B.pitchL,B.rollL],lab:labThigh,x2:true,sc:['upper'],
+  p:['Вытяни провод от сервы 22 в отверстие над сервой 23 (на правой ноге 12 и 13).',
+     'Закрепи кабель 20 см от сервы 24 на краю отверстия над сервой 23 нейлоновым хомутом (на правой ноге 14 и 13).',
+     'Левая нога: сервы 22 и 23 с пластиной в upper_leg_left. Правая нога: сервы 12 и 13 с пластиной в upper_leg_right. Посади их задними сторонами на штифты и закрепи каждую саморезом в заднюю бобышку. Нога готова.'],
+  f:[{s:'M2.3×4 саморез',n:2,w:'upper_leg → задние бобышки серв (длиннее нельзя)'}]},
+]},
+{id:'trunk',name:'Туловище',steps:[
+ {t:'trunk_base на сервы рыскания',show:['trunk_base#1'],ctx:[S.yawL,S.yawR],sc:['tbout'],
+  p:['Поставь сервы рыскания качалками вниз: левая 20, правая 10.',
+     'Надень trunk_base на штифты и закрепи наружным винтом снизу в верхнюю крышку каждой сервы.',
+     'Внутренние отверстия пока пустые — в них встанут винты через нижние лапки power_support.'],
+  f:[{s:'M2×4',n:2,w:'trunk_base → серва рыскания, наружное (длиннее нельзя)'}]},
+ {t:'power_support и PCB',show:['power_support#1','power_board_simplified#1'],ctx:[S.yawL,S.yawR,'trunk_base#1'],sc:['tbin','psup'],
+  p:['Заведи нижние лапки power_support под пластину trunk_base и закрепи их винтами снизу через trunk_base в сервы рыскания.',
+     'Положи PCB на верхние лапки и прикрути её вместе с лапками в задние крышки серв рыскания. Головка винта — не больше Ø3.8.',
+     'Припаяй провода контактов батареи к BAT− (слева) и BAT+ (справа) PCB.'],
+  f:[{s:'M2×6',n:2,w:'trunk_base + нижняя лапка → серва рыскания'},{s:'M2×8',n:2,w:'PCB + верхняя лапка → задняя крышка сервы рыскания'}]},
+ {t:'IMU на power_support',buy:[['Гребёнка угловая 2.54 мм',1],['Провод Dupont 30 см',3],['Провод Dupont 34 см',1]],show:['imu_lsm6dsv16x_module_simplified#1'],ctx:['power_support#1','power_board_simplified#1','trunk_base#1',S.yawL,S.yawR],sc:['imu'],
+  p:['На модуле LSM6DSV16X поставь перемычки AD0→GND и CS→VCC и впаяй угловую гребёнку.',
+     'Подключи к гребёнке IMU 4 провода Dupont: VCC красный, SDA синий, SCL зелёный — по 30 см, GND чёрный — 34 см.',
+     'Закрепи модуль 2 потайными винтами на power_support, как на сцене. Затягивай до прилегания, не сильнее.',
+     'Просунь провода IMU в отверстие trunk_base.'],
+  f:[{s:'M2.5×6 потай',n:2,w:'IMU → power_support'}]},
+ {t:'yaw2roll на качалку рыскания',show:[L.y2r,B.yawL],ctx:[...trunkCore],x2:true,sc:['y2ryaw'],
+  p:['Надень подшипник MR2216-2RS 16×22×4 на бобышку yaw2roll.',
+     'Подключи серву рыскания (левая 20, правая 10) к UC-01, выставь в пульте серв середину (2048) и включи момент.',
+     'Закрепи yaw2roll на качалке сервы рыскания 4 винтами изнутри — пока серва крена не мешает. После этого серву можно отключить от UC-01.'],
+  f:[{s:'M2×4',n:4,w:'yaw2roll → качалка рыскания (длиннее нельзя)'}]},
+ {t:'Серва крена и bearing_roll',buy:[['Кабель 15 см',1]],show:[S.rollL,L.broll],ctx:[L.y2r,S.yawL,B.yawL],x2:true,sc:['y2rroll','brollservo','brolllug'],
+  p:['Вставь серву крена (левая 21, правая 11) задней бобышкой в yaw2roll и закрепи 2 винтами в заднюю крышку.',
+     'Поставь bearing_roll на штифты и закрепи: 2 винта в верхнюю крышку сервы крена, 2 в ушки yaw2roll.',
+     'Соедини кабелем 15 см серву рыскания с сервой крена: слева 20 и 21, справа 10 и 11.'],
+  f:[{s:'M2×4',n:2,w:'yaw2roll → задняя крышка сервы крена'},{s:'M2×4',n:2,w:'bearing_roll → верхняя крышка сервы крена'},{s:'M2×4',n:2,w:'bearing_roll → ушки yaw2roll (длиннее нельзя)'}]},
+ {t:'Нога на качалку крена',show:[...legL],ctx:[...trunkCore,L.y2r,S.rollL,L.broll,B.yawL],x2:true,sc:['hiproll'],
+  p:['Подключи серву крена (левая 21, правая 11) к UC-01, выставь в пульте серв середину (2048) и включи момент.',
+     'Закрепи собранную ногу: hip 4 винтами на качалке сервы крена. После этого серву можно отключить от UC-01.',
+     'Подключи кабель 15 см от сервы 22 к серве крена 21 (справа 12 и 11).',
+     'Просунь кабель 20 см от голеностопа в отверстие trunk_base и подключи к PCB: левой ноги в L PWR, правой в R PWR.'],
+  f:[{s:'M2×6',n:4,w:'hip → качалка крена'}]},
+ {t:'Провода внутри туловища',buy:[['Кабель 4 см',2]],show:['power_board_simplified#1',S.yawL,S.yawR],ctx:[...trunkCore,L.y2r,S.rollL,L.broll,B.yawL,...legL],
+  p:['Подключи к PCB: L → левая серва 20 (4 см), R → правая серва 10 (4 см). Кабель питания шеи выведи вверх к серве 30.'],
+  f:[]},
+ {t:'Оболочки туловища',show:['left_shell#1','right_shell#1'],ctx:[...trunkCore,L.y2r,S.rollL,L.broll,B.yawL,...legL],sc:['shellyaw','shellyaw2','shelljoin'],
+  p:['Прикрути бобышки оболочек к задним крышкам серв рыскания — отвёртка проходит через канал в оболочке.',
+     'Стяни половины винтом M2×8 во вставку right_shell.'],
+  f:[{s:'M2×6',n:2,w:'бобышки оболочек → сервы рыскания (длиннее нельзя)'},{s:'M2×8',n:1,w:'стык половин, во вставку'}]},
+]},
+{id:'neck',name:'Шея',steps:[
+ {t:'Шея: сервы 30 и 31 и пластины neck',buy:[['Кабель 4 см',1]],show:['neck#1','neck#2'],ctx:[S.s069,S.s049],sc:['neck1','neck2'],
+  p:['Поставь серву 31 над сервой 30 и свяжи их корпуса двумя пластинами neck, по 4 винта на пластину.',
+     'Соедини сервы 31 и 30 кабелем 4 см.'],
+  f:[{s:'M2×6',n:8,w:'neck → корпуса серв 30 и 31'}]},
+ {t:'neck_pitch на качалку 32',show:['bearing_neck#1',B.b012,'neck_pitch#1'],ctx:[S.s035],sc:['np035'],
+  p:['Поставь bearing_neck на верхнюю крышку сервы 32, она садится на штифты.',
+     'Надень подшипник MR2216-2RS 16×22×4 на бобышку neck_pitch.',
+     'Подключи серву 32 к UC-01, выставь в пульте серв середину (2048) и включи момент.',
+     'Закрепи neck_pitch 4 винтами на качалке сервы 32, головками снизу. После установки сервы 31 к этим винтам не подобраться. После этого серву можно отключить от UC-01.'],
+  f:[{s:'M2×6',n:4,w:'neck_pitch → качалка 32'}]},
+ {t:'Узел шеи в neck_pitch',buy:[['Кабель 15 см',1]],show:[...neckSet],ctx:[S.s035,'bearing_neck#1',B.b012,'neck_pitch#1'],sc:['np049'],
+  p:['Подключи серву 31 к UC-01, выставь в пульте серв середину (2048) и включи момент.',
+     'Заведи серву 31 узла шеи в вилку neck_pitch и закрепи: 4 винта в качалку, 4 в задний диск. После этого серву можно отключить от UC-01.',
+     'Соедини сервы 32 и 31 кабелем 15 см.'],
+  f:[{s:'M2×6',n:8,w:'neck_pitch → качалка и задний диск 31'}]},
+]},
+{id:'head',name:'Голова',steps:[
+ {t:'Серва 33 на yaw_roll_motion',show:['yaw_roll_motion#1',B.b003,B.b014],ctx:[S.s040],sc:['yrm040'],
+  p:['Надень подшипник MR2216-2RS 16×22×4 на качалку сервы 33.',
+     'Подключи серву 33 к UC-01, выставь в пульте серв середину (2048) и включи момент.',
+     'Закрепи yaw_roll_motion 4 винтами на качалке сервы 33 — сразу, после сервы 32 к ним не подобраться. После этого серву можно отключить от UC-01.',
+     'Надень второй подшипник MR2216-2RS 16×22×4 на передний вал yaw_roll_motion.'],
+  f:[{s:'M2×6',n:4,w:'yaw_roll_motion → качалка 33 (длиннее нельзя)'}]},
+ {t:'Узел шеи в yaw_roll_motion',show:[S.s035,'bearing_neck#1',B.b012,'neck_pitch#1',...neckSet],ctx:['yaw_roll_motion#1',S.s040,B.b003,B.b014],sc:['yrm035'],
+  p:['Вставь серву 32 с neck_pitch и шеей снизу в yaw_roll_motion и закрепи 4 винтами сверху в её заднюю крышку.'],
+  f:[{s:'M2×6',n:4,w:'yaw_roll_motion → задняя крышка 32'}]},
+ {t:'Всё в bottom_head',buy:[['Кабель 15 см',1]],show:['bottom_head_shell#1',B.b050,S.s005],ctx:['yaw_roll_motion#1',S.s040,B.b003,B.b014,S.s035,'bearing_neck#1',B.b012,'neck_pitch#1',...neckSet],
+  p:['Вставь в гнездо bottom_head подшипник 6700 10×15×3 челюсти.',
+     'Опусти собранный узел в bottom_head сверху: шея проходит через проём в полу, серва 33 ложится в охват, подшипники крена — в гнёзда.',
+     'Серву 34 укладывай в охват последней: раньше она мешает neck_pitch.',
+     'Винтов у серв 33 и 34 нет: их прижмёт motor_support.',
+     'Подключи к нижнему разъёму сервы 34 кабель 15 см — он пойдёт потом к UC-01.'],
+  f:[]},
+ {t:'motor_support',buy:[['Кабель 6 см',1],['Кабель 15 см',1]],show:['motor_support#1'],ctx:[...headBase,'yaw_roll_motion#1',S.s035],sc:['ms'],
+  p:['Поставь motor_support фланцем на стойки bottom_head и вкрути сверху 4 винта M2.5.',
+     'Соедини сервы 33 и 32 кабелем 6 см.',
+     'Соедини сервы 34 и 33 кабелем 15 см.'],
+  f:[{s:'M2.5×6',n:4,w:'motor_support → стойки bottom_head'}]},
+ {t:'Шея с головой в оболочки',show:[...neckSet,S.s035,'bearing_neck#1',B.b012,'neck_pitch#1','yaw_roll_motion#1',...headBase,'motor_support#1'],ctx:[...trunkCore,'left_shell#1','right_shell#1',L.y2r,S.rollL,L.broll,B.yawL,...legL],sc:['lshell','rshell'],
+  p:['Просунь шею с головой между ушами оболочек и подключи кабель питания шеи в свободный порт сервы 30.',
+     'Подключи серву 34 к UC-01, выставь в пульте серв середину (2048) сервы 30 и включи на ней момент.',
+     'Закрепи ухо left_shell 4 винтами на качалке сервы 30, ухо right_shell — 4 винтами на заднем диске сервы 30.',
+     'Просунь провода IMU в голову.'],
+  f:[{s:'M2×6',n:4,w:'left_shell → качалка сервы 30'},{s:'M2×6',n:4,w:'right_shell → задний диск сервы 30'}]},
+ {t:'Челюсть',show:['jaw#1'],ctx:[...headBase,'motor_support#1'],sc:['jaw'],
+  p:['Выставь в пульте серв середину (2048) сервы 34 и включи момент.',
+     'Вставь вал челюсти в подшипник 6700 10×15×3 и закрепи jaw 4 винтами на качалке сервы 34. После этого UC-01 можно отключить.'],
+  f:[{s:'M2×6',n:4,w:'jaw → качалка 34'}]},
+ {t:'UC-01 под куполом top_head',buy:[['UBEC 5 В / 3 А',1],['Провод Dupont',3],['Кабель 25 см',1]],show:['uc01_simple#1'],ctx:['top_head_shell#1'],sc:['uc01'],
+  p:['Переключатель уровня на UC-01 поставь на 3.3 В.',
+     'Подключи три провода Dupont к штырям R, T и G гребёнки UC-01. Штырь V остаётся свободным.',
+     'Вход UBEC (+ и −) закрепи в винтовом клеммнике питания UC-01 (+ и −).',
+     'Переверни top_head_shell куполом вниз. Положи UC-01 деталями вверх, портами серв к лицу, и надень отверстие у клеммника на штифт стойки 3.',
+     'Закрепи UC-01 2 винтами через отверстия у портов серв во вставки стоек 1 и 2.',
+     'Подключи к UC-01 кабель 15 см от сервы 34 (первый порт) и кабель 25 см от PCB (второй порт).'],
+  f:[{s:'M2×4',n:2,w:'UC-01 → вставки стоек top_head (головка не больше Ø3.8)'}]},
+ {t:'Лицо: ToF, микрофон, камера, глаз',buy:[['Провод Dupont',4],['Провод 24 AWG',5]],show:['face_part#1','tof_vl53l8cx_board_simplified#1','mic_ics43434_round_simplified#1','camera_8m_219_simplified#1','noenoeil#1'],ctx:[],sc:['tof','cam'],
+  p:['На модуле ToF соедини перемычкой SPI_I2C_N, NCS и GND.',
+     'Припаяй к ToF провода: VIN красный, SCL зелёный, SDA синий, GND — к общей земле.',
+     'Закрепи ToF 2 винтами во вставки face_part.',
+     'На модуле микрофона соедини перемычкой L/R и GND.',
+     'Припаяй к микрофону провода: SCK фиолетовый, WS оранжевый, VDD красный, SD серый, GND чёрный.',
+     'Вставь микрофон под лепестки с крючками.',
+     'Закрепи камеру 4 винтами во вставки face_part, шлейфом влево. Шлейф — стандартный, из комплекта камеры.',
+     'Глаз noenoeil вставь тремя зубьями в прорези лица.'],
+  f:[{s:'M2×4',n:2,w:'ToF → вставки'},{s:'M2×4',n:4,w:'камера → вставки'}]},
+ {t:'Лицо: Zero 3W с радиатором, усилитель, динамик',img:[{t:'Схема подключения',src:'img/wiring.ru.png'}],buy:[['Радиатор Radxa Heatsink 5519A',1],['Провод Dupont',6]],show:['radxa_zero_3w_simplified#1','zero clamp#1','max98357a_module_simplified#1','speaker_2535_simplified#1'],ctx:['face_part#1','tof_vl53l8cx_board_simplified#1','mic_ics43434_round_simplified#1','camera_8m_219_simplified#1','noenoeil#1'],sc:['zero','amp'],
+  p:['Подключи шлейф камеры к Zero 3W.',
+     'Положи радиатор с прокладкой на Zero 3W.',
+     'Поставь Zero 3W на стойки face_part, сверху — прижим zero clamp ножками к плате. Срезанная ножка — в углу между радиатором и концом гребёнки, дальним от антенны.',
+     'Закрути 4 винта через прижим и плату во вставки стоек.',
+     'Провода динамика припаяй к плате усилителя.',
+     'Подключи к гребёнке усилителя провода: VIN красный, BCLK фиолетовый, LRC оранжевый, DIN коричневый, SD серый, GND — к общей земле.',
+     'Собери проводку по схеме подключения hardware/wiring.ru.png.',
+     'Закрепи усилитель MAX98357A 2 винтами во вставки гребёнкой к лицу — гребёнка свешивается за передний край motor_support.',
+     'Динамик 3525 положи сверху на motor_support, на площадку над сервой 33. Винтов у него нет: сверху его закрывает top_head.'],
+  f:[{s:'M2×12',n:4,w:'zero clamp и Zero 3W → вставки (головка до Ø3.8)'},{s:'M2×4',n:2,w:'усилитель → вставки (длиннее нельзя)'}]},
+ {t:'Закрыть голову',buy:[['Провод Dupont',3]],show:['jaw_soft#1','soft_mouth_top#1','top_head_shell#1','uc01_simple#1','face_part#1','camera_8m_219_simplified#1','tof_vl53l8cx_board_simplified#1','radxa_zero_3w_simplified#1','zero clamp#1','mic_ics43434_round_simplified#1','noenoeil#1'],ctx:[...headBase,'motor_support#1','jaw#1','yaw_roll_motion#1',S.s035,'neck_pitch#1'],sc:['headjoin'],
+  p:['Выведи кабель 25 см через паз в ребре bottom_head (левый задний угол).',
+     'Поставь лицо на место. Винтов у него нет — его зажимают top_head и bottom_head.',
+     'Надень top_head_shell с UC-01 и закрепи 3 винтами снизу через bottom_head во вставки.',
+     'Приклей мягкие вставки jaw_soft и soft_mouth_top на двустороннюю клейкую ленту на бумажной основе.'],
+  f:[{s:'M2×6',n:3,w:'bottom_head → вставки top_head'},{s:'двусторонняя клейкая лента на бумажной основе',n:1,w:'мягкие вставки'}]},
+]},
+{id:'finish',name:'Батарея',steps:[
+ {t:'Батарея NP-F550',show:['np-f550#1'],ctx:[...trunkCore,'left_shell#1','right_shell#1'],
+  p:['Поставь батарею на защёлку и зубья power_support, контактами к контактам. Утка готова.'],
+  f:[]},
+]},
+{id:'rollers',name:'Ролики',steps:[
+ {t:'Колесо: обод, шина, подшипники',units:2,show:[R.rimA,R.tireA,R.rimB,R.tireB,...R.brg],ctx:[],x2:true,
+  p:['Обод и шину лучше печатать одной деталью. Если они напечатаны отдельно — натяни шину TPU на обод.','Вставь в обод 2 подшипника MR126ZZ 6×12×4.','Собери 4 колеса, по 2 на ролик.'],
+  f:[]},
+ {t:'Колёса в ролик',show:[R.rimA,R.tireA,R.rimB,R.tireB,R.bushA,R.bushB,...R.brg],ctx:[R.roller],x2:true,sc:['raxle'],
+  p:['Вставь втулку bushing в подшипники колеса.',
+     'Поставь колесо между щёк ролика так, чтобы втулка встала напротив отверстий оси.',
+     'Вставь винт M2.5×14 со стороны гнезда под головку через щёку и втулку и вкрути в противоположную щёку. Затягивай, пока щёки не прижмутся к втулке; колесо должно свободно крутиться.',
+     'Так же поставь второе колесо. Ролики одинаковые, левого и правого нет.'],
+  f:[{s:'M2.5×14',n:2,w:'ось колеса'}]},
+ {t:'Ролик вместо стопы',asm:['Колёса в ролик','Ось лодыжки'],show:[R.roller,R.rimA,R.tireA,R.rimB,R.tireB,R.bushA,R.bushB,...R.brg],ctx:[L.ankle,S.ankL,L.leg,L.axle],x2:true,sc:['rtoe'],
+  p:['Выкрути винт носка и сними стопу.','Поставь ролик так же, как стопу: пятку на клин, носок вниз на 5–10°, поверни вверх и затяни тот же винт во вставку ролика.'],
+  f:[]},
+]},
+];
+
+const SCSPEC={rtoe:'M2×6 потай',raxle:'M2.5×14',toe:'M2×6 потай',ankhorn:'M2×6',axle:'M2.3×6 саморез',legback:'M2×8',legknee:'M2×6',upper:'M2.3×4 саморез',plate:'M2×6',hippitch:'M2×6',hiproll:'M2×6',brollservo:'M2×4',brolllug:'M2×4',y2ryaw:'M2×4',y2rroll:'M2×4',tbout:'M2×4',tbin:'M2×6',psup:'M2×8',imu:'M2.5×6 потай',lshell:'M2×6',rshell:'M2×6',shellyaw:'M2×6',shellyaw2:'M2×6',shelljoin:'M2×8',neck1:'M2×6',neck2:'M2×6',np035:'M2×6',np049:'M2×6',yrm035:'M2×6',yrm040:'M2×6',ms:'M2.5×6',amp:'M2×4',uc01:'M2×4',jaw:'M2×6',cam:'M2×4',tof:'M2×4',zero:'M2×12',headjoin:'M2×6'};
+const SCCOL={'вставка M2×4×Ø3':'#e8b923','вставка M2×3×Ø3.2':'#b98cf0','M2×12':'#6b8e23','M2×4':'#2f8fd8','M2×5':'#22a466','M2×6':'#e0b414','M2×8':'#c93d93','M2×6 потай':'#7d5ce0','M2.5×6':'#17b5b5','M2.5×6 потай':'#d4552a','M2.5×14':'#5b6bd6','M2.3×4 саморез':'#9b6b3f','M2.3×6 саморез':'#e04848'};
+const TPU=new Set(['sole_left#1','sole_right#1','jaw_soft#1','soft_mouth_top#1','R:tire#1','R:tire#2','R:tire#3','R:tire#4']);
+
+const SERVOS=[['левая 20, правая 10','рыскание бедра','качалка вниз в trunk_base'],['левая 21, правая 11','крен бедра','в yaw2roll'],['левая 22, правая 12','тангаж бедра','в upper_leg'],['левая 23, правая 13','колено','в upper_leg'],['левая 24, правая 14','голеностоп','в лодыжке'],['30','тангаж шеи','в оболочках'],['31','тангаж головы','над 30, пластины neck'],['32','рыскание головы','в yaw_roll_motion'],['33','крен головы','в bottom_head'],['34','клюв','в bottom_head']];
+const PINS=[['1','3.3 В','IMU VCC (красный)'],['2','5 В','усилитель VIN (красный)'],['3','SDA (I²C3)','IMU SDA (синий)'],['4','5 В','UBEC +5 (красный)'],['5','SCL (I²C3)','IMU SCL (зелёный)'],
+ ['6','GND','UBEC − (чёрный)'],['8','TX (UART2)','UC-01 R (жёлтый)'],['10','RX (UART2)','UC-01 T (белый)'],['12','BCLK (I²S3)','усилитель BCLK (фиолетовый)'],['13','GPIO3_A2','усилитель SD (серый)'],['14','GND','общая земля (чёрный)'],
+ ['17','3.3 В','ToF VIN (красный); VDD микрофона — от площадки VIN ToF'],['29','SCL (I²C5)','ToF SCL (зелёный)'],['31','SDA (I²C5)','ToF SDA (синий)'],['35','LRCK (I²S3)','усилитель LRC (оранжевый)'],
+ ['38','SDI (I²S3)','микрофон SD (серый)'],['40','SDO (I²S3)','усилитель DIN (коричневый)']];
+const CABLES=[['PCB L → левая 20, PCB R → правая 10','4 см'],['левая 20 → 21, правая 10 → 11','15 см'],['левая 21 → 22, правая 11 → 12','15 см'],['левая 22 → 23, правая 12 → 13','6 см'],['левая 23 → 24, правая 13 → 14','15 см'],['PCB L PWR → свободный порт левой 24, R PWR → правой 14','20 см'],['UC-01 → 34','15 см'],['34 → 33','15 см'],['33 → 32','6 см'],['32 → 31','15 см'],['31 → 30','4 см'],['UC-01, второй порт → PCB','25 см'],['питание шеи: площадки PCB (пайка) → свободный порт 30, с одной вилкой','9 см']];
+const BUY=[['Подшипник MR2216-2RS 16×22×4','11','8 в ногах, 3 в голове'],['Подшипник 6700 10×15×3','3','лодыжки 2, челюсть 1'],['Подшипник MR126ZZ 6×12×4','8','ролики'],['Аккумулятор ZITAY NP-F550C','1',''],['PCB','1','hardware/power_board'],['Кабели шины AMP 2.0-3P','19','9 из коробок серв, 10 по hardware/cables.md'],['Хомут нейлоновый, самый короткий','2','кабели 20 см в ногах']];
+
+
+/* ---------- UI ---------- */
+let ph=0, st=0;
+const $=id=>document.getElementById(id);
+function flat(){const a=[];PHASES.forEach((p,i)=>p.steps.forEach((s,j)=>a.push([i,j])));return a}
+const ALL=flat();
+function stepNo(i,j){return ALL.findIndex(([a,b])=>a===i&&b===j)+1}
+function sw(spec){const c=SCCOL[spec];return c?`<i class="sw" style="background:${c}"></i>`:''}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function renderPhases(){$('phases').innerHTML=PHASES.map((p,i)=>`<button type="button" data-p="${i}" aria-current="${i===ph}">${esc(p.name)}</button>`).join('');
+ $('phases').querySelectorAll('button').forEach(b=>b.onclick=()=>go(+b.dataset.p,0));}
+function renderList(){const p=PHASES[ph];$('phtitle').textContent=p.name+': шаги';
+ $('steplist').innerHTML=p.steps.map((s,j)=>`<button type="button" data-s="${j}" aria-current="${j===st}"><span class="k">${stepNo(ph,j)}</span><span>${esc(s.t)}</span></button>`).join('');
+ $('steplist').querySelectorAll('button').forEach(b=>b.onclick=()=>go(ph,+b.dataset.s));}
+const PNAME={hd1910_servo:'Серва HD-1910',bearing_22x16x4:'Подшипник MR2216-2RS 16×22×4',bearing_15x10x3:'Подшипник 6700 10×15×3',bearing_12x6x4:'Подшипник MR126ZZ 6×12×4',
+ power_board:'PCB',imu_lsm6dsv16x_module:'IMU LSM6DSV16X',max98357a_module:'Усилитель MAX98357A',speaker_2535:'Динамик 3525',camera_8m_219:'Камера Radxa 8M 219',
+ tof_vl53l8cx_board:'ToF VL53L8CX',radxa_zero_3w:'Radxa Zero 3W',mic_ics43434_round:'Микрофон ICS-43434',uc01_simple:'UC-01','np-f550':'Аккумулятор NP-F550'};
+const pname=(k,x2)=>{const b=k.replace(/^R:/,'').replace(/#\d+$/,'').replace(/_simplified$/,'');let nm=PNAME[b]||b;if(x2&&!PNAME[b])nm=nm.replace(/_left$/,'_left / '+nm.replace(/_left$/,'_right'));return nm};
+// parts of a step: parts that appear for the first time, bought items not in the model (buy), and what was assembled
+// earlier as "assembly from step N" (a single earlier part keeps its name)
+const stepAt=k=>PHASES[ALL[k][0]].steps[ALL[k][1]];
+const asmOf=q=>[...new Set([...(q.show||[]),...(q.ctx||[])])];
+const brk=q=>{const a=asmOf(q);return !q.x2&&a.length>1&&a.some(x=>!/_(left|right)#/.test(x))};
+const cx2Memo={};function cumX2(k){if(k in cx2Memo)return cx2Memo[k];const own=new Set(asmOf(stepAt(k)));let ok=!!stepAt(k).x2;
+ for(let i=0;i<k&&ok;i++){const q=stepAt(i);if(q.tables||q.parts)continue;if(asmOf(q).some(x=>own.has(x))&&(q.x2?!cumX2(i):brk(q)))ok=false}return cx2Memo[k]=ok}
+const cumMemo={};function cumOf(k){if(cumMemo[k])return cumMemo[k];const own=new Set(asmOf(stepAt(k)));const c=new Set(own);
+ for(let i=0;i<k;i++){const q=stepAt(i);if(q.tables||q.parts)continue;if(asmOf(q).some(x=>own.has(x)))cumOf(i).forEach(x=>c.add(x))}return cumMemo[k]=c}
+function partsTable(s){if(s.tables)return '';const rows=[];const add=(nm,n,x2)=>{const r=rows.find(r=>r[0]===nm&&r[2]===x2);if(r)r[1]+=n;else rows.push([nm,n,x2])};
+ const addP=(k,x2)=>{const nm=pname(k,false);if(x2&&/_left$/.test(nm)){add(nm,1,false);add(nm.replace(/_left$/,'_right'),1,false)}else add(nm,1,x2)};
+ const j=ALL.findIndex(([a,b])=>PHASES[a].steps[b]===s);const seen=new Set();
+ for(let k=0;k<j;k++){const q=stepAt(k);if(q.tables||q.parts)continue;asmOf(q).forEach(x=>seen.add(x))}
+ const here=asmOf(s);
+ if(s.parts)s.parts.forEach(([k,n])=>add(k,n,false));else here.filter(x=>!seen.has(x)).forEach(x=>addP(x,!!s.x2));
+ (s.buy||[]).forEach(([k,n])=>add(k,n,!!s.x2));
+ if(s.asm){s.asm.forEach(tt=>{const k=ALL.findIndex(([a,b])=>PHASES[a].steps[b].t===tt);if(k>=0)add(`Узел из шага ${k+1}`,stepAt(k).units||1,!!s.x2)});
+  return rows.length?`<div class="tscroll"><table><tr><th>Детали</th><th>Шт.</th></tr>${rows.map(([k,v,x2])=>`<tr><td class="spec">${esc(k)}</td><td class="n">${v*(x2?2:1)}</td></tr>`).join('')}</table></div>`:''}
+ const left=new Set(here.filter(x=>seen.has(x)));
+ while(left.size){let best=-1,bn=0;
+  for(let k=j-1;k>=0;k--){const q=stepAt(k);if(q.tables||q.parts)continue;if(asmOf(q).some(x=>left.has(x))){best=k;break}}
+  if(best<0)break;{const cb=cumOf(best);for(let k=j-1;k>best;k--){const q2=stepAt(k);if(q2.tables||q2.parts)continue;const ck=cumOf(k);if([...cb].every(x=>ck.has(x))){best=k;break}}}
+  const q=stepAt(best);const set=asmOf(q);cumOf(best).forEach(x=>left.delete(x));
+  const one=set.length===1;const x2=!!(s.x2&&(one||cumX2(best)||(!q.x2&&!brk(q))));add(`Узел из шага ${best+1}`,q.units||1,x2)}
+ left.forEach(x=>addP(x,!!s.x2));
+ if(!rows.length)return '';
+ return `<div class="tscroll"><table><tr><th>Детали</th><th>Шт.</th></tr>${rows.map(([k,v,x2])=>`<tr><td class="spec">${esc(k)}</td><td class="n">${v*(x2?2:1)}</td></tr>`).join('')}</table></div>`}
+// {#Step title} in a step text becomes that step's current number
+function stepRefs(x){return x.replace(/\{#([^}]+)\}/g,(m,tt)=>{const k=ALL.findIndex(([a,b])=>PHASES[a].steps[b].t===tt);return k<0?m:String(k+1)})}
+function renderCard(){const s=PHASES[ph].steps[st];const n=stepNo(ph,st);
+ const pt=partsTable(s);
+ const ft=s.f.length?`<div class="tscroll"><table><tr><th>Крепёж</th><th>Шт.</th><th>Куда</th></tr>${s.f.map(f=>`<tr><td class="spec">${sw(f.s)}${esc(f.s)}</td><td class="n">${f.n*(s.x2?2:1)}</td><td>${esc(f.w)}</td></tr>`).join('')}</table></div>`:'';
+ $('imgcard').innerHTML=(s.img||[]).map(im=>`<h3>${esc(im.t)}</h3><a href="${im.src}" target="_blank"><img src="${im.src}" alt="${esc(im.t)}" style="width:100%;display:block;border-radius:6px;margin-bottom:12px"></a>`).join('');$('imgcard').hidden=!s.img;
+ const longNames=[...(s.parts||[]),...(s.buy||[])].some(([k])=>k.length>26)||(s.f||[]).some(f=>f.w.length>30||f.s.length>20)||(s.show||[]).some(k=>pname(k,s.x2).length>26);
+ $('partscard').innerHTML=`<div class="pgrid${longNames?' stack':''}">${pt?`<div>${pt}</div>`:''}${ft?`<div>${ft}</div>`:''}</div>`;$('partscard').hidden=!(pt||ft);
+ $('stepcard').innerHTML=`<div class="stephead"><span class="stepno">${n}</span><div><div class="meta">${esc(PHASES[ph].name)} · шаг ${st+1} из ${PHASES[ph].steps.length}${s.x2?' · обе стороны':''}</div><h2>${esc(s.t)}</h2></div></div>
+ <div class="body">${s.p.map(t=>`<p>${esc(stepRefs(t))}</p>`).join('')}</div>${s.pins?`<div class="tscroll"><table><tr><th>Пин</th><th>Сигнал</th><th>Куда</th></tr>${PINS.map(r=>`<tr><td class="n">${r[0]}</td><td class="spec">${esc(r[1])}</td><td>${esc(r[2])}</td></tr>`).join('')}</table></div>`:''}${s.warn?`<div class="warn" style="margin-top:10px"><b>Проверь:</b> ${esc(s.warn)}</div>`:''}`;
+ $('prev').disabled=n===1;$('next').disabled=n===ALL.length;}
+function go(i,j){ph=i;st=j;const s=PHASES[i].steps[j];document.body.classList.toggle('tables',!!s.tables);renderPhases();renderList();renderCard();if(!s.tables)show(s);try{localStorage.setItem('duckstep',JSON.stringify([i,j]))}catch(e){}}
+$('prev').onclick=()=>{const k=stepNo(ph,st)-2;if(k>=0)go(...ALL[k])};
+$('next').onclick=()=>{const k=stepNo(ph,st);if(k<ALL.length)go(...ALL[k])};
+
+/* reference tables */
+(function(){const tot={};PHASES.forEach(p=>p.steps.forEach(s=>s.f.forEach(f=>{const m=(s.x2?2:1);const key=f.s;(tot[key]=tot[key]||{n:0,w:[]}).n+=f.n*m;tot[key].w.push(f.w+(m>1?' (×2)':''))})));
+ const rows=Object.entries(tot).sort((a,b)=>a[0].localeCompare(b[0],'ru'));
+ $('fasttbl').innerHTML='<tr><th>Что</th><th>Всего</th></tr>'+rows.map(([k,v])=>`<tr><td class="spec">${sw(k)}${esc(k)}</td><td class="n">${v.n}</td></tr>`).join('');
+ $('buytbl').innerHTML='<tr><th>Что</th><th>Шт.</th><th></th></tr>'+BUY.map(r=>`<tr><td>${esc(r[0])}</td><td class="n">${r[1]}</td><td class="side">${esc(r[2])}</td></tr>`).join('');
+ $('servotbl').innerHTML='<tr><th>ID</th><th>Сустав</th><th>Где стоит</th></tr>'+SERVOS.map(r=>`<tr><td class="spec">${r[0]}</td><td>${esc(r[1])}</td><td class="side">${esc(r[2])}</td></tr>`).join('');
+  $('cabletbl').innerHTML='<tr><th>Откуда → куда</th><th>Кабель</th></tr>'+CABLES.map(r=>`<tr><td>${esc(r[0])}</td><td class="n">${r[1]}</td></tr>`).join('');
+ const PRINT=[['trunk_base','1',''],['power_support','1',''],['left_shell / right_shell','1 + 1',''],['neck','2',''],['yaw2roll','2',''],['bearing_roll','2',''],['hip','2','одна деталь на обе ноги'],['upper_leg_left / right','1 + 1','правая — зеркало'],['rigidity_plate','2','одна на обе ноги'],['leg','2','одна на обе ноги'],['ankle_left / right','1 + 1','правая — зеркало'],['ankle_axle','2',''],['foot_left / right','1 + 1',''],['sole_left / right','1 + 1','TPU'],['neck_pitch','1',''],['bearing_neck','1',''],['yaw_roll_motion','1',''],['bottom_head_shell','1',''],['motor_support','1',''],['top_head_shell','1',''],['face_part','1',''],['zero clamp','1','прижим радиатора Zero 3W'],['noenoeil','1',''],['jaw','1',''],['jaw_soft, soft_mouth_top','1 + 1','TPU'],['roller','2','ролики, одна деталь на обе ноги'],['rim','4','ролики'],['tire','4','ролики, TPU'],['bushing','4','ролики']];
+ $('printtbl').innerHTML='<tr><th>Деталь (имя в STEP)</th><th>Шт.</th><th></th></tr>'+PRINT.map(r=>`<tr><td class="spec">${esc(r[0])}</td><td class="n">${r[1]}</td><td class="side">${esc(r[2])}</td></tr>`).join('');
+})();
+
+/* ---------- 3D ---------- */
+const canvas=$('gl');
+const renderer=new THREE.WebGLRenderer({canvas,antialias:true,alpha:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+const scene=new THREE.Scene();
+const cam=new THREE.PerspectiveCamera(35,1,1,5000);
+const controls=new OrbitControls(cam,canvas);controls.enableDamping=true;
+scene.add(new THREE.HemisphereLight(0xffffff,0x8a8f8c,1.6));
+const dl=new THREE.DirectionalLight(0xffffff,1.6);dl.position.set(1,2,1.5);scene.add(dl);
+const root=new THREE.Group();root.rotation.x=-Math.PI/2;scene.add(root);
+const css=getComputedStyle(document.documentElement);
+const ACC=new THREE.Color(css.getPropertyValue('--accent').trim()||'#e2731e');
+const mNew=new THREE.MeshStandardMaterial({color:ACC,roughness:.55,metalness:.05,flatShading:true});
+const mCtx=new THREE.MeshStandardMaterial({color:0x9aa3a0,roughness:.8,transparent:true,opacity:.55,depthWrite:false,flatShading:true});
+const mServoNew=new THREE.MeshStandardMaterial({color:0xc75a10,roughness:.5,flatShading:true});
+const mTpu=new THREE.MeshStandardMaterial({color:0x48535c,roughness:.9,flatShading:true});
+const scMats={};function scMat(spec){return scMats[spec]||(scMats[spec]=new THREE.MeshStandardMaterial({color:new THREE.Color(SCCOL[spec]||'#ffffff'),roughness:.35,metalness:.6,flatShading:true}))}
+const labMats={};function labMat(c){return labMats[c]||(labMats[c]=new THREE.MeshStandardMaterial({color:new THREE.Color(c),roughness:.5,flatShading:true}))}
+let labs=[];
+const byKey=new Map();
+const san=k=>k.replace(/[\[\]\.:\/]/g,'').replace(/\s/g,'_');
+let cur=null, anim=null, ctxOn=true;
+function size(){const w=canvas.clientWidth,h=canvas.clientHeight;renderer.setSize(w,h,false);cam.aspect=w/h;cam.updateProjectionMatrix()}
+new ResizeObserver(size).observe(canvas);
+const onModel=g=>{
+  g.scene.traverse(o=>{if(o.isMesh||o.isGroup||o.isObject3D){const k=o.userData&&o.userData.name?o.userData.name:o.name;if(k&&!byKey.has(san(k))&&(o.isMesh||o.children.some(c=>c.isMesh)))byKey.set(san(k),o)}});
+  root.add(g.scene);g.scene.traverse(o=>{if(o.isMesh){o.visible=false;if(!o.geometry.attributes.normal)o.geometry.computeVertexNormals()}});
+  $('loading').hidden=true;size();
+  let start=[0,0];try{const v=JSON.parse(localStorage.getItem('duckstep'));if(v&&PHASES[v[0]]&&PHASES[v[0]].steps[v[1]])start=v}catch(e){}
+  go(...start);
+};
+const failModel=()=>{$('loading').textContent='Не удалось загрузить модель (duck.glb)'};
+fetch('duck.glb').then(r=>{if(!r.ok)throw 0;return r.arrayBuffer()}).then(b=>new GLTFLoader().parse(b,'',onModel,failModel)).catch(failModel);
+function meshesOf(k){const o=byKey.get(san(k));if(!o)return[];const a=[];o.traverse(c=>{if(c.isMesh)a.push(c)});return a}
+const INSDIM={toe:[3,4],rtoe:[3,4],headjoin:[3,4],uc01:[3,4],zero:[3,4],cam:[3.2,3],tof:[3.2,3],amp:[3.2,3],shelljoin:[3.2,3]};
+const insG=new THREE.Group();const insGeo=new THREE.CylinderGeometry(1,1,1,20);
+const insMats={};const insMat=sp=>insMats[sp]||(insMats[sp]=new THREE.MeshBasicMaterial({color:new THREE.Color(SCCOL[sp]),depthTest:false,transparent:true,opacity:0.9}));
+let insAdded=false;
+function show(s){if(!insAdded){scene.add(insG);insAdded=true}if(!byKey.size||s.tables)return;cur=s;
+  byKey.forEach(o=>o.traverse(c=>{if(c.isMesh){c.visible=false;c.position.copy(c.userData.home||c.position)}}));
+  const box=new THREE.Box3();const ctxBox=new THREE.Box3();
+  const newM=[];s.show.forEach(k=>meshesOf(k).forEach(m=>{if(!m.userData.home)m.userData.home=m.position.clone();m.visible=true;m.material=TPU.has(k)?mTpu:(k.startsWith('hd1910')?mServoNew:mNew);newM.push(m);m.updateWorldMatrix(true,false);box.expandByObject(m)}));
+  if(ctxOn)s.ctx.filter(k=>!s.show.includes(k)).forEach(k=>meshesOf(k).forEach(m=>{if(!m.userData.home)m.userData.home=m.position.clone();m.visible=true;m.material=mCtx;m.updateWorldMatrix(true,false);ctxBox.expandByObject(m)}));
+  // labelled parts: own colour + a tag that follows the camera
+  $('labs').innerHTML='';labs=[];
+  (s.lab||[]).forEach(l=>{const ms=meshesOf(l.k).filter(m=>m.visible);if(!ms.length)return;const b=new THREE.Box3();
+    ms.forEach(m=>{m.material=labMat(l.c);m.updateWorldMatrix(true,false);b.expandByObject(m)});
+    const el=document.createElement('div');el.className='lab';el.style.borderColor=l.c;el.textContent=l.t;el.hidden=true;$('labs').append(el);
+    labs.push({el,p:b.getCenter(new THREE.Vector3())})});
+  const used=new Set();
+  byKey.forEach((o,k)=>{if(!k.startsWith('SCREW|'))return;const j=k.split('|')[1];if(!(s.sc||[]).includes(j))return;const spec=SCSPEC[j];used.add(spec);
+    o.traverse(c=>{if(c.isMesh){if(!c.userData.home)c.userData.home=c.position.clone();c.visible=true;c.material=scMat(spec);newM.push(c)}})});
+  // inserts: a cylinder of the insert's size (Ø × length, mm) at the screw tip, inside the shown part; seen through the part
+  insG.clear();const insUsed=new Set();const partC=box.getCenter(new THREE.Vector3());
+  byKey.forEach((o,k)=>{if(!k.startsWith('SCREW|'))return;const jn=k.split('|')[1];if(!(s.ins||[]).includes(jn))return;
+    const bb=new THREE.Box3();o.traverse(c=>{if(c.isMesh){c.updateWorldMatrix(true,false);bb.expandByObject(c)}});if(bb.isEmpty())return;
+    const sz=bb.getSize(new THREE.Vector3()),ctr=bb.getCenter(new THREE.Vector3());const ax=sz.x>=sz.y&&sz.x>=sz.z?'x':(sz.y>=sz.z?'y':'z');
+    const mm=sz[ax]/parseFloat(SCSPEC[jn].split('×')[1]);const [d,len]=INSDIM[jn];
+    const dir=new THREE.Vector3();dir[ax]=1;const a=ctr.clone().addScaledVector(dir,sz[ax]/2),b2=ctr.clone().addScaledVector(dir,-sz[ax]/2);
+    const tip=a.distanceTo(partC)<b2.distanceTo(partC)?a:b2;const back=ctr.clone().sub(tip).normalize();
+    const isp=d===3?'вставка M2×4×Ø3':'вставка M2×3×Ø3.2';insUsed.add(isp);const cyl=new THREE.Mesh(insGeo,insMat(isp));cyl.renderOrder=10;cyl.position.copy(tip).addScaledVector(back,len*mm/2);cyl.scale.set(d*mm/2,len*mm,d*mm/2);
+    if(ax==='x')cyl.rotation.z=Math.PI/2;else if(ax==='z')cyl.rotation.x=Math.PI/2;insG.add(cyl)});
+  // mirrored part with no screws in the scene (right foot): copy the marker across, mirrored on the side axis
+  (s.insMirror||[]).forEach(([kl,kr])=>{const bl=new THREE.Box3(),br=new THREE.Box3();meshesOf(kl).forEach(m=>bl.expandByObject(m));meshesOf(kr).forEach(m=>br.expandByObject(m));
+    if(bl.isEmpty()||br.isEmpty())return;const cl=bl.getCenter(new THREE.Vector3()),cr=br.getCenter(new THREE.Vector3()),d=cr.clone().sub(cl);
+    const sa=Math.abs(d.x)>=Math.abs(d.y)&&Math.abs(d.x)>=Math.abs(d.z)?'x':(Math.abs(d.y)>=Math.abs(d.z)?'y':'z');
+    [...insG.children].filter(c=>bl.containsPoint(c.position)).forEach(c=>{const m=c.clone();const off=c.position.clone().sub(cl);off[sa]=-off[sa];m.position.copy(cr).add(off);insG.add(m)})});
+  $('sclegend').innerHTML=[...used].map(sp=>`<span>${sw(sp)}${esc(sp)}</span>`).join('')+[...insUsed].map(sp=>`<span>${sw(sp)}${esc(sp)}</span>`).join('');
+  const all=box.clone();if(!ctxBox.isEmpty())all.union(ctxBox);
+  fit(all);
+  // fly-in: away from the context centre (or from above), in world space
+  const c=box.getCenter(new THREE.Vector3());const from=ctxBox.isEmpty()?new THREE.Vector3(0,1,0):c.clone().sub(ctxBox.getCenter(new THREE.Vector3()));
+  if(from.length()<1e-3)from.set(0,1,0);from.normalize();const dist=all.getSize(new THREE.Vector3()).length()*0.35;
+  const off=new THREE.Vector3().copy(from).multiplyScalar(dist);
+  const inv=new THREE.Matrix4();
+  newM.forEach(m=>{inv.copy(m.parent.matrixWorld).invert();m.userData.off=off.clone().applyMatrix3(new THREE.Matrix3().setFromMatrix4(inv))});
+  const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
+  anim={t0:performance.now(),dur:reduce?0:900,meshes:newM};
+}
+function fit(b){if(b.isEmpty())return;const c=b.getCenter(new THREE.Vector3());const r=b.getSize(new THREE.Vector3()).length()/2;
+  const d=r/Math.sin(THREE.MathUtils.degToRad(cam.fov/2))*1.05;const dir=new THREE.Vector3(1.1,0.7,1.25).normalize();
+  cam.position.copy(c).addScaledVector(dir,d);cam.near=d/100;cam.far=d*10;cam.updateProjectionMatrix();controls.target.copy(c);controls.update();}
+$('fit').onclick=()=>{if(cur)show(cur)};$('replay').onclick=()=>{if(cur)show(cur)};
+$('ctx').onclick=()=>{ctxOn=!ctxOn;$('ctx').setAttribute('aria-pressed',ctxOn);if(cur)show(cur)};
+const ray=new THREE.Raycaster(),mp=new THREE.Vector2();
+canvas.addEventListener('pointermove',e=>{const r=canvas.getBoundingClientRect();mp.set((e.clientX-r.left)/r.width*2-1,-(e.clientY-r.top)/r.height*2+1);ray.setFromCamera(mp,cam);
+  const hit=ray.intersectObject(root,true).find(h=>h.object.visible);const tip=$('tip');
+  if(hit){let o=hit.object,name='';while(o&&o!==root){const k=o.userData&&o.userData.name||o.name;if(k&&byKey.get(san(k))===o){name=k;break}o=o.parent}
+    tip.textContent=(name||hit.object.name).replace(/^R:/,'').replace(/_simplified/,'');tip.hidden=false;tip.style.left=(e.clientX-r.left+12)+'px';tip.style.top=(e.clientY-r.top+12)+'px'}else tip.hidden=true});
+canvas.addEventListener('pointerleave',()=>$('tip').hidden=true);
+(function loop(t){requestAnimationFrame(loop);
+  if(anim){const k=anim.dur?Math.min(1,(t-anim.t0)/anim.dur):1;const e=1-Math.pow(1-k,3);
+    anim.meshes.forEach(m=>{m.position.copy(m.userData.home).addScaledVector(m.userData.off,1-e)});if(k>=1)anim=null}
+  controls.update();renderer.render(scene,cam);
+  labs.forEach(l=>{const v=l.p.clone().project(cam);l.el.hidden=!!anim||v.z>1;l.el.style.left=(v.x+1)/2*canvas.clientWidth+'px';l.el.style.top=(1-v.y)/2*canvas.clientHeight+'px'})})(0);
+</script>

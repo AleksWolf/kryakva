@@ -1,0 +1,24 @@
+# padd for the stand-alone duck (duck-brain P25, deploy/standalone/README.md): the DualSense BlueZ
+# already paired and trusted, through the kernel's hid-playstation — no configd. @DIR@ by install.sh.
+[Unit]
+Description=duck padd (DualSense → robotd)
+After=robotd.service bluetooth.service
+BindsTo=robotd.service
+
+[Service]
+Type=simple
+WorkingDirectory=@DIR@
+Environment=RUST_LOG=info
+# --silent-after-ms 250: motion sensors silent that long = the radio link is gone (README).
+ExecStart=@DIR@/bin/padd --socket /run/duck/robot.sock --config @DIR@/robotd.toml --tap-socket /run/duck/pad.sock --silent-after-ms 250
+# padd exits when robotd is not answering yet, or goes away; systemd brings it back.
+Restart=always
+RestartSec=1
+StandardOutput=journal
+StandardError=journal
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/run/duck
+
+[Install]
+WantedBy=multi-user.target

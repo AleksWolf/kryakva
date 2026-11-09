@@ -1,0 +1,13 @@
+{
+    "configuration": "default",
+    "documentId": "c7bd6fc8896f06a6b7c5b77c",
+    "documentMicroversion": "bd0d418455717fbcce0dc494",
+    "elementId": "fc0ca713899b4db905ae68f4",
+    "fullConfiguration": "default",
+    "id": "MNgzutamS2KA5zL3g",
+    "isStandardContent": false,
+    "name": "rigidity_plate <1>",
+    "partId": "J3D",
+    "suppressed": false,
+    "type": "Part"
+}

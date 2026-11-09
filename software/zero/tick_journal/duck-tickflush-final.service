@@ -1,0 +1,14 @@
+# Last copy at shutdown: Before=robotd means that on stop it runs AFTER robotd (robotd has finished the journal).
+[Unit]
+Description=duck: tick journal RAM -> SD at shutdown
+Before=robotd.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/bin/python3 /usr/local/bin/duck-tickflush.py
+
+[Install]
+WantedBy=multi-user.target

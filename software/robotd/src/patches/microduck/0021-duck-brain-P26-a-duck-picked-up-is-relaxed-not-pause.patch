@@ -1,0 +1,80 @@
+From f8c72fc2579a1e3f17238e07afc79fb18aabf3ee Mon Sep 17 00:00:00 2001
+From: duck-brain <duck-brain@localhost>
+Date: Sun, 8 Nov 2026 13:01:08 +0000
+Subject: [PATCH] duck-brain P26: a duck picked up is relaxed, not paused
+
+Alex replayed Pollen's pick-up classifier (v2) over the duck's journals of
+08.11 (scripts/pickup_replay.py): standing and walking in place, 1913
+ticks, p(held) median 0.03 and no pause; lifted, 0.68 -> 0.99 within
+0.2-0.3 s and held there. It fits without retraining. So on its edge
+robotd now relaxes - torque off on all 15, read back, as the pad's PS -
+in that same tick, instead of ramping to Pollen's pause pose, and nothing
+hands the duck back to the policy: Options does.
+---
+ robotd/src/main.rs | 29 ++++++++++++++++++++++++++---
+ 1 file changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/robotd/src/main.rs b/robotd/src/main.rs
+index 0413db3..e7c1069 100644
+--- a/robotd/src/main.rs
++++ b/robotd/src/main.rs
+@@ -3458,6 +3458,7 @@ async fn control_loop<T: RobotIo>(
+         // networks have the robot — everything that owns it outright (a skill, a sit, the
+         // limp-fall, a disable, the shutdown sit) ends a pause and resets the watch. Roller mode
+         // is not watched: the model has never seen wheels.
++        let mut pickup_relax = false;
+         let pickup_paused = match pickup_watch.as_mut() {
+             Some(watch) => {
+                 let watching = policy_cfg.mode == Mode::Walk
+@@ -3472,12 +3473,16 @@ async fn control_loop<T: RobotIo>(
+                         .as_ref()
+                         .is_some_and(|c| !c.busy() && !c.is_sitting());
+                 let p_held = watch.p_held().map(|p| format!("{p:.2}"));
++                // duck-brain P26: a duck picked up is relaxed — torque off on all 15, read back, as
++                // the pad's PS — not paused into Pollen's pause pose, and nothing hands it back to
++                // the policy: Options does. Done right below, in this tick.
+                 match watch.tick(watching, fresh.as_ref(), period) {
+                     Some(pickup::Edge::Pause) => {
+                         tracing::warn!(
+                             p_held = watch.p_held().map(|p| format!("{p:.2}")),
+-                            "picked up — pausing the policy"
+-                        )
++                            "picked up — relax (torque off); Options to start again"
++                        );
++                        pickup_relax = true;
+                     }
+                     Some(pickup::Edge::Resume) if watching => {
+                         tracing::warn!(
+@@ -3493,10 +3498,28 @@ async fn control_loop<T: RobotIo>(
+                     }
+                     None => {}
+                 }
+-                watch.paused()
++                watch.paused() && !pickup_relax
+             }
+             None => false,
+         };
++        if pickup_relax {
++            // As `robot.relax` does, now rather than at the next tick's power request: the rest of
++            // this tick then commands a limp robot, which reaches no servo (P23).
++            intents.request_relax();
++            let _ = intents.take_power_request();
++            match safety.set_torque(false) {
++                Ok(()) => {
++                    tracing::warn!("robot.relax: torque off (picked up)");
++                    bringup = Bringup::Limp;
++                    was_driving = false;
++                    if let Some(controller) = controller.as_mut() {
++                        controller.forget();
++                    }
++                }
++                Err(e) => tracing::error!(error = %e, "picked up: torque off did not take everywhere"),
++            }
++            snapshot.enabled = false;
++        }
+ 
+         // Smooth the command. The limp-fall sequence holds the twist at zero outright, so
+         // the robot is not handed back mid-command; and leaving body-pose mode snaps the
+-- 
+2.43.0
+

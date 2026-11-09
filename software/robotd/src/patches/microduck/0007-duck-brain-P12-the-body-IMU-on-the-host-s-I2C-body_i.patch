@@ -1,0 +1,1115 @@
+From 352549eb1aec7a9f1becf0ec77ae43ea3f6cb614 Mon Sep 17 00:00:00 2001
+From: duck-brain <duck-brain@localhost>
+Date: Sat, 17 Oct 2026 00:07:42 +0000
+Subject: [PATCH 7/8] duck-brain P12: the body IMU on the host's I2C
+ (`[body_imu]`)
+
+On the duck-brain robot the LSM6DSV16X sits on the Zero 3W's own I2C,
+not on an imu_to_dxl board on the servo bus.
+
+- robotd/src/body_imu.rs: a reader thread polls the chip at
+  `[body_imu] poll_hz` (default 200, at least 100). Bring-up is
+  head_imu's (imu_to_dxl's: reset, reload trimming, configure, read back,
+  SFLP), batching gyro, accel and the game quaternion at 120 Hz (FIFO_CTRL3
+  0x66, SFLP_ODR 011, checked against ST's lsm6dsv16x_reg.h). FIFO
+  records are packed into the imu_to_dxl 12-byte block (raw gyro counts +
+  quaternion halves) and decoded by the same SflpDecoder, with its median
+  filter off (SflpDecoder::unfiltered). Each sample is stamped and handed
+  to the tick through ImuFeed; the tick reports the age of the one it used.
+  No magnetometer: heading is the game quaternion's yaw (integrated gyro).
+- head_imu.rs: Chip, the register constants and the bring-up rate made
+  reachable (Rate::Hz60 for the head as before, Rate::Hz120 for the body).
+- [body_imu] params: bus (/dev/i2c-3), address (0x6a or 0x6b), poll_hz,
+  mount quaternion (identity until measured); on by default with the
+  feetech driver.
+- `robotd body-imu [--solve]`: the reader alone, printing gravity, gyro
+  and sample age in the trunk frame; --solve measures the mount from two
+  still poses (upright, nose-down) and prints [body_imu.mount].
+- robot.health `host_imu`: device, error, ready, poll and sample rates.
+---
+ duck-control/src/host_imu.rs  | 135 +++++++++++++
+ duck-control/src/imu.rs       |  28 ++-
+ duck-ipc-proto/src/lib.rs     |  19 ++
+ robotctl/src/configure.rs     |   5 +-
+ robotd-params/src/edit.rs     |   1 +
+ robotd-params/src/lib.rs      |  99 +++++++++-
+ robotd-params/src/registry.rs |  14 ++
+ robotd/src/body_imu.rs        | 347 ++++++++++++++++++++++++++++++++++
+ robotd/src/feetech_bus.rs     |  13 ++
+ robotd/src/head_imu.rs        |  82 ++++++--
+ robotd/src/main.rs            |  52 ++++-
+ 11 files changed, 770 insertions(+), 25 deletions(-)
+ create mode 100644 robotd/src/body_imu.rs
+
+diff --git a/duck-control/src/host_imu.rs b/duck-control/src/host_imu.rs
+index e9bad7c..58c68f8 100644
+--- a/duck-control/src/host_imu.rs
++++ b/duck-control/src/host_imu.rs
+@@ -4,6 +4,11 @@
+ //! `imu_to_dxl` board, so the tick cannot get orientation in the same transaction as the joints.
+ //! A reader thread (`robotd`'s `body_imu`, P12) polls the chip and publishes here; the bus driver
+ //! (P11) takes the newest sample at the start of each tick, together with how old it is.
++//!
++//! The sample is decoded by the same [`crate::imu::SflpDecoder`] the `imu_to_dxl` block goes
++//! through — raw gyro counts and the SFLP game quaternion, the mount, projected gravity — minus
++//! the median-of-three spike filter ([`crate::imu::SflpDecoder::unfiltered`]): the policies were
++//! trained without a filter on the observation.
+ 
+ use std::sync::Mutex;
+ use std::sync::atomic::{AtomicBool, Ordering};
+@@ -112,3 +117,133 @@ impl ImuFeed {
+ pub fn age(sample: &HostSample, now: Instant) -> Duration {
+     now.saturating_duration_since(sample.at)
+ }
++
++/// The sensor→trunk mount from two still poses, as gravity measured in the sensor's own axes
++/// (an identity mount): the robot upright, and the robot pitched nose-down by any clear angle.
++///
++/// Upright, gravity is the trunk's −z; nose-down it gains a +x part and no y part (trunk `x`
++/// forward, `y` left, `z` up). So the trunk's axes, in sensor coordinates, are `z = −up`,
++/// `x` = the nose-down reading with its `z` part removed, `y = z × x` — the rows of the matrix
++/// that takes a sensor vector into the trunk, which is what [`crate::imu::SflpDecoder`]'s mount
++/// does. `None` when the two poses are too close to tell an axis from.
++pub fn mount_from_two_poses(upright: [f64; 3], nose_down: [f64; 3]) -> Option<[f64; 4]> {
++    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
++    let unit = |v: [f64; 3]| {
++        let n = dot(v, v).sqrt();
++        (n > 1e-6).then(|| v.map(|c| c / n))
++    };
++    let z = unit(upright.map(|c| -c))?;
++    let d = dot(nose_down, z);
++    let x_raw = [
++        nose_down[0] - d * z[0],
++        nose_down[1] - d * z[1],
++        nose_down[2] - d * z[2],
++    ];
++    // Less than ~6° of tilt is not a pose, it is a hand shaking.
++    if dot(x_raw, x_raw).sqrt() < 0.1 * dot(nose_down, nose_down).sqrt() {
++        return None;
++    }
++    let x = unit(x_raw)?;
++    let y = [
++        z[1] * x[2] - z[2] * x[1],
++        z[2] * x[0] - z[0] * x[2],
++        z[0] * x[1] - z[1] * x[0],
++    ];
++    // Rows x, y, z: trunk = R · sensor. Quaternion of R (Shepperd), scalar first, w ≥ 0.
++    let r = [x, y, z];
++    let trace = r[0][0] + r[1][1] + r[2][2];
++    let q = if trace > 0.0 {
++        let s = (trace + 1.0).sqrt() * 2.0;
++        [
++            0.25 * s,
++            (r[2][1] - r[1][2]) / s,
++            (r[0][2] - r[2][0]) / s,
++            (r[1][0] - r[0][1]) / s,
++        ]
++    } else if r[0][0] > r[1][1] && r[0][0] > r[2][2] {
++        let s = (1.0 + r[0][0] - r[1][1] - r[2][2]).sqrt() * 2.0;
++        [
++            (r[2][1] - r[1][2]) / s,
++            0.25 * s,
++            (r[0][1] + r[1][0]) / s,
++            (r[0][2] + r[2][0]) / s,
++        ]
++    } else if r[1][1] > r[2][2] {
++        let s = (1.0 + r[1][1] - r[0][0] - r[2][2]).sqrt() * 2.0;
++        [
++            (r[0][2] - r[2][0]) / s,
++            (r[0][1] + r[1][0]) / s,
++            0.25 * s,
++            (r[1][2] + r[2][1]) / s,
++        ]
++    } else {
++        let s = (1.0 + r[2][2] - r[0][0] - r[1][1]).sqrt() * 2.0;
++        [
++            (r[1][0] - r[0][1]) / s,
++            (r[0][2] + r[2][0]) / s,
++            (r[1][2] + r[2][1]) / s,
++            0.25 * s,
++        ]
++    };
++    let q = if q[0] < 0.0 { q.map(|c| -c) } else { q };
++    let n = dot([q[1], q[2], q[3]], [q[1], q[2], q[3]]) + q[0] * q[0];
++    Some(q.map(|c| c / n.sqrt()))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::imu::SflpDecoder;
++
++    /// Rotate by a scalar-first quaternion.
++    fn rotate(q: [f64; 4], v: [f64; 3]) -> [f64; 3] {
++        let [w, x, y, z] = q;
++        let t = [
++            2.0 * (y * v[2] - z * v[1]),
++            2.0 * (z * v[0] - x * v[2]),
++            2.0 * (x * v[1] - y * v[0]),
++        ];
++        [
++            v[0] + w * t[0] + (y * t[2] - z * t[1]),
++            v[1] + w * t[1] + (z * t[0] - x * t[2]),
++            v[2] + w * t[2] + (x * t[1] - y * t[0]),
++        ]
++    }
++
++    /// Gravity a sensor mounted with `mount` reads, for a trunk-frame gravity `g`.
++    fn sensed(mount: [f64; 4], g: [f64; 3]) -> [f64; 3] {
++        let inverse = [mount[0], -mount[1], -mount[2], -mount[3]];
++        rotate(inverse, g)
++    }
++
++    /// The two-pose solve recovers Pollen's two known mounts and an arbitrary one.
++    #[test]
++    fn two_poses_recover_the_mount() {
++        let h = std::f64::consts::FRAC_1_SQRT_2;
++        let odd = {
++            let (a, b, c, d) = (0.3f64, -0.5, 0.7, 0.2);
++            let n = (a * a + b * b + c * c + d * d).sqrt();
++            [a / n, b / n, c / n, d / n]
++        };
++        for mount in [
++            SflpDecoder::DEFAULT_MOUNT,
++            SflpDecoder::BETA_MOUNT,
++            [0.5, 0.5, -0.5, -0.5],
++            odd,
++            [h, 0.0, 0.0, h],
++        ] {
++            let up = sensed(mount, [0.0, 0.0, -1.0]);
++            let theta = 0.6f64;
++            let nose = sensed(mount, [theta.sin(), 0.0, -theta.cos()]);
++            let got = mount_from_two_poses(up, nose).expect("solvable");
++            let same = got.iter().zip(mount).all(|(a, b)| (a - b).abs() < 1e-9)
++                || got.iter().zip(mount).all(|(a, b)| (a + b).abs() < 1e-9);
++            assert!(same, "mount {mount:?}, solved {got:?}");
++        }
++        assert_eq!(
++            mount_from_two_poses([0.0, 0.0, -1.0], [0.0, 0.01, -1.0]),
++            None,
++            "no tilt"
++        );
++    }
++}
+diff --git a/duck-control/src/imu.rs b/duck-control/src/imu.rs
+index 37e0b1e..e95dcfd 100644
+--- a/duck-control/src/imu.rs
++++ b/duck-control/src/imu.rs
+@@ -64,6 +64,9 @@ pub struct SflpDecoder {
+     quat_samples: u32,
+     gyro_history: [[f64; 3]; 2],
+     gravity_history: [[f64; 3]; 2],
++    /// The median-of-three spike filter on gyro and gravity. On for the `imu_to_dxl` block;
++    /// off for the host-read chip (duck-brain P12), whose policies were trained unfiltered.
++    median: bool,
+ }
+ 
+ impl Default for SflpDecoder {
+@@ -94,6 +97,15 @@ impl SflpDecoder {
+             quat_samples: 0,
+             gyro_history: [[0.0; 3]; 2],
+             gravity_history: [[0.0, 0.0, -1.0]; 2],
++            median: true,
++        }
++    }
++
++    /// The same decoder without the median filter: what the sample says, as it says it.
++    pub fn unfiltered(mount: [f64; 4]) -> Self {
++        Self {
++            median: false,
++            ..Self::new(mount)
+         }
+     }
+ 
+@@ -150,10 +162,18 @@ impl SflpDecoder {
+         // but that is a behaviour change to a path that currently walks.
+         let gravity = normalise(rotate_inverse(self.last_quat, [0.0, 0.0, -1.0]));
+ 
+-        let out = ImuData {
+-            gyro: median3_each(&self.gyro_history, gyro),
+-            gravity: median3_each(&self.gravity_history, gravity),
+-            quat: self.last_quat,
++        let out = if self.median {
++            ImuData {
++                gyro: median3_each(&self.gyro_history, gyro),
++                gravity: median3_each(&self.gravity_history, gravity),
++                quat: self.last_quat,
++            }
++        } else {
++            ImuData {
++                gyro,
++                gravity,
++                quat: self.last_quat,
++            }
+         };
+         self.gyro_history = [self.gyro_history[1], gyro];
+         self.gravity_history = [self.gravity_history[1], gravity];
+diff --git a/duck-ipc-proto/src/lib.rs b/duck-ipc-proto/src/lib.rs
+index a90fec4..88c8ea4 100644
+--- a/duck-ipc-proto/src/lib.rs
++++ b/duck-ipc-proto/src/lib.rs
+@@ -3711,6 +3711,25 @@ pub struct HealthResult {
+     /// The Feetech bus, servo by servo (duck-brain P11). Absent on a Dynamixel robot.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub feetech: Option<FeetechHealth>,
++    /// The body IMU read on the host's I²C (duck-brain P12). Absent on a Dynamixel robot.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub host_imu: Option<HostImuHealth>,
++}
++
++/// The host-read body IMU's reader (duck-brain P12). The age of the sample each tick used is in
++/// [`FeetechHealth`], beside the tick.
++#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
++pub struct HostImuHealth {
++    /// `"/dev/i2c-3 0x6a"` once the chip answered and configured.
++    pub device: Option<String>,
++    /// Why there is no chip, or the last read error.
++    pub error: Option<String>,
++    /// The SFLP output has converged.
++    pub ready: bool,
++    /// FIFO polls and samples per second since the reader started.
++    pub poll_hz: Option<f64>,
++    pub sample_hz: Option<f64>,
++    pub samples: u64,
+ }
+ 
+ /// What the Feetech driver has seen since it started (duck-brain P11). Percentiles are over the
+diff --git a/robotctl/src/configure.rs b/robotctl/src/configure.rs
+index 733160b..1cc77ed 100644
+--- a/robotctl/src/configure.rs
++++ b/robotctl/src/configure.rs
+@@ -135,8 +135,9 @@ fn apply_for(key: &str) -> Option<Apply> {
+         // Read once at startup by both `padd` and `netpadd`, each to decide whether it is the one
+         // to run (`--should-run`). `apply_for` names one daemon; `plan_for_keys` adds `padd`.
+         "netpad" => Apply::Restart("netpadd"),
+-        // `feetech`: duck-brain P11, the HD-1910 bus robotd opens once at startup.
+-        "bus" | "feetech" | "control" | "update_gate" | "policy" | "safety" | "chorale"
++        // `feetech`, `body_imu`: duck-brain P11/P12, the HD-1910 bus and the host IMU, both opened
++        // once at startup.
++        "bus" | "feetech" | "body_imu" | "control" | "update_gate" | "policy" | "safety" | "chorale"
+         | "theremin" | "pickup" | "audio" => Apply::Restart("robotd"),
+         _ => return None,
+     })
+diff --git a/robotd-params/src/edit.rs b/robotd-params/src/edit.rs
+index 560ec0d..c830e42 100644
+--- a/robotd-params/src/edit.rs
++++ b/robotd-params/src/edit.rs
+@@ -1177,6 +1177,7 @@ mod tests {
+                 "bus",
+                 // duck-brain P11: the HD-1910 bus, beside the bus it replaces.
+                 "feetech",
++                "body_imu",
+                 "control",
+                 "update_gate",
+                 "policy",
+diff --git a/robotd-params/src/lib.rs b/robotd-params/src/lib.rs
+index 3b11ce3..a244dae 100644
+--- a/robotd-params/src/lib.rs
++++ b/robotd-params/src/lib.rs
+@@ -73,6 +73,8 @@ pub struct Params {
+     /// The Feetech HD-1910 bus of the duck-brain robot (duck-brain P11); read when
+     /// `[bus] driver = "feetech"`.
+     pub feetech: FeetechParams,
++    /// The body IMU on the host's I²C (duck-brain P12), read on a Feetech robot.
++    pub body_imu: BodyImuParams,
+     pub control: Control,
+     pub update_gate: UpdateGate,
+     pub policy: PolicyParams,
+@@ -1003,7 +1005,7 @@ impl HeadImuParams {
+     }
+ }
+ 
+-/// duck-brain P11: `[feetech]` is checked only on a Feetech robot, and then strictly.
++/// duck-brain P11/P12: `[feetech]` and `[body_imu]` are checked only on a Feetech robot.
+ #[cfg(test)]
+ mod feetech_tests {
+     use super::*;
+@@ -1036,6 +1038,21 @@ mod feetech_tests {
+         // A Dynamixel robot never reads the section, so it never fails over it.
+         assert!(load("[feetech]\nspeed = 0\n").is_ok());
+     }
++
++    #[test]
++    fn the_body_imu_follows_the_driver_and_is_checked() {
++        let p = load("[bus]\ndriver = \"feetech\"\n").unwrap();
++        assert!(p.body_imu.enabled_for(p.bus.driver));
++        assert_eq!((p.body_imu.bus.as_str(), p.body_imu.address), ("/dev/i2c-3", 0x6a));
++        assert_eq!(p.body_imu.mount(), [1.0, 0.0, 0.0, 0.0]);
++        assert!(!Params::default().body_imu.enabled_for(BusDriver::Dynamixel));
++        let p = load("[bus]\ndriver = \"feetech\"\n[body_imu]\naddress = 0x6b\n[body_imu.mount]\nw = 0.7071068\nx = 0.0\ny = 0.7071068\nz = 0.0\n").unwrap();
++        assert_eq!(p.body_imu.address, 0x6b);
++        let err = load("[bus]\ndriver = \"feetech\"\n[body_imu]\naddress = 0x18\n").unwrap_err();
++        assert!(err.to_string().contains("body_imu.address"), "{err}");
++        let err = load("[bus]\ndriver = \"feetech\"\n[body_imu.mount]\nw = 2.0\nx = 0.0\ny = 0.0\nz = 0.0\n").unwrap_err();
++        assert!(err.to_string().contains("body_imu.mount"), "{err}");
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -2383,6 +2400,67 @@ impl Default for FeetechParams {
+     }
+ }
+ 
++/// `[body_imu]` — the duck-brain robot's LSM6DSV16X on the Zero 3W's own I²C (duck-brain P12).
++///
++/// Bus, address and mount depend on how the chip is wired and fixed in the body, which nobody
++/// has measured yet: the shipped values are where to start, and `robotd body-imu` is how to check
++/// them (docs/board.md in duck-brain).
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields, default)]
++pub struct BodyImuParams {
++    /// Read it at all. Absent means: on when `[bus] driver = "feetech"`, which has no other IMU.
++    pub enabled: Option<bool>,
++    /// The i2c-dev node. Header pins 3/5 are `i2c3` once the overlay is loaded.
++    pub bus: String,
++    /// 0x6a with SA0 low, 0x6b with SA0 high.
++    pub address: u16,
++    /// FIFO polls per second; the chip batches at 120 Hz, so a sample waits at most one poll.
++    pub poll_hz: u32,
++    /// Sensor→trunk rotation, scalar first: trunk `x` forward, `y` left, `z` up.
++    pub mount: Mount,
++}
++
++/// A unit quaternion, scalar first.
++#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct Mount {
++    pub w: f64,
++    pub x: f64,
++    pub y: f64,
++    pub z: f64,
++}
++
++impl Default for BodyImuParams {
++    fn default() -> Self {
++        Self {
++            enabled: None,
++            bus: "/dev/i2c-3".into(),
++            address: 0x6a,
++            poll_hz: 200,
++            mount: Mount {
++                w: 1.0,
++                x: 0.0,
++                y: 0.0,
++                z: 0.0,
++            },
++        }
++    }
++}
++
++impl BodyImuParams {
++    /// Whether the host IMU is read for a robot whose bus is `driver`.
++    pub fn enabled_for(&self, driver: BusDriver) -> bool {
++        self.enabled.unwrap_or(driver == BusDriver::Feetech)
++    }
++
++    /// The mount, normalised.
++    pub fn mount(&self) -> [f64; 4] {
++        let m = self.mount;
++        let n = (m.w * m.w + m.x * m.x + m.y * m.y + m.z * m.z).sqrt();
++        [m.w / n, m.x / n, m.y / n, m.z / n]
++    }
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ #[serde(deny_unknown_fields, default)]
+ pub struct Control {
+@@ -2763,6 +2841,25 @@ impl Params {
+                 return Err(setting("speed", "0 means stop, not unlimited".into()));
+             }
+         }
++        if self.body_imu.enabled_for(self.bus.driver) {
++            let setting = |key: &str, reason: String| ParamsError::Setting {
++                path: path.display().to_string(),
++                key: format!("body_imu.{key}"),
++                reason,
++            };
++            let b = &self.body_imu;
++            if b.address != 0x6a && b.address != 0x6b {
++                return Err(setting("address", format!("{:#04x}: the LSM6DSV16X is 0x6a or 0x6b", b.address)));
++            }
++            if !(100..=1000).contains(&b.poll_hz) {
++                return Err(setting("poll_hz", format!("{} must be 100–1000", b.poll_hz)));
++            }
++            let m = b.mount;
++            let n = (m.w * m.w + m.x * m.x + m.y * m.y + m.z * m.z).sqrt();
++            if !(n.is_finite() && (n - 1.0).abs() < 0.01) {
++                return Err(setting("mount", format!("|q| = {n:.4}: a rotation is a unit quaternion")));
++            }
++        }
+         // An inverted band would pause and resume on the same probability, every tick.
+         let (pause, resume) = (self.pickup.pause_threshold, self.pickup.resume_threshold);
+         if !(0.0 < resume && resume < pause && pause < 1.0) {
+diff --git a/robotd-params/src/registry.rs b/robotd-params/src/registry.rs
+index 16dee51..d96547a 100644
+--- a/robotd-params/src/registry.rs
++++ b/robotd-params/src/registry.rs
+@@ -158,6 +158,20 @@ pub const REGISTRY: &[Entry] = &[
+         ),
+         "Direction of each joint, 1 or -1 — measured on the assembled robot",
+     ),
++    // ── [body_imu] (duck-brain P12) ──────────────────────────────────────────
++    entry(
++        "body_imu.enabled",
++        Kind::TriBool,
++        "Read the host's LSM6DSV16X — unset: on with the feetech driver",
++    ),
++    entry("body_imu.bus", Kind::Text, "i2c-dev node the body IMU is on"),
++    entry("body_imu.address", Kind::Integer, "Body IMU I²C address: 0x6a (106) or 0x6b (107)"),
++    entry("body_imu.poll_hz", Kind::Integer, "Body IMU FIFO polls per second (100–1000)"),
++    entry(
++        "body_imu.mount",
++        Kind::Record("w = 1.0\nx = 0.0\ny = 0.0\nz = 0.0"),
++        "Sensor→trunk rotation — `robotd body-imu --solve` measures it",
++    ),
+     // ── [control] ────────────────────────────────────────────────────────────
+     entry("control.hz", Kind::Integer, "Control loop rate"),
+     entry(
+diff --git a/robotd/src/body_imu.rs b/robotd/src/body_imu.rs
+new file mode 100644
+index 0000000..d1b63bf
+--- /dev/null
++++ b/robotd/src/body_imu.rs
+@@ -0,0 +1,347 @@
++//! The body IMU on the host's I²C (duck-brain patch P12): an LSM6DSV16X on the Zero 3W's own
++//! bus, polled by this thread at `[body_imu] poll_hz` and handed to the Feetech tick through
++//! [`ImuFeed`].
++//!
++//! What it gives the observation is what `imu_to_dxl` gave on Pollen's bus, decoded by the same
++//! code: the chip's raw gyro counts (±500 dps) and its SFLP game-rotation quaternion are packed
++//! into the board's 12-byte block and run through [`SflpDecoder`] — the mount, projected gravity —
++//! with the median filter off ([`SflpDecoder::unfiltered`]). There is no magnetometer: heading is
++//! the game quaternion's yaw, which is the chip's integral of its gyro, zero wherever it started.
++//!
++//! The bring-up is `head_imu`'s, which is `imu_to_dxl`'s (reset, reload the trimming, configure,
++//! read back, start SFLP), batching at 120 Hz rather than the head's 60: the tick takes the newest
++//! sample, and a sample's age is part of the observation's.
++//!
++//! A sample is stamped when the poll that fetched it read the FIFO, the newest of a burst at the
++//! read and each earlier one a batch period (8.3 ms) before it. The chip produced the newest one
++//! up to one batch period before that read, so the age `robot.health` reports is short by at most
++//! 8.3 ms.
++
++use std::sync::Arc;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::time::{Duration, Instant};
++
++use duck_control::host_imu::{HostSample, ImuFeed};
++use duck_control::imu::{IMU_BLOCK_LEN, SflpDecoder};
++use robotd_params::Params;
++
++use crate::head_imu::{RECORD, TAG_GYRO, TAG_SFLP_GAME};
++
++/// `[body_imu]` as the reader takes it.
++#[derive(Debug, Clone, PartialEq)]
++pub struct Config {
++    pub bus: String,
++    pub address: u16,
++    pub poll_hz: u32,
++    pub mount: [f64; 4],
++}
++
++impl Config {
++    pub fn from(params: &Params) -> Self {
++        Self {
++            bus: params.body_imu.bus.clone(),
++            address: params.body_imu.address,
++            poll_hz: params.body_imu.poll_hz,
++            mount: params.body_imu.mount(),
++        }
++    }
++}
++
++/// FIFO records into `imu_to_dxl` blocks, one per SFLP quaternion: the gyro record before it (or
++/// the previous burst's, kept in `last_gyro`), then the quaternion's three half floats.
++pub fn blocks(burst: &[u8], last_gyro: &mut [u8; 6]) -> Vec<[u8; IMU_BLOCK_LEN]> {
++    let (records, _) = burst.as_chunks::<RECORD>();
++    let mut out = Vec::new();
++    for record in records {
++        match record[0] >> 3 {
++            TAG_GYRO => last_gyro.copy_from_slice(&record[1..7]),
++            TAG_SFLP_GAME => {
++                let mut block = [0u8; IMU_BLOCK_LEN];
++                block[..6].copy_from_slice(last_gyro);
++                block[6..].copy_from_slice(&record[1..7]);
++                out.push(block);
++            }
++            _ => {}
++        }
++    }
++    out
++}
++
++/// Start the reader, on a robot whose `[body_imu]` is on. A thread of its own: it wakes
++/// `poll_hz` times a second, which the control thread must never wait on.
++pub fn start(cfg: Config, feed: Arc<ImuFeed>, shutdown: Arc<AtomicBool>) {
++    let spawned = std::thread::Builder::new()
++        .name("body-imu".into())
++        .spawn(move || run(&cfg, &feed, &shutdown));
++    if let Err(e) = spawned {
++        tracing::error!(error = %e, "cannot start the body IMU reader");
++    }
++}
++
++#[cfg(target_os = "linux")]
++pub use reader::run;
++
++#[cfg(not(target_os = "linux"))]
++pub fn run(_cfg: &Config, feed: &ImuFeed, _shutdown: &AtomicBool) {
++    feed.update_status(|s| {
++        s.error = Some("the body IMU is on I2C, which exists only on Linux".into())
++    });
++}
++
++#[cfg(target_os = "linux")]
++mod reader {
++    use super::*;
++    use crate::head_imu::{Chip, FIFO_DATA_OUT_TAG, FIFO_STATUS1, Rate, WHO_AM_I, WHO_AM_I_VALUE};
++
++    /// More than a poll ever queues at 120 Hz (a few records), less than the FIFO's 512 words.
++    const MAX_WORDS: usize = 64;
++    const RETRY_MIN: Duration = Duration::from_millis(500);
++    const RETRY_MAX: Duration = Duration::from_secs(30);
++
++    fn open(cfg: &Config) -> Result<Chip, String> {
++        let mut chip = Chip::open(&cfg.bus, cfg.address)
++            .map_err(|e| format!("{} {:#04x}: {e}", cfg.bus, cfg.address))?;
++        match chip.read1(WHO_AM_I) {
++            Ok(WHO_AM_I_VALUE) => {}
++            Ok(other) => {
++                return Err(format!(
++                    "{} {:#04x}: WHO_AM_I {other:#04x}, not an LSM6DSV16X",
++                    cfg.bus, cfg.address
++                ));
++            }
++            Err(e) => return Err(format!("{} {:#04x}: {e}", cfg.bus, cfg.address)),
++        }
++        chip.bring_up_at(Rate::Hz120)
++            .map_err(|e| format!("{} {:#04x} did not configure: {e}", cfg.bus, cfg.address))?;
++        Ok(chip)
++    }
++
++    /// Poll the chip until shutdown, publishing every decoded sample. Reopens with backoff on any
++    /// error, and says why in `robot.health`.
++    pub fn run(cfg: &Config, feed: &ImuFeed, shutdown: &AtomicBool) {
++        let period = Duration::from_secs_f64(1.0 / f64::from(cfg.poll_hz.max(1)));
++        let batch = Duration::from_secs_f64(1.0 / f64::from(Rate::Hz120.hz()));
++        let mut backoff = RETRY_MIN;
++        let mut seq = 0u64;
++        feed.update_status(|s| s.started = Some(Instant::now()));
++        while !shutdown.load(Ordering::Acquire) {
++            let mut chip = match open(cfg) {
++                Ok(chip) => chip,
++                Err(why) => {
++                    tracing::warn!(why, "body IMU not available; retrying");
++                    feed.update_status(|s| {
++                        s.device = None;
++                        s.error = Some(why);
++                    });
++                    sleep_unless(backoff, shutdown);
++                    backoff = (backoff * 2).min(RETRY_MAX);
++                    continue;
++                }
++            };
++            let at = format!("{} {:#04x}", cfg.bus, cfg.address);
++            tracing::info!(
++                at,
++                poll_hz = cfg.poll_hz,
++                "body IMU found: LSM6DSV16X, SFLP at 120 Hz"
++            );
++            feed.update_status(|s| {
++                s.device = Some(at.clone());
++                s.error = None;
++            });
++            backoff = RETRY_MIN;
++            let mut decoder = SflpDecoder::unfiltered(cfg.mount);
++            let mut last_gyro = [0u8; 6];
++            let mut burst = vec![0u8; MAX_WORDS * RECORD];
++            let error = loop {
++                if shutdown.load(Ordering::Acquire) {
++                    return;
++                }
++                let tick = Instant::now();
++                let mut level = [0u8; 2];
++                if let Err(e) = chip.read(FIFO_STATUS1, &mut level) {
++                    break e;
++                }
++                let words =
++                    (usize::from(level[0]) | (usize::from(level[1] & 0x01) << 8)).min(MAX_WORDS);
++                let mut n = 0;
++                if words > 0 {
++                    let bytes = &mut burst[..words * RECORD];
++                    if let Err(e) = chip.read(FIFO_DATA_OUT_TAG, bytes) {
++                        break e;
++                    }
++                    let read_at = Instant::now();
++                    let found = blocks(bytes, &mut last_gyro);
++                    n = found.len();
++                    for (i, block) in found.iter().enumerate() {
++                        let imu = decoder.decode(block);
++                        seq += 1;
++                        let behind = batch * (n - 1 - i) as u32;
++                        feed.publish(
++                            HostSample {
++                                imu,
++                                at: read_at.checked_sub(behind).unwrap_or(read_at),
++                                seq,
++                            },
++                            decoder.ready(),
++                        );
++                    }
++                }
++                feed.update_status(|s| {
++                    s.polls += 1;
++                    s.samples += n as u64;
++                });
++                let elapsed = tick.elapsed();
++                if elapsed < period {
++                    std::thread::sleep(period - elapsed);
++                }
++            };
++            tracing::warn!(error = %error, "body IMU read failed; reopening");
++            feed.update_status(|s| s.error = Some(format!("read failed: {error}")));
++            sleep_unless(backoff, shutdown);
++            backoff = (backoff * 2).min(RETRY_MAX);
++        }
++    }
++
++    fn sleep_unless(dur: Duration, shutdown: &AtomicBool) {
++        let mut left = dur;
++        while left > Duration::ZERO && !shutdown.load(Ordering::Acquire) {
++            let step = left.min(Duration::from_millis(50));
++            std::thread::sleep(step);
++            left = left.saturating_sub(step);
++        }
++    }
++}
++
++/// `robotd body-imu`: the reader on its own, printing what the tick would see five times a
++/// second — the bench check of bus, address and mount (docs/board.md in duck-brain). With
++/// `solve`, the mount is measured instead: hold the robot upright, then nose-down, and the
++/// quaternion for `[body_imu.mount]` is printed.
++pub fn bench(params: &Params, solve: bool) -> std::process::ExitCode {
++    let mut cfg = Config::from(params);
++    if solve {
++        // The sensor's own axes: gravity as the chip reads it.
++        cfg.mount = [1.0, 0.0, 0.0, 0.0];
++    }
++    let feed = Arc::new(ImuFeed::new());
++    let shutdown = Arc::new(AtomicBool::new(false));
++    start(cfg.clone(), Arc::clone(&feed), Arc::clone(&shutdown));
++    println!(
++        "body IMU on {} {:#04x}, mount {:?}; Ctrl-C to stop",
++        cfg.bus, cfg.address, cfg.mount
++    );
++    let wait_ready = || {
++        for _ in 0..100 {
++            if feed.ready() {
++                return true;
++            }
++            std::thread::sleep(Duration::from_millis(100));
++        }
++        false
++    };
++    if !wait_ready() {
++        let s = feed.status();
++        eprintln!(
++            "no converged sample in 10 s: {}",
++            s.error.unwrap_or_else(|| "no samples".into())
++        );
++        return std::process::ExitCode::FAILURE;
++    }
++    if solve {
++        let mean = |what: &str| {
++            println!("{what}, hold still, then press Enter");
++            let mut line = String::new();
++            let _ = std::io::stdin().read_line(&mut line);
++            let mut sum = [0.0f64; 3];
++            let mut n = 0.0f64;
++            let mut last = None;
++            let until = Instant::now() + Duration::from_secs(1);
++            while Instant::now() < until {
++                if let Some(s) = feed.latest()
++                    && Some(s.seq) != last
++                {
++                    last = Some(s.seq);
++                    for (a, g) in sum.iter_mut().zip(s.imu.gravity) {
++                        *a += g;
++                    }
++                    n += 1.0;
++                }
++                std::thread::sleep(Duration::from_millis(5));
++            }
++            let g = sum.map(|a| a / n.max(1.0));
++            println!(
++                "  gravity in sensor axes {:+.3} {:+.3} {:+.3} ({n} samples)",
++                g[0], g[1], g[2]
++            );
++            g
++        };
++        let up = mean("1/2: the robot upright, as it stands");
++        let nose = mean("2/2: the robot pitched nose-down, 30° or more");
++        shutdown.store(true, Ordering::Release);
++        return match duck_control::host_imu::mount_from_two_poses(up, nose) {
++            Some(q) => {
++                println!(
++                    "[body_imu.mount]\nw = {:.6}\nx = {:.6}\ny = {:.6}\nz = {:.6}",
++                    q[0], q[1], q[2], q[3]
++                );
++                std::process::ExitCode::SUCCESS
++            }
++            None => {
++                eprintln!("the two poses are too close; tilt further");
++                std::process::ExitCode::FAILURE
++            }
++        };
++    }
++    let started = Instant::now();
++    loop {
++        if let Some(s) = feed.latest() {
++            let [gx, gy, gz] = s.imu.gravity;
++            let [wx, wy, wz] = s.imu.gyro;
++            let age_ms = s.at.elapsed().as_secs_f64() * 1000.0;
++            println!(
++                "{:7.1}s gravity {gx:+.3} {gy:+.3} {gz:+.3}   gyro {wx:+.3} {wy:+.3} {wz:+.3} rad/s   age {age_ms:4.1} ms   poll {:.0} Hz, {:.0} samples/s",
++                started.elapsed().as_secs_f64(),
++                feed.poll_hz().unwrap_or(0.0),
++                feed.sample_hz().unwrap_or(0.0),
++            );
++        }
++        std::thread::sleep(Duration::from_millis(200));
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn record(tag: u8, data: [u8; 6]) -> [u8; 7] {
++        let mut r = [0u8; 7];
++        r[0] = tag << 3;
++        r[1..].copy_from_slice(&data);
++        r
++    }
++
++    /// The board's 2026-10-06 burst (head_imu's test) packs into an `imu_to_dxl` block that the
++    /// body decoder reads as a level sensor: gyro bytes first, then the quaternion's.
++    #[test]
++    fn records_pack_into_the_imu_to_dxl_block() {
++        let mut burst = Vec::new();
++        burst.extend(record(TAG_GYRO, [0xf1, 0x06, 0xb8, 0x0b, 0x1f, 0xee]));
++        burst.extend(record(
++            crate::head_imu::TAG_ACCEL,
++            [0xf7, 0xff, 0x14, 0x14, 0x05, 0xff],
++        ));
++        burst.extend(record(TAG_SFLP_GAME, [0xc9, 0x39, 0x7b, 0x18, 0x8a, 0x16]));
++        let mut last = [0u8; 6];
++        let found = blocks(&burst, &mut last);
++        assert_eq!(found.len(), 1);
++        assert_eq!(found[0][..6], [0xf1, 0x06, 0xb8, 0x0b, 0x1f, 0xee]);
++        assert_eq!(found[0][6..], [0xc9, 0x39, 0x7b, 0x18, 0x8a, 0x16]);
++        // Unfiltered: the first block's gyro is the block's own, not a median with zeros.
++        let mut d = SflpDecoder::unfiltered([1.0, 0.0, 0.0, 0.0]);
++        let imu = d.decode(&found[0]);
++        let lsb = 0.0175 * std::f64::consts::PI / 180.0;
++        assert!((imu.gyro[0] - 1777.0 * lsb).abs() < 1e-9, "{:?}", imu.gyro);
++        // A quaternion with no gyro before it in this burst takes the previous burst's.
++        let found = blocks(&record(TAG_SFLP_GAME, [0; 6]), &mut last);
++        assert_eq!(found[0][..6], [0xf1, 0x06, 0xb8, 0x0b, 0x1f, 0xee]);
++    }
++}
+diff --git a/robotd/src/feetech_bus.rs b/robotd/src/feetech_bus.rs
+index e9726fd..bea7e9a 100644
+--- a/robotd/src/feetech_bus.rs
++++ b/robotd/src/feetech_bus.rs
+@@ -171,6 +171,19 @@ pub fn health(shared: &FeetechShared) -> proto::FeetechHealth {
+     }
+ }
+ 
++/// `robot.health`'s `host_imu` block (P12).
++pub fn host_imu_health(feed: &ImuFeed) -> proto::HostImuHealth {
++    let s = feed.status();
++    proto::HostImuHealth {
++        device: if feed.is_static() { Some("--static-imu".into()) } else { s.device },
++        error: s.error,
++        ready: feed.ready(),
++        poll_hz: feed.poll_hz(),
++        sample_hz: feed.sample_hz(),
++        samples: s.samples,
++    }
++}
++
+ /// `robotd init` on a Feetech robot: refused, with the way that works. The standalone ramp goes to
+ /// Pollen's compiled home pose, which is not this robot's; `robotctl robot init` with the daemon
+ /// running ramps to the walking policy's own HOME (P6), over two seconds, through the verified
+diff --git a/robotd/src/head_imu.rs b/robotd/src/head_imu.rs
+index 6e5753e..e84e146 100644
+--- a/robotd/src/head_imu.rs
++++ b/robotd/src/head_imu.rs
+@@ -56,18 +56,18 @@ const ADDRESSES: &[u16] = &[0x6a, 0x6b];
+ 
+ // ---- Registers (ST DS13510; values as in imu_to_dxl firmware/include/lsm6dsv16x.h) ----------
+ const FUNC_CFG_ACCESS: u8 = 0x01;
+-const FIFO_CTRL3: u8 = 0x09;
++pub(crate) const FIFO_CTRL3: u8 = 0x09;
+ const FIFO_CTRL4: u8 = 0x0a;
+-const WHO_AM_I: u8 = 0x0f;
++pub(crate) const WHO_AM_I: u8 = 0x0f;
+ const CTRL1: u8 = 0x10;
+ const CTRL2: u8 = 0x11;
+ const CTRL3: u8 = 0x12;
+ const CTRL6: u8 = 0x15;
+ const CTRL8: u8 = 0x17;
+ const CTRL9: u8 = 0x18;
+-const FIFO_STATUS1: u8 = 0x1b;
+-const OUT_TEMP_L: u8 = 0x20;
+-const FIFO_DATA_OUT_TAG: u8 = 0x78;
++pub(crate) const FIFO_STATUS1: u8 = 0x1b;
++pub(crate) const OUT_TEMP_L: u8 = 0x20;
++pub(crate) const FIFO_DATA_OUT_TAG: u8 = 0x78;
+ // Embedded-functions bank, visible while FUNC_CFG_ACCESS bit 7 is set.
+ const EMB_FUNC_EN_A: u8 = 0x04;
+ const EMB_FUNC_FIFO_EN_A: u8 = 0x44;
+@@ -76,9 +76,45 @@ const EMB_FUNC_INIT_A: u8 = 0x66;
+ /// SFLP_ODR[5:3]: 010 is 60 Hz (the default 011 is 120). The other bits are reserved and kept.
+ const SFLP_ODR_MASK: u8 = 0b0011_1000;
+ const SFLP_ODR_60HZ: u8 = 0b010 << 3;
++/// 011, the chip's default (duck-brain P12: the body IMU batches at 120 Hz).
++const SFLP_ODR_120HZ: u8 = 0b011 << 3;
++
++/// The batch rate a reader brings the chip up at: the head's 60 Hz, or the body's 120 Hz
++/// (duck-brain P12 — the control tick wants the newest sample, not one 16 ms old).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum Rate {
++    Hz60,
++    Hz120,
++}
++
++impl Rate {
++    /// FIFO_CTRL3: BDR_GY[7:4], BDR_XL[3:0] — 0101 is 60 Hz, 0110 120 Hz. Checked against ST's
++    /// own driver (STMicroelectronics/lsm6dsv16x-pid `lsm6dsv16x_reg.h`: `*_BATCHED_AT_120Hz = 0x6`,
++    /// `SFLP_ODR` 0x5E with `sflp_game_odr` in bits 5:3, `LSM6DSV16X_SFLP_120Hz = 0x3`).
++    fn fifo_ctrl3(self) -> u8 {
++        match self {
++            Rate::Hz60 => 0x55,
++            Rate::Hz120 => 0x66,
++        }
++    }
++
++    fn sflp_odr(self) -> u8 {
++        match self {
++            Rate::Hz60 => SFLP_ODR_60HZ,
++            Rate::Hz120 => SFLP_ODR_120HZ,
++        }
++    }
++
++    pub(crate) fn hz(self) -> u32 {
++        match self {
++            Rate::Hz60 => 60,
++            Rate::Hz120 => 120,
++        }
++    }
++}
+ const SFLP_GAME_BIT: u8 = 1 << 1;
+ 
+-const WHO_AM_I_VALUE: u8 = 0x70;
++pub(crate) const WHO_AM_I_VALUE: u8 = 0x70;
+ const CTRL3_BOOT: u8 = 1 << 7;
+ const CTRL3_SW_RESET: u8 = 1 << 0;
+ 
+@@ -97,10 +133,10 @@ const CONFIG: &[(u8, u8)] = &[
+ ];
+ 
+ // FIFO record tags (FIFO_DATA_OUT_TAG[7:3]).
+-const TAG_GYRO: u8 = 0x01;
+-const TAG_ACCEL: u8 = 0x02;
+-const TAG_SFLP_GAME: u8 = 0x13;
+-const RECORD: usize = 7;
++pub(crate) const TAG_GYRO: u8 = 0x01;
++pub(crate) const TAG_ACCEL: u8 = 0x02;
++pub(crate) const TAG_SFLP_GAME: u8 = 0x13;
++pub(crate) const RECORD: usize = 7;
+ 
+ const GYRO_RAD_PER_LSB: f32 = 0.0175 * std::f32::consts::PI / 180.0;
+ const ACCEL_MS2_PER_LSB: f32 = 0.000122 * 9.806_65;
+@@ -268,6 +304,9 @@ pub fn run(
+     status.lost("the head IMU is on an I2C bus, which exists only on Linux".to_owned());
+ }
+ 
++#[cfg(target_os = "linux")]
++pub(crate) use reader::Chip;
++
+ #[cfg(target_os = "linux")]
+ mod reader {
+     use std::fs::{File, OpenOptions};
+@@ -287,12 +326,12 @@ mod reader {
+     const RETRY_MIN: Duration = Duration::from_millis(500);
+     const RETRY_MAX: Duration = Duration::from_secs(30);
+ 
+-    struct Chip {
++    pub(crate) struct Chip {
+         file: File,
+     }
+ 
+     impl Chip {
+-        fn open(bus: &str, address: u16) -> std::io::Result<Self> {
++        pub(crate) fn open(bus: &str, address: u16) -> std::io::Result<Self> {
+             let file = OpenOptions::new().read(true).write(true).open(bus)?;
+             // SAFETY: I2C_SLAVE takes the address by value; the fd is owned and open.
+             if unsafe { libc::ioctl(file.as_raw_fd(), I2C_SLAVE, libc::c_ulong::from(address)) } < 0
+@@ -307,12 +346,12 @@ mod reader {
+         }
+ 
+         /// Set the register pointer, then read `buf.len()` bytes from it (IF_INC advances it).
+-        fn read(&mut self, reg: u8, buf: &mut [u8]) -> std::io::Result<()> {
++        pub(crate) fn read(&mut self, reg: u8, buf: &mut [u8]) -> std::io::Result<()> {
+             self.file.write_all(&[reg])?;
+             self.file.read_exact(buf)
+         }
+ 
+-        fn read1(&mut self, reg: u8) -> std::io::Result<u8> {
++        pub(crate) fn read1(&mut self, reg: u8) -> std::io::Result<u8> {
+             let mut b = [0u8];
+             self.read(reg, &mut b)?;
+             Ok(b[0])
+@@ -325,6 +364,11 @@ mod reader {
+ 
+         /// `imu_to_dxl`'s bring-up: reset, reload the trimming, configure, read back, start SFLP.
+         fn bring_up(&mut self) -> std::io::Result<()> {
++            self.bring_up_at(Rate::Hz60)
++        }
++
++        /// The same bring-up, batching at `rate` (duck-brain P12).
++        pub(crate) fn bring_up_at(&mut self, rate: Rate) -> std::io::Result<()> {
+             self.write(CTRL3, CTRL3_SW_RESET)?;
+             for _ in 0..20 {
+                 std::thread::sleep(Duration::from_millis(1));
+@@ -334,10 +378,14 @@ mod reader {
+             }
+             self.write(CTRL3, CTRL3_BOOT | 0x44)?;
+             std::thread::sleep(Duration::from_millis(30));
+-            for &(reg, value) in CONFIG {
++            let config: Vec<(u8, u8)> = CONFIG
++                .iter()
++                .map(|&(reg, value)| (reg, if reg == FIFO_CTRL3 { rate.fifo_ctrl3() } else { value }))
++                .collect();
++            for &(reg, value) in &config {
+                 self.write(reg, value)?;
+             }
+-            for &(reg, value) in CONFIG {
++            for &(reg, value) in &config {
+                 let got = self.read1(reg)?;
+                 if got != value {
+                     return Err(std::io::Error::other(format!(
+@@ -348,7 +396,7 @@ mod reader {
+             self.write(FUNC_CFG_ACCESS, 0x80)?;
+             let sflp = (|| {
+                 let odr = self.read1(SFLP_ODR)?;
+-                self.write(SFLP_ODR, (odr & !SFLP_ODR_MASK) | SFLP_ODR_60HZ)?;
++                self.write(SFLP_ODR, (odr & !SFLP_ODR_MASK) | rate.sflp_odr())?;
+                 self.set_bits(EMB_FUNC_EN_A, SFLP_GAME_BIT)?;
+                 self.set_bits(EMB_FUNC_FIFO_EN_A, SFLP_GAME_BIT)?;
+                 self.set_bits(EMB_FUNC_INIT_A, SFLP_GAME_BIT)
+diff --git a/robotd/src/main.rs b/robotd/src/main.rs
+index 9d87e5f..84a1a8a 100644
+--- a/robotd/src/main.rs
++++ b/robotd/src/main.rs
+@@ -18,6 +18,8 @@
+ //! publishes and never calls into the loop — a wedged loop reports itself unhealthy rather
+ //! than hanging the caller.
+ 
++/// duck-brain P12: the body IMU on the host's I²C.
++mod body_imu;
+ mod chorale;
+ mod control;
+ /// duck-brain P11: the Feetech HD-1910 bus.
+@@ -315,6 +317,14 @@ enum Command {
+         #[arg(long, default_value = "2s", value_parser = parse_duration)]
+         duration: Duration,
+     },
++
++    /// The body IMU on the host's I²C, alone (duck-brain P12): print gravity, gyro and sample age
++    /// in the trunk frame five times a second, or, with `--solve`, measure `[body_imu.mount]` from
++    /// two poses. Stop the daemon first — two readers would share the chip's FIFO.
++    BodyImu {
++        #[arg(long)]
++        solve: bool,
++    },
+ }
+ 
+ fn parse_duration(raw: &str) -> Result<Duration, String> {
+@@ -841,6 +851,7 @@ impl RobotState {
+                     missing: self.startup_imu_missing.load(Ordering::Relaxed),
+                 }),
+                 feetech: self.feetech.get().map(|shared| feetech_bus::health(shared)),
++                host_imu: self.host_imu.get().map(|feed| feetech_bus::host_imu_health(feed)),
+             };
+ 
+         let unhealthy = |reason: String| describe(false, false, Some(reason));
+@@ -1065,6 +1076,17 @@ async fn main() -> ExitCode {
+         params.policy.enabled = false;
+     }
+ 
++    if let Some(Command::BodyImu { solve }) = args.command {
++        let _instance_lock = match claim_lock(&args.socket) {
++            Ok(lock) => lock,
++            Err(e) => {
++                tracing::error!(path = %args.socket.display(), error = %e, "robotd is running: stop it first");
++                return ExitCode::FAILURE;
++            }
++        };
++        return body_imu::bench(&params, solve);
++    }
++
+     if let Some(Command::Init { duration }) = args.command {
+         // init opens the motor bus itself. Keep ownership until the whole ramp returns,
+         // so neither a daemon nor another init can join it partway through.
+@@ -1111,6 +1133,34 @@ async fn main() -> ExitCode {
+ 
+     start_head_imu(&state, &params, args.fake || args.sim.is_some());
+ 
++    // duck-brain P12: on a Feetech robot the body IMU is the host's, read on a thread of its own and
++    // handed to the tick through this feed. Set before the control thread exists, which takes it.
++    if params.bus.driver == robotd_params::BusDriver::Feetech && !args.fake && args.sim.is_none() {
++        let feed = Arc::clone(state.host_imu.get_or_init(|| {
++            Arc::new(if args.static_imu {
++                tracing::warn!("--static-imu: the IMU is a constant upright sample — bench only");
++                duck_control::host_imu::ImuFeed::static_upright()
++            } else {
++                duck_control::host_imu::ImuFeed::new()
++            })
++        }));
++        if args.static_imu {
++            // Nothing to read.
++        } else if params.body_imu.enabled_for(params.bus.driver) {
++            let cfg = body_imu::Config::from(&params);
++            let owner = Arc::clone(&state);
++            let spawned = std::thread::Builder::new()
++                .name("body-imu".into())
++                .spawn(move || body_imu::run(&cfg, &feed, &owner.shutdown));
++            if let Err(e) = spawned {
++                tracing::error!(error = %e, "cannot start the body IMU reader");
++            }
++        } else {
++            tracing::warn!("[body_imu] enabled = false: the policy gets no orientation");
++            feed.update_status(|s| s.error = Some("[body_imu] enabled = false".into()));
++        }
++    }
++
+     // The real thing. `setsid` detaches the command from this process's cgroup, so the
+     // poweroff proceeds while systemd is busy killing robotd itself.
+     let poweroff: PowerOff = Arc::new(|| {
+@@ -1307,9 +1357,9 @@ fn spawn_control_thread(
+ 
+             // duck-brain P11: the HD-1910 bus. Same waiting shape as below, its own census.
+             if params.bus.driver == robotd_params::BusDriver::Feetech {
++                // Set by `main` before this thread started (P12), with its reader.
+                 let imu = Arc::clone(state.host_imu.get_or_init(|| {
+                     Arc::new(if static_imu {
+-                        tracing::warn!("--static-imu: the IMU is a constant upright sample — bench only");
+                         duck_control::host_imu::ImuFeed::static_upright()
+                     } else {
+                         duck_control::host_imu::ImuFeed::new()
+-- 
+2.43.0
+

@@ -1,0 +1,15 @@
+# rkaiq 3A server (auto exposure and white balance) for the IMX219 camera: build v6.0x9.0 in /opt/rkaiq-v9, IQ file in /etc/iqfiles.
+[Unit]
+Description=rkaiq 3A server (IMX219, ISP21)
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env LD_LIBRARY_PATH=/opt/rkaiq-v9 /opt/rkaiq-v9/rkaiq_3A_server
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

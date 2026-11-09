@@ -1,0 +1,13 @@
+{
+    "configuration": "default",
+    "documentId": "1d24afb7e30158ea0f2613bd",
+    "documentMicroversion": "757b1ab39acbc5ea5ea7108d",
+    "elementId": "b195352d33a0793fc6f7f4d6",
+    "fullConfiguration": "default",
+    "id": "M1R1xXQ55jHHjrgGo",
+    "isStandardContent": false,
+    "name": "bus_servo <33>",
+    "partId": "JFD",
+    "suppressed": false,
+    "type": "Part"
+}

@@ -1,0 +1,1014 @@
+From 32bebdaec3b65162900f4e9a98c1beed2d2b0204 Mon Sep 17 00:00:00 2001
+From: duck-brain <duck-brain@localhost>
+Date: Sun, 8 Nov 2026 07:52:27 +0000
+Subject: [PATCH] duck-brain P25: the duck without a PC - stops of its own, the
+ DualSense's axes
+
+For a duck run by systemd with a DualSense and nothing else:
+- robotd --relax-at-start: torque off on all 15, read back, as the daemon
+  starts; a boot or a restart comes up limp.
+- robotd --pad-lost-relax S: relax when no client has sent a twist for S
+  seconds with torque on. padd sends one at least every 0.1 s while it has
+  a live pad, nothing once the pad is gone. The relax also clears the
+  tick's enable, so the bring-up cannot switch torque straight back on.
+- robotd --leg-load / --lift-relax-load T: the tick reads the present
+  current (56..70); the legs' load is the mean |current| over hip pitch,
+  knee and ankle (health feetech.leg_load, servos[].current, cur_raw in the
+  journal). With T, a load under T (smoothed 0.2 s) for 0.3 s while the
+  walking network drives an upright duck relaxes it. No default: T is a
+  measurement.
+- pad-map: Home (PS) is the stop, robot.relax on the press, in place of
+  the flashlight the duck has none of.
+- padd --silent-after-ms (250): a pad whose motion sensors have said
+  nothing for that long is gone, though gilrs still lists it - the radio
+  link lost with the sticks frozen. The IMU is kept open for it; gaps of
+  100 ms and more are logged.
+- pad-imu: the DualSense's raw axes to the body frame, [-Z, -X, +Y], from
+  Alex's measurement of 08.11.2026 - the head follows the pad's tilt the
+  right way.
+---
+ duck-control/src/feetech.rs |  91 +++++++++++++++++-
+ duck-control/src/io.rs      |   6 ++
+ duck-control/src/safety.rs  |   5 +
+ duck-ipc-proto/src/lib.rs   |   7 ++
+ pad-imu/src/lib.rs          |  86 +++++++++++++++++-
+ pad-map/src/mapper.rs       |  34 ++-----
+ padd/src/main.rs            |  37 +++++++-
+ padd/src/tap.rs             |  42 ++++++++-
+ robotd/src/control.rs       |   6 ++
+ robotd/src/feetech_bus.rs   |   5 +
+ robotd/src/main.rs          | 177 +++++++++++++++++++++++++++++++++++-
+ 11 files changed, 458 insertions(+), 38 deletions(-)
+
+diff --git a/duck-control/src/feetech.rs b/duck-control/src/feetech.rs
+index 2b61d39..c57da3f 100644
+--- a/duck-control/src/feetech.rs
++++ b/duck-control/src/feetech.rs
+@@ -78,8 +78,16 @@ pub struct FeetechConfig {
+     /// goal, no P/D. Torque on and off are only noted, so the loop ramps, steps the policy and
+     /// journals its targets as it would, with the servos limp where they lie.
+     pub dry_run: bool,
++    /// Read the present current (69) with every tick (duck-brain P25): the tick's block grows from
++    /// 56..62 to 56..70, ~1.2 ms more on the bus [расчёт: 15 × 8 bytes at 10 µs]. Gives
++    /// [`RobotIo::leg_load`] and the temperature every tick.
++    pub read_current: bool,
+ }
+ 
++/// The joints that carry the duck's weight, indexed as `JOINT_NAMES`: hip pitch, knee and ankle of
++/// each leg (P25).
++pub const LOAD_JOINTS: [usize; 6] = [2, 3, 4, 12, 13, 14];
++
+ /// Ticks in a row with no servo answering after which torque is cut on every servo, unverified
+ /// (duck-brain P22): 100 ms at 50 Hz, past the loop's three ticks of coasting.
+ pub const SILENT_CUTOFF_TICKS: u32 = 5;
+@@ -110,6 +118,7 @@ impl Default for FeetechConfig {
+             temperature_every: 50,
+             battery_offset_v: 0.0,
+             dry_run: false,
++            read_current: false,
+         }
+     }
+ }
+@@ -181,6 +190,8 @@ struct Stats {
+     servo_p: [Option<u8>; NUM_JOINTS],
+     servo_d: [Option<u8>; NUM_JOINTS],
+     servo_torque: [Option<bool>; NUM_JOINTS],
++    currents: [Option<i32>; NUM_JOINTS],
++    leg_load: Option<f64>,
+     counters: feetech::Counters,
+     imu_stale: ImuStale,
+     imu_age_last: Option<Duration>,
+@@ -243,6 +254,10 @@ pub struct FeetechSnapshot {
+     pub servo_d: [Option<u8>; NUM_JOINTS],
+     /// Torque (40) per joint, as read at startup and after every verified write (P23).
+     pub servo_torque: [Option<bool>; NUM_JOINTS],
++    /// Present current (69) per joint, raw units with sign, when `read_current` (P25).
++    pub currents: [Option<i32>; NUM_JOINTS],
++    /// Mean |current| over [`LOAD_JOINTS`] this tick, raw units (P25).
++    pub leg_load: Option<f64>,
+     pub echoes: u64,
+     pub bad_packets: u64,
+     pub stray: u64,
+@@ -297,6 +312,8 @@ impl FeetechShared {
+             servo_p: s.servo_p,
+             servo_d: s.servo_d,
+             servo_torque: s.servo_torque,
++            currents: s.currents,
++            leg_load: s.leg_load,
+             echoes: s.counters.echoes,
+             bad_packets: s.counters.bad_packets,
+             stray: s.counters.stray,
+@@ -314,6 +331,9 @@ pub struct BusTick {
+     pub volt_raw: Vec<Option<u8>>,
+     /// Goal register per joint as sent.
+     pub goal_raw: Vec<u16>,
++    /// Present current per joint, raw with sign (P25); empty unless `read_current`.
++    #[serde(skip_serializing_if = "Vec::is_empty")]
++    pub cur_raw: Vec<Option<i32>>,
+     /// The smoothed lowest voltage, and the factor the errors were multiplied by.
+     pub v_smoothed: Option<f64>,
+     pub adapt: f64,
+@@ -343,6 +363,8 @@ pub struct FeetechIo<P: Port = SerialPort> {
+     silent_ticks: u32,
+     /// Torque was cut on a silent bus, unverified: cut it again, verified, once servos answer.
+     off_pending: bool,
++    /// This tick's [`LOAD_JOINTS`] current, when read (P25).
++    leg_load: Option<f64>,
+     /// Torque (40) per joint as the servos last said (P23): read at the census, then set by every
+     /// verified write. A goal goes only to a joint known to be on — a goal written to a servo with
+     /// torque off switches it on.
+@@ -400,6 +422,7 @@ impl<P: Port> FeetechIo<P> {
+             cutoff: false,
+             silent_ticks: 0,
+             off_pending: false,
++            leg_load: None,
+             torque_on: [None; NUM_JOINTS],
+             bus_up: false,
+             kp: None,
+@@ -674,7 +697,15 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+         self.tick += 1;
+         let with_temperature = self.cfg.temperature_every > 0
+             && self.tick % u64::from(self.cfg.temperature_every) == 1;
+-        let len = if with_temperature { 8 } else { 7 };
++        let len = if self.cfg.read_current {
++            15
++        } else if with_temperature {
++            8
++        } else {
++            7
++        };
++        let with_temperature = with_temperature || self.cfg.read_current;
++        let mut cur_raw = vec![None; if self.cfg.read_current { NUM_JOINTS } else { 0 }];
+ 
+         let answers = match self.bus.sync_read(&JOINT_IDS, reg::POSITION.0, len) {
+             Ok(answers) => answers,
+@@ -722,6 +753,24 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+             if with_temperature {
+                 self.temps[j] = Some(f64::from(s.params[7]));
+             }
++            if self.cfg.read_current && s.params.len() >= 15 {
++                cur_raw[j] = Some(i32::from(feetech::sign_magnitude(feetech::from_le(
++                    &s.params[13..15],
++                ))));
++            }
++        }
++        if self.cfg.read_current {
++            let loads: Vec<f64> = LOAD_JOINTS
++                .iter()
++                .filter_map(|&j| cur_raw[j].map(|c| f64::from(c.abs())))
++                .collect();
++            self.leg_load =
++                (!loads.is_empty()).then(|| loads.iter().sum::<f64>() / loads.len() as f64);
++            let mut s = self.shared.0.lock().unwrap();
++            for (slot, c) in s.currents.iter_mut().zip(&cur_raw) {
++                *slot = *c;
++            }
++            s.leg_load = self.leg_load;
+         }
+ 
+         if let Some(v) = v_min {
+@@ -797,6 +846,7 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+             pos_raw,
+             volt_raw,
+             goal_raw: Vec::new(),
++            cur_raw,
+             v_smoothed: self.v_smoothed,
+             adapt: 1.0,
+             read_us: started.elapsed().as_micros() as u64,
+@@ -876,6 +926,10 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+         false
+     }
+ 
++    fn leg_load(&self) -> Option<f64> {
++        self.leg_load
++    }
++
+     fn set_gain(&mut self, kp: u16) -> Result<()> {
+         if self.cfg.dry_run {
+             self.kp = Some(kp);
+@@ -1727,6 +1781,41 @@ mod tests {
+         );
+     }
+ 
++    /// `read_current` (P25): the tick reads 56..70, the current comes back signed per joint, and
++    /// the legs' load is the mean |current| over hip pitch, knee and ankle of both legs.
++    #[test]
++    fn the_current_and_the_legs_load_come_with_the_tick() {
++        let mut emu = Emulator::new(&JOINT_IDS);
++        for (k, &j) in LOAD_JOINTS.iter().enumerate() {
++            // Sign-magnitude, bit 15 the sign: alternate signs, magnitudes 100..600.
++            let m = 100 * (k as u16 + 1);
++            emu.servo_mut(JOINT_IDS[j]).unwrap().set(
++                69,
++                2,
++                if k % 2 == 1 { m | 0x8000 } else { m },
++            );
++        }
++        emu.servo_mut(JOINT_IDS[0]).unwrap().set(69, 2, 999); // hip yaw: not a load joint
++        let cfg = FeetechConfig {
++            read_current: true,
++            ..quick()
++        };
++        let mut with = io(emu, cfg);
++        with.read().unwrap();
++        assert_eq!(with.leg_load(), Some(350.0), "mean of 100..600");
++        let snap = with.shared().snapshot();
++        assert_eq!(snap.leg_load, Some(350.0));
++        assert_eq!(snap.currents[LOAD_JOINTS[1]], Some(-200));
++        assert_eq!(snap.currents[0], Some(999));
++        let j = with.journal().unwrap();
++        assert_eq!(j["cur_raw"][LOAD_JOINTS[0]], 100);
++        // Off, nothing changes: 7 bytes, no current, no load.
++        let mut without = io(Emulator::new(&JOINT_IDS), quick());
++        without.read().unwrap();
++        assert_eq!(without.leg_load(), None);
++        assert!(without.journal().unwrap().get("cur_raw").is_none());
++    }
++
+     /// The emulator, like the servos, switches torque on when given a goal — what P23 guards.
+     #[test]
+     fn a_goal_switches_an_emulated_servo_on() {
+diff --git a/duck-control/src/io.rs b/duck-control/src/io.rs
+index c12fa16..e6934d5 100644
+--- a/duck-control/src/io.rs
++++ b/duck-control/src/io.rs
+@@ -132,6 +132,12 @@ pub trait RobotIo {
+ 
+     /// The same question for [`Sensors::currents_ma`], separately: the simulator reports
+     /// velocity from the physics and may have no load to report at all.
++    /// How much the legs are carrying this tick, in the backend's own units, when it can say
++    /// (duck-brain P25: the Feetech driver's mean |current| over hip pitch, knee and ankle).
++    fn leg_load(&self) -> Option<f64> {
++        None
++    }
++
+     fn measures_load(&self) -> bool {
+         true
+     }
+diff --git a/duck-control/src/safety.rs b/duck-control/src/safety.rs
+index 640eaeb..6eff66d 100644
+--- a/duck-control/src/safety.rs
++++ b/duck-control/src/safety.rs
+@@ -197,6 +197,11 @@ impl<T: RobotIo> Safety<T> {
+         self.io.imu_ready()
+     }
+ 
++    /// The legs' load this tick (duck-brain P25), when the backend measures it.
++    pub fn leg_load(&self) -> Option<f64> {
++        self.io.leg_load()
++    }
++
+     pub fn hardware_errors(&mut self) -> Result<Option<[u8; crate::model::NUM_JOINTS]>, IoError> {
+         self.io.hardware_errors()
+     }
+diff --git a/duck-ipc-proto/src/lib.rs b/duck-ipc-proto/src/lib.rs
+index abc0f15..bf4f6be 100644
+--- a/duck-ipc-proto/src/lib.rs
++++ b/duck-ipc-proto/src/lib.rs
+@@ -3766,6 +3766,10 @@ pub struct FeetechHealth {
+     /// `robotd --dry-run` (P22): nothing is written to the servos.
+     #[serde(default)]
+     pub dry_run: bool,
++    /// Mean |current| over hip pitch, knee and ankle of both legs this tick, raw units — what the
++    /// lift rule compares (duck-brain P25). `None` unless robotd reads the current.
++    #[serde(default)]
++    pub leg_load: Option<f64>,
+     /// Torque over the 15 servos (duck-brain P23): `true` when any servo has it on, `false` when
+     /// all have it off — read at startup, then every verified write; `None` while one is unknown
+     /// and none is on.
+@@ -3820,6 +3824,9 @@ pub struct ServoHealth {
+     /// first read, or when a write did not read back.
+     #[serde(default)]
+     pub torque: Option<bool>,
++    /// Present current (69), raw units with sign, when robotd reads it (duck-brain P25).
++    #[serde(default)]
++    pub current: Option<i32>,
+ }
+ 
+ /// The control loop's rate and timing.
+diff --git a/pad-imu/src/lib.rs b/pad-imu/src/lib.rs
+index 470f265..cc5c62c 100644
+--- a/pad-imu/src/lib.rs
++++ b/pad-imu/src/lib.rs
+@@ -29,6 +29,13 @@
+ //! left**, which follows from a right-handed frame with Z up. Confirmed against the drawn pad on
+ //! the robot, 2026-09-09.
+ //!
++//! **DualSense** (`hid-playstation`, "… Motion Sensors"; duck-brain P25) reports its axes otherwise.
++//! Measured by Alex on 08.11.2026, the accelerometer reading "up" at rest: flat, buttons up, +Y
++//! raw; standing on the grips, triggers up, −Z raw; on its edge, left grip down, +X raw. So raw +X
++//! is the pad's right, +Y out of its face, +Z toward the player, and the body frame above is
++//! `[−Z, −X, +Y]` of the raw axes — a proper rotation (right-handed). Gyro and accelerometer share
++//! the frame in the driver; the gyro's own signs were not measured separately.
++//!
+ //! ## What it costs
+ //!
+ //! A few dozen multiplications per sample. Six hundred a second are a rounding error next to
+@@ -67,6 +74,8 @@ const MAX_DT_S: f32 = 0.05;
+ /// One pad IMU, as accumulated from the tap.
+ pub struct Imu {
+     device: proto::PadImuDevice,
++    /// How this pad's raw axes map to the body frame (P25).
++    axes: Axes,
+     samples: u64,
+     socket_dropped: u64,
+     /// The last sample's kernel timestamp, for the interval.
+@@ -160,9 +169,36 @@ impl Bias {
+     }
+ }
+ 
++/// How a pad's raw IMU axes sit in the body frame (P25).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum Axes {
++    /// `hid-nintendo`: the raw axes are the body's.
++    AsIs,
++    /// `hid-playstation`'s DualSense: body = `[−Z, −X, +Y]` raw.
++    DualSense,
++}
++
++impl Axes {
++    fn of(device: &proto::PadImuDevice) -> Self {
++        if device.name.contains("DualSense") {
++            Self::DualSense
++        } else {
++            Self::AsIs
++        }
++    }
++
++    fn body(self, v: [f32; 3]) -> [f32; 3] {
++        match self {
++            Self::AsIs => v,
++            Self::DualSense => [-v[2], -v[0], v[1]],
++        }
++    }
++}
++
+ impl Imu {
+     pub fn new(device: proto::PadImuDevice) -> Self {
+         Self {
++            axes: Axes::of(&device),
+             device,
+             samples: 0,
+             socket_dropped: 0,
+@@ -220,16 +256,16 @@ impl Imu {
+ 
+         let accel_scale = scale(self.device.accel_per_g);
+         let gyro_scale = scale(self.device.gyro_per_dps);
+-        let accel = [
++        let accel = self.axes.body([
+             sample.accel[0] as f32 * accel_scale,
+             sample.accel[1] as f32 * accel_scale,
+             sample.accel[2] as f32 * accel_scale,
+-        ];
+-        let raw_gyro = [
++        ]);
++        let raw_gyro = self.axes.body([
+             sample.gyro[0] as f32 * gyro_scale,
+             sample.gyro[1] as f32 * gyro_scale,
+             sample.gyro[2] as f32 * gyro_scale,
+-        ];
++        ]);
+         self.accel_g = accel;
+ 
+         let magnitude = norm(accel);
+@@ -444,6 +480,48 @@ fn from_gravity(accel: [f32; 3]) -> [f32; 4] {
+ 
+ #[cfg(test)]
+ mod tests {
++
++    /// The DualSense, as Alex measured it on 08.11.2026 (P25): averaged raw accelerometer in three
++    /// poses, 8192 per g. Each comes out as the body frame says — flat: up is +Z; triggers up: up is
++    /// +X (the front); left grip down: up is −Y (the right).
++    #[test]
++    fn a_dualsense_reads_in_the_body_frame() {
++        let device = proto::PadImuDevice {
++            name: "DualSense Wireless Controller Motion Sensors".to_owned(),
++            node: "/dev/input/event5".to_owned(),
++            accel_per_g: 8192,
++            gyro_per_dps: 1024,
++            accel_max: 32767,
++            gyro_max: 32767,
++        };
++        let axes = Axes::of(&device);
++        assert_eq!(axes, Axes::DualSense);
++        let up = |raw: [f32; 3]| {
++            let b = axes.body(raw.map(|v| v / 8192.0));
++            let i = (0..3)
++                .max_by(|&a, &c| b[a].abs().total_cmp(&b[c].abs()))
++                .unwrap();
++            (i, b[i].signum())
++        };
++        assert_eq!(up([62.0, 8110.0, 1415.0]), (2, 1.0), "flat, buttons up: +Z");
++        assert_eq!(
++            up([98.0, 630.0, -8160.0]),
++            (0, 1.0),
++            "triggers up: +X, the front"
++        );
++        assert_eq!(
++            up([8241.0, -135.0, 483.0]),
++            (1, -1.0),
++            "left grip down: up is the right, −Y"
++        );
++        // A pad that is not a DualSense is read as it was.
++        let pro = proto::PadImuDevice {
++            name: "Nintendo Switch Pro Controller IMU".to_owned(),
++            ..device
++        };
++        assert_eq!(Axes::of(&pro).body([1.0, 2.0, 3.0]), [1.0, 2.0, 3.0]);
++    }
++
+     use super::*;
+ 
+     fn a_device() -> proto::PadImuDevice {
+diff --git a/pad-map/src/mapper.rs b/pad-map/src/mapper.rs
+index f9846b0..275b8a2 100644
+--- a/pad-map/src/mapper.rs
++++ b/pad-map/src/mapper.rs
+@@ -322,16 +322,11 @@ impl Mapper {
+             })));
+         }
+ 
+-        // Home: the flashlight. Not bindable — it is not a skill, and the robot owns the toggle.
+-        // A request, so a board without a flashlight says so in the journal rather than not at
+-        // all.
++        // Home (PS): the stop (duck-brain P25) — torque off on every servo, read back. In place of
++        // Pollen's flashlight, which the duck has none of. Not bindable, and on the press, not the
++        // release: a stop has no reason to wait. A request, so its answer reaches the journal.
+         if pad.pressed.contains(Buttons::HOME) {
+-            out.push(Out::Request(proto::Call::RobotFlashlight(
+-                proto::FlashlightParams {
+-                    toggle: true,
+-                    ..Default::default()
+-                },
+-            )));
++            out.push(Out::Request(proto::Call::RobotRelax));
+         }
+ 
+         // X held: keep a chaining skill going. The robot starts another when a request lands
+@@ -579,23 +574,14 @@ mod tests {
+ 
+     /// The whole path a frame takes: a D-pad edge changes mode once, a held one does not change
+     /// it again, a stick inside the deadzone walks nothing, and A's edge runs A's binding.
+-    /// Home toggles the flashlight, on its edge: once per press, held or not, and the robot owns
+-    /// the toggle.
++    /// Home (PS) is the stop (duck-brain P25): one `robot.relax` per press, on the press.
+     #[test]
+-    fn home_toggles_the_flashlight_once_per_press() {
++    fn home_relaxes_the_robot_once_per_press() {
+         let (mut m, cfg, t) = (Mapper::new(), cfg(), Instant::now());
+         let (mut out, mut frame) = (Vec::new(), Vec::new());
+-        let flashlight = |out: &[Out]| {
++        let relaxes = |out: &[Out]| {
+             out.iter()
+-                .filter(|o| {
+-                    matches!(
+-                        o,
+-                        Out::Request(proto::Call::RobotFlashlight(proto::FlashlightParams {
+-                            toggle: true,
+-                            ..
+-                        }))
+-                    )
+-                })
++                .filter(|o| matches!(o, Out::Request(proto::Call::RobotRelax)))
+                 .count()
+         };
+ 
+@@ -605,14 +591,14 @@ mod tests {
+             ..Default::default()
+         };
+         m.tick(&pad, &cfg, t, &mut out, &mut frame);
+-        assert_eq!(flashlight(&out), 1, "{out:?}");
++        assert_eq!(relaxes(&out), 1, "{out:?}");
+ 
+         let pad = PadFrame {
+             held: Buttons::HOME,
+             ..Default::default()
+         };
+         m.tick(&pad, &cfg, t, &mut out, &mut frame);
+-        assert_eq!(flashlight(&out), 0, "held is not a second press");
++        assert_eq!(relaxes(&out), 0, "held is not a second press");
+     }
+ 
+     #[test]
+diff --git a/padd/src/main.rs b/padd/src/main.rs
+index 5b0fd8b..15a0a5a 100644
+--- a/padd/src/main.rs
++++ b/padd/src/main.rs
+@@ -138,6 +138,10 @@ mod tap {
+         pub fn attitude(&self) -> Option<[f32; 4]> {
+             None
+         }
++
++        pub fn imu_silence(&self) -> Option<std::time::Duration> {
++            None
++        }
+     }
+ }
+ 
+@@ -148,6 +152,14 @@ struct Args {
+     #[arg(long, default_value = "/run/robotd.sock")]
+     socket: PathBuf,
+ 
++    /// The pad counts as gone when its motion sensors have said nothing for this long, ms
++    /// (duck-brain P25): a DualSense streams them all the time, so silence is the radio link lost
++    /// while the kernel still has the input device — and sticks frozen where they were. Nothing
++    /// more is sent; robotd's deadman stops the walking at 0.5 s and `--pad-lost-relax` relaxes.
++    /// 0 turns it off.
++    #[arg(long, default_value_t = 250)]
++    silent_after_ms: u64,
++
+     /// Where the button bindings are read from — the same file everything else is configured in.
+     #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
+     config: PathBuf,
+@@ -300,7 +312,7 @@ fn main() -> std::process::ExitCode {
+         roller,
+         "driving — A sit, B ground pick, triggers mouth; D-pad up head, \
+          right head + move, left move, down body + head; Start stands up then toggles the policy, \
+-         Start (1.5s) home pose; Select (2-4s) rest, Select (4s) power off"
++         Start (1.5s) home pose; Select (2-4s) rest, Select (4s) power off; Home: relax (stop)"
+     );
+ 
+     let period = Duration::from_secs_f64(1.0 / args.hz as f64);
+@@ -389,7 +401,16 @@ fn main() -> std::process::ExitCode {
+         // Re-read the pad by id after the drain: a `Disconnected` dequeued above may have
+         // taken it, and asking for the first pad again would silently hand the robot the
+         // *other* pad's sticks. One tick of "pad gone" beats that.
+-        let Some(pad) = pad_id.and_then(|id| gilrs.connected_gamepad(id)) else {
++        let present = pad_id.and_then(|id| gilrs.connected_gamepad(id));
++        // P25: a pad whose motion sensors went silent is gone too, though gilrs still lists it.
++        let silent = args.silent_after_ms > 0
++            && present.is_some()
++            && tap
++                .as_ref()
++                .and_then(|t| t.imu_silence())
++                .is_some_and(|d| d > Duration::from_millis(args.silent_after_ms));
++        let gilrs_has_it = present.is_some();
++        let Some(pad) = present.filter(|_| !silent) else {
+             // No pad. Send nothing: `robotd`'s deadman stops the robot on its own, which is
+             // exactly the wanted behaviour, and inventing a zero command here would mask a
+             // disconnected pad as a deliberate stop.
+@@ -399,6 +420,7 @@ fn main() -> std::process::ExitCode {
+             // stops responding mid-drive, and one line per tick would bury it.
+             if driving {
+                 tracing::warn!(
++                    silent,
+                     "pad gone — robotd's deadman stops the walking; sitting down in {:?} if it stays gone",
+                     pad_map::loss::PAD_LOST_SIT
+                 );
+@@ -433,7 +455,11 @@ fn main() -> std::process::ExitCode {
+             // Select still down when the pad returns lands its full hold time at once — a
+             // power-off nobody asked for.
+             mapper.pad_gone();
+-            if let Some(tap) = tap.as_ref() {
++            // A silent pad keeps its IMU reader: the first batch after the silence is how it
++            // comes back.
++            if let Some(tap) = tap.as_ref()
++                && !gilrs_has_it
++            {
+                 tap.idle();
+             }
+             std::thread::sleep(if pad_loss.pending() {
+@@ -458,8 +484,9 @@ fn main() -> std::process::ExitCode {
+         if let Some(tap) = tap.as_ref() {
+             tap.watch(&pad);
+             // Every tick, like the bindings: switching the feature on in the config has to start
+-            // the IMU reader without a restart, and off has to let it go.
+-            tap.imu_control(config.imu_head.enabled);
++            // the IMU reader without a restart, and off has to let it go. Always on when the pad's
++            // silence is watched (P25): the IMU is how this daemon knows the radio is alive.
++            tap.imu_control(config.imu_head.enabled || args.silent_after_ms > 0);
+         }
+ 
+         // The pad's attitude this tick, when the feature is on and the pad has an IMU that has
+diff --git a/padd/src/tap.rs b/padd/src/tap.rs
+index 3c6fbfe..7d54949 100644
+--- a/padd/src/tap.rs
++++ b/padd/src/tap.rs
+@@ -69,7 +69,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+ use std::thread;
+-use std::time::{SystemTime, UNIX_EPOCH};
++use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+ 
+ use duck_ipc_proto as proto;
+ use evdev::raw_stream::RawDevice;
+@@ -123,6 +123,10 @@ struct Shared {
+     /// open. Its own lock, not `state`'s: the main loop reads it fifty times a second and must not
+     /// queue behind a subscriber's send.
+     attitude: Mutex<Option<pad_imu::Imu>>,
++    /// When the IMU last delivered a batch (duck-brain P25): the pad's radio is alive. A DualSense
++    /// streams its motion sensors whether or not anything moves, so silence here is the link gone
++    /// even while the kernel still has the input device.
++    imu_heard: Mutex<Option<Instant>>,
+ }
+ 
+ struct State {
+@@ -195,6 +199,7 @@ impl Tap {
+             }),
+             wake: Condvar::new(),
+             attitude: Mutex::new(None),
++            imu_heard: Mutex::new(None),
+         });
+ 
+         let accepting = Arc::clone(&shared);
+@@ -258,6 +263,12 @@ impl Tap {
+         self.shared.lock().wanted_imu.is_some()
+     }
+ 
++    /// How long the open IMU has been silent (P25), `None` while none is open or before its first
++    /// batch.
++    pub fn imu_silence(&self) -> Option<Duration> {
++        self.shared.imu_heard().map(|at| at.elapsed())
++    }
++
+     /// The pad's attitude, body → world, `w` first. `None` while no IMU is open or before its
+     /// first believable sample.
+     pub fn attitude(&self) -> Option<[f32; 4]> {
+@@ -412,7 +423,18 @@ impl Shared {
+         None
+     }
+ 
++    fn imu_heard(&self) -> Option<Instant> {
++        *self
++            .imu_heard
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++    }
++
+     fn attach_imu(&self, device: proto::PadImuDevice) {
++        *self
++            .imu_heard
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner) = None;
+         *self.attitude_slot() = Some(pad_imu::Imu::new(device.clone()));
+         let report = Arc::new(proto::PadReport::ImuAttached {
+             device: Box::new(device),
+@@ -423,6 +445,10 @@ impl Shared {
+     }
+ 
+     fn detach_imu(&self, why: String) {
++        *self
++            .imu_heard
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner) = None;
+         *self.attitude_slot() = None;
+         let mut state = self.lock();
+         state.imu_attached = None;
+@@ -431,6 +457,19 @@ impl Shared {
+ 
+     /// One batch: into the filter first, then out to whoever is watching.
+     fn samples(&self, samples: Vec<proto::PadImuSample>) {
++        let now = Instant::now();
++        let before = self
++            .imu_heard
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .replace(now);
++        // Every gap worth a line (P25): what `padd --silent-after-ms` is set against.
++        if let Some(gap) = before
++            .map(|b| now - b)
++            .filter(|g| *g >= Duration::from_millis(100))
++        {
++            tracing::info!(gap_ms = gap.as_millis() as u64, "pad IMU gap");
++        }
+         let batch = proto::PadImuBatch {
+             samples,
+             socket_dropped: 0,
+@@ -1007,6 +1046,7 @@ mod tests {
+             }),
+             wake: Condvar::new(),
+             attitude: Mutex::new(None),
++            imu_heard: Mutex::new(None),
+         })
+     }
+ 
+diff --git a/robotd/src/control.rs b/robotd/src/control.rs
+index 95d3b5c..070c434 100644
+--- a/robotd/src/control.rs
++++ b/robotd/src/control.rs
+@@ -397,6 +397,12 @@ impl Controller {
+         self.fall_chain.is_some()
+     }
+ 
++    /// Plain walking or riding on the main network: no skill, no fall chain step, no sit, no pick
++    /// (duck-brain P25 — when the lift rule may look at the legs' load).
++    pub fn walking_plain(&self) -> bool {
++        self.recovery == Recovery::Off && self.active.is_none() && self.ground_pick.is_none() && self.sit == Sit::Up
++    }
++
+     /// One tick of the fall chain, before the network is chosen (P18).
+     fn advance_fall_chain(&mut self, sensors: &duck_control::Sensors, dt: f64) {
+         let Some(fallsafe) = self.fall_chain else {
+diff --git a/robotd/src/feetech_bus.rs b/robotd/src/feetech_bus.rs
+index e646feb..7b452a9 100644
+--- a/robotd/src/feetech_bus.rs
++++ b/robotd/src/feetech_bus.rs
+@@ -52,6 +52,7 @@ pub fn config(params: &Params) -> FeetechConfig {
+         temperature_every: params.control.hz.max(1),
+         battery_offset_v: f.battery_offset_v,
+         dry_run: false,
++        read_current: false,
+     }
+ }
+ 
+@@ -65,9 +66,11 @@ pub async fn open_waiting(
+     state: &RobotState,
+     imu: Arc<ImuFeed>,
+     dry_run: bool,
++    read_current: bool,
+ ) -> Option<FeetechIo> {
+     let cfg = FeetechConfig {
+         dry_run,
++        read_current,
+         ..config(params)
+     };
+     if dry_run {
+@@ -165,6 +168,7 @@ pub fn health(shared: &FeetechShared) -> proto::FeetechHealth {
+         cutoff: s.cutoff,
+         silent_cutoff: s.silent_cutoff,
+         dry_run: s.dry_run,
++        leg_load: s.leg_load,
+         torque: s.torque,
+         rewrites: s.rewrites,
+         write_failures: s.write_failures,
+@@ -188,6 +192,7 @@ pub fn health(shared: &FeetechShared) -> proto::FeetechHealth {
+                 p: s.servo_p[j],
+                 d: s.servo_d[j],
+                 torque: s.servo_torque[j],
++                current: s.currents[j],
+             })
+             .collect(),
+     }
+diff --git a/robotd/src/main.rs b/robotd/src/main.rs
+index de34c70..0413db3 100644
+--- a/robotd/src/main.rs
++++ b/robotd/src/main.rs
+@@ -241,6 +241,42 @@ impl LimpFall {
+     }
+ }
+ 
++/// The stand-alone duck's own stops (duck-brain P25): what `--pad-lost-relax` and
++/// `--lift-relax-load` asked for.
++#[derive(Debug, Clone, Copy, Default)]
++struct Standalone {
++    pad_lost_relax: Option<Duration>,
++    lift_relax_load: Option<f64>,
++}
++
++/// The lift rule's state (P25): the legs' load smoothed, and how long it has stayed low.
++#[derive(Debug, Default)]
++struct LiftWatch {
++    load: Option<f64>,
++    low_for: f64,
++}
++
++/// Smoothing of the legs' load, seconds; and how long it has to stay under the threshold.
++const LIFT_TAU_S: f64 = 0.2;
++const LIFT_HOLD_S: f64 = 0.3;
++/// Above this tilt the duck is falling or down, and its legs unloaded for that reason.
++const LIFT_MAX_TILT: f64 = 30.0 * std::f64::consts::PI / 180.0;
++
++impl LiftWatch {
++    /// One tick; `true` once the load has stayed under `threshold` for [`LIFT_HOLD_S`].
++    fn step(&mut self, load: f64, threshold: f64, dt: f64) -> bool {
++        let a = dt / (LIFT_TAU_S + dt);
++        let smoothed = self.load.map_or(load, |l| l + a * (load - l));
++        self.load = Some(smoothed);
++        self.low_for = if smoothed < threshold { self.low_for + dt } else { 0.0 };
++        self.low_for >= LIFT_HOLD_S
++    }
++
++    fn reset(&mut self) {
++        *self = Self::default();
++    }
++}
++
+ #[derive(Parser, Debug)]
+ #[command(name = "robotd", about = "Robot control daemon", version)]
+ struct Args {
+@@ -310,6 +346,32 @@ struct Args {
+     #[arg(long, requires = "journal", conflicts_with_all = ["fake", "sim"])]
+     dry_run: bool,
+ 
++    /// With `[bus] driver = "feetech"`: take torque off all 15 servos as the daemon starts, each
++    /// read back (duck-brain P25) — a duck that boots, or a daemon that restarts, comes up limp,
++    /// whatever was left on. The service does this; by hand it is up to you.
++    #[arg(long)]
++    relax_at_start: bool,
++
++    /// Relax (torque off, read back) when no client has sent a twist for this many seconds while
++    /// torque is on (duck-brain P25). `padd` sends one at least every 0.1 s while it has a pad,
++    /// and nothing once the pad is gone or silent; robotd's deadman has stopped the walking
++    /// at 0.5 s by then. Seconds, 0.5–60.
++    #[arg(long, value_parser = parse_secs)]
++    pad_lost_relax: Option<f64>,
++
++    /// Read the servos' present current every tick (duck-brain P25): `robot.health` →
++    /// `feetech.leg_load` and `servos[].current`, `cur_raw` in the tick journal. For measuring
++    /// what `--lift-relax-load` should be. Feetech only.
++    #[arg(long)]
++    leg_load: bool,
++
++    /// Relax when the legs carry less than this — mean |current| over hip pitch, knee and ankle,
++    /// raw units, smoothed over 0.2 s — for 0.3 s while the walking network drives an upright duck:
++    /// the duck has been picked up (duck-brain P25). Implies `--leg-load`. No default: the number
++    /// is a measurement on the duck (docs/board.md §17.7), not a guess.
++    #[arg(long)]
++    lift_relax_load: Option<f64>,
++
+     /// Write the tick journal to this file (duck-brain P13): one JSON line per control tick — the
+     /// policy's input and output, the targets, what the servos reported and were sent — for
+     /// replaying a run through the same network on a PC (`scripts/replay_journal.py`). About
+@@ -348,6 +410,13 @@ enum Command {
+     },
+ }
+ 
++fn parse_secs(raw: &str) -> Result<f64, String> {
++    match raw.parse::<f64>() {
++        Ok(s) if (0.5..=60.0).contains(&s) => Ok(s),
++        _ => Err(format!("expected seconds, 0.5–60, got {raw:?}")),
++    }
++}
++
+ fn parse_duration(raw: &str) -> Result<Duration, String> {
+     let (value, scale) = match raw.strip_suffix("ms") {
+         Some(v) => (v, 1u64),
+@@ -663,6 +732,8 @@ struct RobotState {
+     /// Where the control loop writes its tick journal, when asked (`--journal`, duck-brain P13), and
+     /// how often it goes to the card (P14).
+     journal_path: std::sync::OnceLock<(PathBuf, Duration)>,
++    /// The stand-alone duck's own stops (duck-brain P25), from the command line.
++    standalone: std::sync::OnceLock<Standalone>,
+     /// Why the policy is not loaded, if it is not. Set once at startup; the loop keeps
+     /// running and holds the pose, so a broken bundle is a rollback rather than a crash.
+     policy_error: ArcSwapOption<String>,
+@@ -810,6 +881,7 @@ impl RobotState {
+             feetech: std::sync::OnceLock::new(),
+             host_imu: std::sync::OnceLock::new(),
+             journal_path: std::sync::OnceLock::new(),
++            standalone: std::sync::OnceLock::new(),
+             policy_error: ArcSwapOption::empty(),
+             policy_change_error: ArcSwapOption::empty(),
+             policies: ArcSwap::from_pointee(PolicyNames::of(&params.policy.resolved())),
+@@ -1121,6 +1193,14 @@ async fn main() -> ExitCode {
+         return body_imu::bench(&params, solve);
+     }
+ 
++    // P25: these read or write the Feetech servos.
++    if (args.relax_at_start || args.leg_load || args.lift_relax_load.is_some())
++        && params.bus.driver != robotd_params::BusDriver::Feetech
++    {
++        tracing::error!("--relax-at-start, --leg-load and --lift-relax-load are for [bus] driver = \"feetech\"");
++        return ExitCode::FAILURE;
++    }
++
+     // P22: a dry run is the Feetech daemon's, nothing else's — a flag that silently did nothing on
+     // another bus or under a subcommand would be a robot moving that was meant not to.
+     if args.dry_run && (params.bus.driver != robotd_params::BusDriver::Feetech || args.command.is_some()) {
+@@ -1165,6 +1245,16 @@ async fn main() -> ExitCode {
+         let every = Duration::from_secs(args.journal_flush_s.max(1));
+         let _ = state.journal_path.set((path, every));
+     }
++    let _ = state.standalone.set(Standalone {
++        pad_lost_relax: args.pad_lost_relax.map(Duration::from_secs_f64),
++        lift_relax_load: args.lift_relax_load,
++    });
++    if let Some(s) = args.pad_lost_relax {
++        tracing::warn!(seconds = s, "--pad-lost-relax: no twist from any client for this long with torque on → relax");
++    }
++    if let Some(t) = args.lift_relax_load {
++        tracing::warn!(threshold = t, "--lift-relax-load: legs unloaded while walking upright → relax");
++    }
+     let state = Arc::new(state);
+ 
+     if args.unhealthy {
+@@ -1351,6 +1441,8 @@ fn spawn_control_thread(
+     let sim = args.sim.clone();
+     let static_imu = args.static_imu;
+     let dry_run = args.dry_run;
++    let relax_at_start = args.relax_at_start;
++    let read_current = args.leg_load || args.lift_relax_load.is_some();
+     let bus = params.bus.clone();
+     let params = params.clone();
+     // So a reload can re-read `[policy]` without a restart. The path rather than the loaded
+@@ -1418,9 +1510,17 @@ fn spawn_control_thread(
+                 }));
+                 runtime.block_on(async move {
+                     let waiting_voice = WaitingVoice::start(&params, Arc::clone(&intents));
+-                    let io = feetech_bus::open_waiting(&params, &state, imu, dry_run).await;
++                    let io = feetech_bus::open_waiting(&params, &state, imu, dry_run, read_current).await;
+                     drop(waiting_voice);
+-                    if let Some(io) = io {
++                    if let Some(mut io) = io {
++                        // P25: the duck comes up limp whatever was left on, each servo read back.
++                        if relax_at_start {
++                            use duck_control::io::RobotIo;
++                            match io.set_torque(false) {
++                                Ok(()) => tracing::warn!("--relax-at-start: torque off on all 15, read back"),
++                                Err(e) => tracing::error!(error = %e, "--relax-at-start: torque off did not take everywhere"),
++                            }
++                        }
+                         control_loop(io, state, intents, params, params_path, period, poweroff).await;
+                     }
+                 });
+@@ -2341,6 +2441,9 @@ async fn control_loop<T: RobotIo>(
+     // The tick journal (duck-brain P13), when `--journal` asked for one.
+     let journal_started = Instant::now();
+     let mut journal_tick = 0u64;
++    // duck-brain P25: the stand-alone stops, and the lift rule's state.
++    let standalone = state.standalone.get().copied().unwrap_or_default();
++    let mut lift = LiftWatch::default();
+     let mut journal = state.journal_path.get().and_then(|(path, every)| {
+         let header = serde_json::json!({
+             "journal": 1,
+@@ -2647,10 +2750,49 @@ async fn control_loop<T: RobotIo>(
+         }
+         state.fallen.store(safety.fallen(), Ordering::Relaxed);
+ 
+-        let snapshot = intents.snapshot();
++        let mut snapshot = intents.snapshot();
+         let (gated, deadman) = safety.gate(snapshot.command, snapshot.twist_age);
+         let mut limits: Vec<duck_control::safety::Limit> = deadman.into_iter().collect();
+ 
++        // duck-brain P25: the stand-alone duck's own stops, as a relax the next lines take. Only
++        // with torque on (anything but limp) and the daemon not powering off.
++        if bringup != Bringup::Limp && !powered_off {
++            if let Some(after) = standalone.pad_lost_relax
++                && snapshot.twist_age > after
++            {
++                tracing::warn!(
++                    seconds = snapshot.twist_age.as_secs_f64(),
++                    "no twist from the pad for too long (--pad-lost-relax): relax"
++                );
++                intents.request_relax();
++                // This tick's enable was read before the relax: without this, the bring-up below
++                // would switch torque straight back on from it.
++                snapshot.enabled = false;
++            }
++            let watching = snapshot.enabled
++                && bringup == Bringup::Ready
++                && controller.as_ref().is_some_and(Controller::walking_plain);
++            match (standalone.lift_relax_load, safety.leg_load(), sensors.as_ref()) {
++                (Some(threshold), Some(load), Some(s))
++                    if watching && duck_control::stance::tilt(&s.imu) < LIFT_MAX_TILT =>
++                {
++                    if lift.step(load, threshold, period.as_secs_f64()) {
++                        tracing::warn!(
++                            load = lift.load,
++                            threshold,
++                            "legs unloaded while walking upright — picked up? (--lift-relax-load): relax"
++                        );
++                        lift.reset();
++                        intents.request_relax();
++                        snapshot.enabled = false;
++                    }
++                }
++                _ => lift.reset(),
++            }
++        } else {
++            lift.reset();
++        }
++
+         // An explicit `robot.init` / `robot.relax`, taken once.
+         //
+         // Before the enable-driven bring-up below, so a `relax` that arrives in the same tick as a
+@@ -7932,6 +8074,35 @@ mod tests {
+         assert_eq!(frame.joints.len(), NUM_JOINTS);
+     }
+ 
++    /// The lift rule (P25): the load smoothed over 0.2 s has to stay under the threshold for
++    /// 0.3 s; one heavy tick in between starts the count again, a short dip does nothing.
++    #[test]
++    fn the_lift_rule_wants_the_legs_unloaded_for_a_while() {
++        let dt = 0.02;
++        let mut w = LiftWatch::default();
++        // Standing: well above the threshold.
++        for _ in 0..50 {
++            assert!(!w.step(400.0, 100.0, dt));
++        }
++        // A 0.1 s dip to zero — a foot lifted, a bump: the smoothed load does not get there.
++        for _ in 0..5 {
++            assert!(!w.step(0.0, 100.0, dt));
++        }
++        for _ in 0..50 {
++            assert!(!w.step(400.0, 100.0, dt));
++        }
++        // Held in the air: unloaded for good.
++        let mut ticks = 0;
++        while !w.step(20.0, 100.0, dt) {
++            ticks += 1;
++            assert!(ticks < 100, "never fired");
++        }
++        let fired_after = f64::from(ticks + 1) * dt;
++        assert!((0.5..0.9).contains(&fired_after), "{fired_after} s: the smoothing, then 0.3 s");
++        w.reset();
++        assert!(!w.step(20.0, 100.0, dt), "a reset starts from nothing");
++    }
++
+     /// The host IMU's sample reaches the state stream as the loop saw it (duck-brain P23, Alex
+     /// 07.11: `monitor --json` showed the identity quaternion and upright gravity while the journal
+     /// said the robot was down): quaternion and gyro in `imu`, gravity and the fall verdict in
+-- 
+2.43.0
+

@@ -1,0 +1,3421 @@
+From 05f017dce4f6a8f1f1dca8cd7b74494a5b192aaf Mon Sep 17 00:00:00 2001
+From: duck-brain <duck-brain@localhost>
+Date: Sat, 17 Oct 2026 00:01:03 +0000
+Subject: [PATCH 6/8] duck-brain P11: Feetech HD-1910 bus driver (`[bus] driver
+ = "feetech"`)
+
+The duck-brain robot has fifteen Feetech HD-1910 servos on a half-duplex
+TTL line at 1 Mbit/s, protocol v1, no IMU board on the bus.
+
+- feetech/ (new crate): framing, a streaming parser, deadline reads with
+  per-servo results, echo handling, verified register writes, the
+  torque-on sequence of the 13-14.10 measurements; an in-memory emulator
+  for tests.
+- duck-control::feetech::FeetechIo: the tick is one sync_write of 42 and
+  one sync_read of 56..62 (56..63 once a second for temperature). A
+  servo that does not answer keeps its last position and is counted per
+  id. Direction sign per joint, error multiplied by 7.4 / V (smoothed
+  lowest servo voltage, clamped 6.0-9.5 V), torque off after 5 ticks
+  below 4.5 V, velocity from position difference or register 58. No
+  EEPROM writes, no homing_offset, no filters.
+- duck-control::host_imu::ImuFeed: where the host-read IMU (P12) hands
+  its newest sample to the tick; `robotd --static-imu` feeds a constant
+  upright one for bench runs against an emulator.
+- RobotIo::adapts_voltage: [policy] voltage_adapt stands down when the
+  bus compensates by itself.
+- robotd: [feetech] params, startup census, robot.health `feetech`
+  block (tick period p50/p99, misses per id, V min/median, temperatures,
+  observation age, IMU sample age), degraded on undervoltage cutoff;
+  `robotd init` refuses on this bus (robotctl robot init ramps to the
+  policy HOME).
+- robotctl servo: table / ping / read / write / torque, straight on the
+  port with robotd stopped.
+---
+ Cargo.lock                    |   10 +
+ Cargo.toml                    |    4 +-
+ duck-control/Cargo.toml       |    2 +
+ duck-control/src/feetech.rs   | 1001 +++++++++++++++++++++++++++++++++
+ duck-control/src/host_imu.rs  |  114 ++++
+ duck-control/src/io.rs        |    8 +
+ duck-control/src/lib.rs       |    4 +
+ duck-control/src/safety.rs    |    5 +
+ duck-ipc-proto/src/lib.rs     |   56 ++
+ feetech/Cargo.toml            |   12 +
+ feetech/src/emu.rs            |  176 ++++++
+ feetech/src/lib.rs            |  751 +++++++++++++++++++++++++
+ robotctl/Cargo.toml           |    2 +
+ robotctl/src/configure.rs     |    5 +-
+ robotctl/src/main.rs          |   15 +
+ robotctl/src/servo.rs         |  284 ++++++++++
+ robotd-params/src/edit.rs     |    2 +
+ robotd-params/src/lib.rs      |  269 +++++++++
+ robotd-params/src/registry.rs |   42 ++
+ robotd/Cargo.toml             |    2 +
+ robotd/src/feetech_bus.rs     |  184 ++++++
+ robotd/src/main.rs            |   52 +-
+ 22 files changed, 2995 insertions(+), 5 deletions(-)
+ create mode 100644 duck-control/src/feetech.rs
+ create mode 100644 duck-control/src/host_imu.rs
+ create mode 100644 feetech/Cargo.toml
+ create mode 100644 feetech/src/emu.rs
+ create mode 100644 feetech/src/lib.rs
+ create mode 100644 robotctl/src/servo.rs
+ create mode 100644 robotd/src/feetech_bus.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 0d0a912..a459aab 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1119,6 +1119,7 @@ name = "duck-control"
+ version = "0.17.2"
+ dependencies = [
+  "duck-ipc-proto",
++ "feetech",
+  "libloading 0.8.9",
+  "ort",
+  "rustypot",
+@@ -1338,6 +1339,13 @@ dependencies = [
+  "simd-adler32",
+ ]
+ 
++[[package]]
++name = "feetech"
++version = "0.17.2"
++dependencies = [
++ "serialport",
++]
++
+ [[package]]
+ name = "filetime"
+ version = "0.2.29"
+@@ -3862,6 +3870,7 @@ dependencies = [
+  "clap",
+  "clap_complete",
+  "duck-ipc-proto",
++ "feetech",
+  "kinematics",
+  "libc",
+  "pad-imu",
+@@ -3885,6 +3894,7 @@ dependencies = [
+  "clap",
+  "duck-control",
+  "duck-ipc-proto",
++ "feetech",
+  "kinematics",
+  "libc",
+  "minisign",
+diff --git a/Cargo.toml b/Cargo.toml
+index 6683ea1..a40a7cd 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -4,7 +4,7 @@
+ # docs/design/architecture.md §1. `robotd`, `btd` and `mediad` are all siblings now.
+ [workspace]
+ resolver = "3"
+-members = ["btd", "configd", "duck-ble", "duck-control", "duck-detect", "duck-ether", "duck-ipc-proto", "duckctl", "kinematics", "mediad", "netpadd", "nfc", "odometry", "pad-imu", "pad-map", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "uyvy", "xtask"]
++members = ["btd", "configd", "duck-ble", "duck-control", "duck-detect", "duck-ether", "duck-ipc-proto", "duckctl", "feetech", "kinematics", "mediad", "netpadd", "nfc", "odometry", "pad-imu", "pad-map", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "uyvy", "xtask"]
+ 
+ # Everything except `duckctl`, and that exception is the whole reason this key exists.
+ #
+@@ -18,7 +18,7 @@ members = ["btd", "configd", "duck-ble", "duck-control", "duck-detect", "duck-et
+ # writing down. One list here, and a new daemon is picked up by both without anybody remembering.
+ #
+ # `--workspace` is unaffected, so CI still lints and tests `duckctl` exactly as before.
+-default-members = ["btd", "configd", "duck-ble", "duck-ble", "duck-control", "duck-detect", "duck-ipc-proto", "kinematics", "mediad", "netpadd", "nfc", "odometry", "pad-imu", "pad-map", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "uyvy", "xtask"]
++default-members = ["btd", "configd", "duck-ble", "duck-ble", "duck-control", "duck-detect", "duck-ipc-proto", "feetech", "kinematics", "mediad", "netpadd", "nfc", "odometry", "pad-imu", "pad-map", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "uyvy", "xtask"]
+ 
+ # ONNX Runtime, which robotd dlopens to run a policy. One source of truth: `xtask package`
+ # bakes these into the release's preinstall hook, and a test asserts scripts/setup-board.sh
+diff --git a/duck-control/Cargo.toml b/duck-control/Cargo.toml
+index b53d572..7c7fa7a 100644
+--- a/duck-control/Cargo.toml
++++ b/duck-control/Cargo.toml
+@@ -43,6 +43,8 @@ rustypot = "1.8.0"
+ # not have, so leaving it on breaks the aarch64 build outright. rustypot disables it for the
+ # same reason; this crate has to as well, or cargo's feature unification turns it back on.
+ serialport = { version = "4.8", default-features = false }
++# The Feetech HD-1910 bus (duck-brain P11): framing, deadline reads, the verified torque-on.
++feetech = { path = "../feetech" }
+ 
+ [dev-dependencies]
+ serde_json.workspace = true
+diff --git a/duck-control/src/feetech.rs b/duck-control/src/feetech.rs
+new file mode 100644
+index 0000000..b30dbf1
+--- /dev/null
++++ b/duck-control/src/feetech.rs
+@@ -0,0 +1,1001 @@
++//! The Feetech bus: fifteen HD-1910 servos on a half-duplex TTL line (duck-brain patch P11).
++//!
++//! The tick is two transactions, by the duck-brain register table:
++//!
++//! - one `sync_write` of goal (42, 2 bytes) to every joint;
++//! - one `sync_read` of 56..62 (7 bytes: position, speed, load, voltage) from every joint —
++//!   once a second 56..63 instead, one byte longer, which brings the temperature (63) along
++//!   rather than spending a transaction of its own on it.
++//!
++//! A servo that does not answer the read is not a failed tick: its joint keeps the position it
++//! last reported, the miss is counted per id, and `robot.health` shows the count. Only a read
++//! that nobody answers is an error.
++//!
++//! What this driver does *not* do, deliberately: write `homing_offset` or anything else in
++//! EEPROM (each servo's zero is set when it is calibrated, with its ID — P9), reboot a servo
++//! (there is no reboot here), or filter what it reads or writes (the policies were trained
++//! without filters).
++//!
++//! Orientation does not come over this bus: the IMU is the host's (P12), handed over through an
++//! [`ImuFeed`] and taken, newest sample first, at the start of each read.
++
++use std::collections::VecDeque;
++use std::f64::consts::TAU;
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, Instant};
++
++use feetech::{Bus, Echo, Mismatch, Port, SerialPort, TorqueOn, reg};
++
++use crate::host_imu::{ImuFeed, age};
++use crate::imu::ImuData;
++use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
++use crate::model::{JOINT_IDS, JOINT_NAMES, NUM_JOINTS};
++
++/// Where the observation's joint velocity comes from (`[feetech] velocity`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum VelocitySource {
++    /// Position change since the servo's previous answer, over the time between the two reads.
++    PositionDelta,
++    /// Present speed (58, sign in bit 15), times [`FeetechConfig::speed_rad_per_count`].
++    Register,
++}
++
++/// Everything the driver is told by `robotd.toml`'s `[feetech]` section. Values marked
++/// "замерить" in the shipped file are guesses until measured on the robot.
++#[derive(Debug, Clone, PartialEq)]
++pub struct FeetechConfig {
++    pub baud: u32,
++    pub read_timeout: Duration,
++    pub echo: Echo,
++    /// Per-joint direction, ±1, indexed as [`JOINT_NAMES`].
++    pub sign: [f64; NUM_JOINTS],
++    pub torque: TorqueOn,
++    /// The `[policy] gain` the configured P belongs to: `set_gain(kp)` writes
++    /// `P × kp / gain_ref`, so the policy gain is P itself and `gain_limp` is the same fraction
++    /// of P that it is of the policy gain.
++    pub gain_ref: u16,
++    pub voltage_adapt: bool,
++    /// 7.4 V: the error sent to a servo is multiplied by `nominal_v / V`.
++    pub nominal_v: f64,
++    /// V is clamped to this band before it divides anything: 6.0–9.5 V.
++    pub adapt_band: (f64, f64),
++    /// Weight of a new reading in the per-tick smoothing of V (exponential).
++    pub voltage_alpha: f64,
++    /// Torque off when the lowest servo reads below this for `cutoff_ticks` ticks in a row.
++    pub cutoff_v: f64,
++    pub cutoff_ticks: u32,
++    pub velocity: VelocitySource,
++    pub speed_rad_per_count: f64,
++    /// Ticks between the reads that also bring the temperature.
++    pub temperature_every: u32,
++}
++
++impl Default for FeetechConfig {
++    fn default() -> Self {
++        Self {
++            baud: 1_000_000,
++            read_timeout: Duration::from_millis(12),
++            echo: Echo::Auto,
++            sign: [1.0; NUM_JOINTS],
++            torque: TorqueOn {
++                p: 32,
++                d: 40,
++                torque_limit: 1000,
++                speed: 10000,
++                retries: 5,
++            },
++            gain_ref: 200,
++            voltage_adapt: true,
++            nominal_v: 7.4,
++            adapt_band: (6.0, 9.5),
++            voltage_alpha: 0.02,
++            cutoff_v: 4.5,
++            cutoff_ticks: 5,
++            velocity: VelocitySource::PositionDelta,
++            speed_rad_per_count: TAU / feetech::COUNTS_PER_TURN,
++            temperature_every: 50,
++        }
++    }
++}
++
++/// Radians from a position register, `sign` applied.
++pub fn counts_to_rad(raw: u16, sign: f64) -> f64 {
++    sign * (f64::from(feetech::sign_magnitude(raw)) - feetech::CENTER) * TAU
++        / feetech::COUNTS_PER_TURN
++}
++
++/// A goal register from radians, `sign` applied, rounded and clamped to 0..=4095.
++pub fn rad_to_counts(rad: f64, sign: f64) -> u16 {
++    let counts = feetech::CENTER + (sign * rad * feetech::COUNTS_PER_TURN / TAU).round();
++    counts.clamp(0.0, feetech::COUNTS_PER_TURN - 1.0) as u16
++}
++
++/// The last `CAP` values of a timing, for percentiles.
++#[derive(Debug, Clone, Default)]
++struct Window(VecDeque<u32>);
++
++impl Window {
++    const CAP: usize = 500; // 10 s at 50 Hz
++
++    fn push(&mut self, d: Duration) {
++        if self.0.len() == Self::CAP {
++            self.0.pop_front();
++        }
++        self.0
++            .push_back(d.as_micros().min(u128::from(u32::MAX)) as u32);
++    }
++
++    /// p-th percentile in ms, nearest rank.
++    fn percentile_ms(&self, p: f64) -> Option<f64> {
++        if self.0.is_empty() {
++            return None;
++        }
++        let mut v: Vec<u32> = self.0.iter().copied().collect();
++        v.sort_unstable();
++        let rank = ((p / 100.0) * v.len() as f64).ceil().max(1.0) as usize - 1;
++        Some(f64::from(v[rank.min(v.len() - 1)]) / 1000.0)
++    }
++}
++
++/// What `robot.health` reports about the bus, filled by the driver as it runs.
++#[derive(Debug, Clone, Default)]
++struct Stats {
++    ticks: u64,
++    periods: Window,
++    obs_ages: Window,
++    imu_ages: Window,
++    misses: [u64; NUM_JOINTS],
++    run: [u32; NUM_JOINTS],
++    volts: [Option<f64>; NUM_JOINTS],
++    temps: [Option<f64>; NUM_JOINTS],
++    errors: [u8; NUM_JOINTS],
++    v_smoothed: Option<f64>,
++    adapt: f64,
++    cutoff: bool,
++    torque: Option<bool>,
++    rewrites: u64,
++    write_failures: u64,
++    counters: feetech::Counters,
++    imu_stale: ImuStale,
++    imu_age_last: Option<Duration>,
++}
++
++/// The driver's numbers, shared with whoever answers `robot.health`.
++pub struct FeetechShared(Mutex<Stats>);
++
++impl Default for FeetechShared {
++    fn default() -> Self {
++        // Nothing multiplied yet is a factor of one, not zero.
++        Self(Mutex::new(Stats {
++            adapt: 1.0,
++            ..Stats::default()
++        }))
++    }
++}
++
++/// A copy of [`FeetechShared`] at one moment.
++#[derive(Debug, Clone, PartialEq, Default)]
++pub struct FeetechSnapshot {
++    pub ticks: u64,
++    pub period_ms: (Option<f64>, Option<f64>),
++    pub obs_age_ms: (Option<f64>, Option<f64>),
++    pub imu_age_ms: (Option<f64>, Option<f64>),
++    pub imu_age_last_ms: Option<f64>,
++    pub misses: [u64; NUM_JOINTS],
++    pub consecutive_misses: [u32; NUM_JOINTS],
++    pub volts: [Option<f64>; NUM_JOINTS],
++    pub v_min: Option<f64>,
++    pub v_median: Option<f64>,
++    pub v_smoothed: Option<f64>,
++    pub adapt: f64,
++    pub temps_c: [Option<f64>; NUM_JOINTS],
++    pub errors: [u8; NUM_JOINTS],
++    pub cutoff: bool,
++    pub torque: Option<bool>,
++    pub rewrites: u64,
++    pub write_failures: u64,
++    pub echoes: u64,
++    pub bad_packets: u64,
++    pub stray: u64,
++    pub imu_stale: ImuStale,
++}
++
++impl FeetechShared {
++    pub fn snapshot(&self) -> FeetechSnapshot {
++        let s = self.0.lock().unwrap();
++        let mut known: Vec<f64> = s.volts.iter().flatten().copied().collect();
++        known.sort_by(f64::total_cmp);
++        let median = (!known.is_empty()).then(|| {
++            let n = known.len();
++            if n % 2 == 1 {
++                known[n / 2]
++            } else {
++                (known[n / 2 - 1] + known[n / 2]) / 2.0
++            }
++        });
++        FeetechSnapshot {
++            ticks: s.ticks,
++            period_ms: (s.periods.percentile_ms(50.0), s.periods.percentile_ms(99.0)),
++            obs_age_ms: (
++                s.obs_ages.percentile_ms(50.0),
++                s.obs_ages.percentile_ms(99.0),
++            ),
++            imu_age_ms: (
++                s.imu_ages.percentile_ms(50.0),
++                s.imu_ages.percentile_ms(99.0),
++            ),
++            imu_age_last_ms: s.imu_age_last.map(|d| d.as_secs_f64() * 1000.0),
++            misses: s.misses,
++            consecutive_misses: s.run,
++            volts: s.volts,
++            v_min: known.first().copied(),
++            v_median: median,
++            v_smoothed: s.v_smoothed,
++            adapt: s.adapt,
++            temps_c: s.temps,
++            errors: s.errors,
++            cutoff: s.cutoff,
++            torque: s.torque,
++            rewrites: s.rewrites,
++            write_failures: s.write_failures,
++            echoes: s.counters.echoes,
++            bad_packets: s.counters.bad_packets,
++            stray: s.counters.stray,
++            imu_stale: s.imu_stale,
++        }
++    }
++}
++
++pub struct FeetechIo<P: Port = SerialPort> {
++    bus: Bus<P>,
++    cfg: FeetechConfig,
++    shared: Arc<FeetechShared>,
++    imu: Arc<ImuFeed>,
++    positions: [f64; NUM_JOINTS],
++    velocities: [f64; NUM_JOINTS],
++    /// Each servo's last answer: position and when the read that brought it started.
++    last_answer: [Option<(f64, Instant)>; NUM_JOINTS],
++    volts: [Option<f64>; NUM_JOINTS],
++    temps: [Option<f64>; NUM_JOINTS],
++    v_smoothed: Option<f64>,
++    low_ticks: u32,
++    cutoff: bool,
++    kp: Option<u16>,
++    read_started: Option<Instant>,
++    imu_seq: Option<u64>,
++    imu_stale: ImuStale,
++    tick: u64,
++}
++
++impl FeetechIo<SerialPort> {
++    /// Open the port. No bus traffic: [`Self::census`] is the first.
++    pub fn open(
++        port: &str,
++        cfg: FeetechConfig,
++        shared: Arc<FeetechShared>,
++        imu: Arc<ImuFeed>,
++    ) -> Result<Self> {
++        let serial = SerialPort::open(port, cfg.baud).map_err(|source| IoError::Port {
++            path: port.to_owned(),
++            source,
++        })?;
++        Ok(Self::with_port(serial, cfg, shared, imu))
++    }
++}
++
++impl<P: Port> FeetechIo<P> {
++    pub fn with_port(
++        port: P,
++        cfg: FeetechConfig,
++        shared: Arc<FeetechShared>,
++        imu: Arc<ImuFeed>,
++    ) -> Self {
++        let bus = Bus::new(port, cfg.read_timeout, cfg.echo);
++        Self {
++            bus,
++            cfg,
++            shared,
++            imu,
++            positions: [0.0; NUM_JOINTS],
++            velocities: [0.0; NUM_JOINTS],
++            last_answer: [None; NUM_JOINTS],
++            volts: [None; NUM_JOINTS],
++            temps: [None; NUM_JOINTS],
++            v_smoothed: None,
++            low_ticks: 0,
++            cutoff: false,
++            kp: None,
++            read_started: None,
++            imu_seq: None,
++            imu_stale: ImuStale::default(),
++            tick: 0,
++        }
++    }
++
++    /// The joint ids that do not answer one read of the tick's block. Run until it is empty
++    /// before the loop starts: a joint that has never answered has no position to hold.
++    pub fn census(&mut self) -> Result<Vec<u8>> {
++        let answers = self
++            .bus
++            .sync_read(&JOINT_IDS, reg::POSITION.0, 7)
++            .map_err(|e| IoError::Bus(format!("census sync_read: {e}")))?;
++        let now = Instant::now();
++        let mut missing = Vec::new();
++        for (j, a) in answers.iter().enumerate() {
++            match a {
++                Some(s) => {
++                    let p = counts_to_rad(feetech::from_le(&s.params[0..2]), self.cfg.sign[j]);
++                    self.positions[j] = p;
++                    self.last_answer[j] = Some((p, now));
++                    self.volts[j] = Some(f64::from(s.params[6]) * 0.1);
++                }
++                None => missing.push(JOINT_IDS[j]),
++            }
++        }
++        Ok(missing)
++    }
++
++    pub fn shared(&self) -> Arc<FeetechShared> {
++        Arc::clone(&self.shared)
++    }
++
++    pub fn bus_mut(&mut self) -> &mut Bus<P> {
++        &mut self.bus
++    }
++
++    /// The servos that answered the last read — the ones a register write can be checked on.
++    fn present_ids(&self) -> Vec<u8> {
++        let s = self.shared.0.lock().unwrap();
++        JOINT_IDS
++            .iter()
++            .zip(&s.run)
++            .filter(|(_, run)| **run == 0)
++            .map(|(id, _)| *id)
++            .collect()
++    }
++
++    fn mapped_p(&self, kp: u16) -> u8 {
++        let p = f64::from(self.cfg.torque.p) * f64::from(kp) / f64::from(self.cfg.gain_ref.max(1));
++        p.round().clamp(1.0, 254.0) as u8
++    }
++
++    fn log_mismatch(m: &Mismatch, attempt: u32) {
++        let joint = JOINT_IDS
++            .iter()
++            .position(|&id| id == m.id)
++            .map_or("?", |i| JOINT_NAMES[i]);
++        tracing::warn!(id = m.id, joint, register = m.addr, wrote = m.wrote, read = ?m.read, attempt, "servo register reads back different; rewriting");
++    }
++
++    fn count_writes(&self, failed: &[Mismatch], rewrites: u64) {
++        let mut s = self.shared.0.lock().unwrap();
++        s.rewrites += rewrites;
++        s.write_failures += failed.len() as u64;
++        s.counters = self.bus.counters();
++    }
++
++    fn torque_off_all(&mut self) -> Result<()> {
++        let mut rewrites = 0u64;
++        let failed = feetech::torque_off(
++            &mut self.bus,
++            &JOINT_IDS,
++            self.cfg.torque.retries,
++            &mut |m, a| {
++                rewrites += 1;
++                Self::log_mismatch(m, a);
++            },
++        )
++        .map_err(|e| IoError::Bus(format!("torque off: {e}")))?;
++        self.count_writes(&failed, rewrites);
++        self.shared.0.lock().unwrap().torque = Some(false);
++        if failed.is_empty() {
++            Ok(())
++        } else {
++            Err(IoError::Bus(format!(
++                "torque off did not take: {}",
++                join(&failed)
++            )))
++        }
++    }
++}
++
++fn join(failed: &[Mismatch]) -> String {
++    failed
++        .iter()
++        .map(ToString::to_string)
++        .collect::<Vec<_>>()
++        .join("; ")
++}
++
++impl<P: Port> RobotIo for FeetechIo<P> {
++    fn read(&mut self) -> Result<Sensors> {
++        let started = Instant::now();
++        let period = self.read_started.map(|prev| started - prev);
++        self.read_started = Some(started);
++        self.tick += 1;
++        let with_temperature = self.cfg.temperature_every > 0
++            && self.tick % u64::from(self.cfg.temperature_every) == 1;
++        let len = if with_temperature { 8 } else { 7 };
++
++        let answers = self
++            .bus
++            .sync_read(&JOINT_IDS, reg::POSITION.0, len)
++            .map_err(|e| IoError::Bus(format!("tick sync_read: {e}")))?;
++
++        let mut v_min: Option<f64> = None;
++        let mut answered = 0usize;
++        let mut errors = [0u8; NUM_JOINTS];
++        let mut missed = [false; NUM_JOINTS];
++        for (j, a) in answers.iter().enumerate() {
++            let Some(s) = a else {
++                missed[j] = true;
++                continue;
++            };
++            answered += 1;
++            errors[j] = s.error;
++            let raw = feetech::from_le(&s.params[0..2]);
++            let sign = self.cfg.sign[j];
++            let p = counts_to_rad(raw, sign);
++            self.velocities[j] = match self.cfg.velocity {
++                VelocitySource::PositionDelta => match self.last_answer[j] {
++                    Some((p0, t0)) if started > t0 => (p - p0) / (started - t0).as_secs_f64(),
++                    _ => self.velocities[j],
++                },
++                VelocitySource::Register => {
++                    sign * f64::from(feetech::sign_magnitude(feetech::from_le(&s.params[2..4])))
++                        * self.cfg.speed_rad_per_count
++                }
++            };
++            self.positions[j] = p;
++            self.last_answer[j] = Some((p, started));
++            let v = f64::from(s.params[6]) * 0.1;
++            self.volts[j] = Some(v);
++            if v > 0.0 {
++                v_min = Some(v_min.map_or(v, |m: f64| m.min(v)));
++            }
++            if with_temperature {
++                self.temps[j] = Some(f64::from(s.params[7]));
++            }
++        }
++
++        if let Some(v) = v_min {
++            let a = self.cfg.voltage_alpha;
++            self.v_smoothed = Some(self.v_smoothed.map_or(v, |s| a * v + (1.0 - a) * s));
++            self.low_ticks = if v < self.cfg.cutoff_v {
++                self.low_ticks + 1
++            } else {
++                0
++            };
++        }
++        if self.low_ticks >= self.cfg.cutoff_ticks && !self.cutoff {
++            self.cutoff = true;
++            tracing::error!(
++                volts = ?v_min,
++                below = self.cfg.cutoff_v,
++                ticks = self.low_ticks,
++                "servo supply below the cutoff; torque off (robot.relax, then init, to bring it back)"
++            );
++            if let Err(e) = self.torque_off_all() {
++                tracing::error!(error = %e, "undervoltage torque-off did not take everywhere");
++            }
++        }
++
++        let sample = self.imu.latest();
++        let imu = sample.map_or_else(ImuData::default, |s| s.imu);
++        let imu_age = sample.map(|s| age(&s, started));
++        match (sample, self.imu_seq) {
++            (Some(s), Some(seq)) if s.seq == seq => {
++                self.imu_stale.total += 1;
++                self.imu_stale.run += 1;
++            }
++            _ => self.imu_stale.run = 0,
++        }
++        self.imu_seq = sample.map(|s| s.seq);
++
++        {
++            let mut s = self.shared.0.lock().unwrap();
++            s.ticks = self.tick;
++            if let Some(p) = period {
++                s.periods.push(p);
++            }
++            for j in 0..NUM_JOINTS {
++                if missed[j] {
++                    s.misses[j] += 1;
++                    s.run[j] += 1;
++                } else {
++                    if s.run[j] >= 50 {
++                        tracing::warn!(
++                            id = JOINT_IDS[j],
++                            joint = JOINT_NAMES[j],
++                            missed = s.run[j],
++                            "servo answers again; if it lost power its RAM registers are factory ones — relax, then init"
++                        );
++                    }
++                    s.run[j] = 0;
++                    s.errors[j] = errors[j];
++                }
++            }
++            s.volts = self.volts;
++            s.temps = self.temps;
++            s.v_smoothed = self.v_smoothed;
++            s.cutoff = self.cutoff;
++            s.counters = self.bus.counters();
++            s.imu_stale = self.imu_stale;
++            s.imu_age_last = imu_age;
++            if let Some(a) = imu_age {
++                s.imu_ages.push(a);
++            }
++        }
++
++        if answered == 0 {
++            return Err(IoError::ShortRead {
++                what: "servo answers",
++                expected: NUM_JOINTS,
++                got: 0,
++            });
++        }
++        Ok(Sensors {
++            positions: self.positions,
++            velocities: self.velocities,
++            currents_ma: [0.0; NUM_JOINTS],
++            imu,
++        })
++    }
++
++    fn write(&mut self, targets: &JointTargets) -> Result<()> {
++        // The servo's P loop pushes with a torque that follows its supply; multiplying the error
++        // by nominal / V holds that push where it was at the nominal voltage.
++        let k = match (self.cfg.voltage_adapt, self.v_smoothed) {
++            (true, Some(v)) => {
++                self.cfg.nominal_v / v.clamp(self.cfg.adapt_band.0, self.cfg.adapt_band.1)
++            }
++            _ => 1.0,
++        };
++        let mut bytes = Vec::with_capacity(NUM_JOINTS);
++        for (j, &id) in JOINT_IDS.iter().enumerate() {
++            let present = self.positions[j];
++            let goal = present + (targets.positions[j] - present) * k;
++            let raw = rad_to_counts(goal, self.cfg.sign[j]);
++            bytes.push((id, raw.to_le_bytes()));
++        }
++        let refs: Vec<(u8, &[u8])> = bytes.iter().map(|(id, b)| (*id, b.as_slice())).collect();
++        self.bus
++            .sync_write(reg::GOAL.0, reg::GOAL.1, &refs)
++            .map_err(|e| IoError::Bus(format!("sync_write goal: {e}")))?;
++        let obs_age = self.read_started.map(|t| t.elapsed());
++        if let Some(a) = obs_age {
++            let mut s = self.shared.0.lock().unwrap();
++            s.obs_ages.push(a);
++            s.adapt = k;
++        }
++        Ok(())
++    }
++
++    fn measures_load(&self) -> bool {
++        false
++    }
++
++    fn set_gain(&mut self, kp: u16) -> Result<()> {
++        let p = self.mapped_p(kp);
++        // Only the servos that answer: a silent one would cost every verification attempt a
++        // full timeout, and the tick with it. It gets its gain with the next torque-on.
++        let ids = self.present_ids();
++        let mut rewrites = 0u64;
++        let failed = feetech::write_verified(
++            &mut self.bus,
++            &ids,
++            reg::P,
++            &vec![u16::from(p); ids.len()],
++            self.cfg.torque.retries,
++            &mut |m, a| {
++                rewrites += 1;
++                Self::log_mismatch(m, a);
++            },
++        )
++        .map_err(|e| IoError::Bus(format!("P gain: {e}")))?
++        .into_iter()
++        .filter_map(std::result::Result::err)
++        .collect::<Vec<_>>();
++        self.count_writes(&failed, rewrites);
++        if failed.is_empty() {
++            self.kp = Some(kp);
++            Ok(())
++        } else {
++            Err(IoError::Bus(format!(
++                "P gain {p} did not take: {}",
++                join(&failed)
++            )))
++        }
++    }
++
++    fn set_torque(&mut self, on: bool) -> Result<()> {
++        if !on {
++            return self.torque_off_all();
++        }
++        let cfg = TorqueOn {
++            p: self.mapped_p(self.kp.unwrap_or(self.cfg.gain_ref)),
++            ..self.cfg.torque
++        };
++        let mut rewrites = 0u64;
++        let failed = feetech::torque_on(&mut self.bus, &JOINT_IDS, &cfg, &mut |m, a| {
++            rewrites += 1;
++            Self::log_mismatch(m, a);
++        })
++        .map_err(|e| IoError::Bus(format!("torque on: {e}")))?;
++        self.count_writes(&failed, rewrites);
++        if failed.is_empty() {
++            self.cutoff = false;
++            self.low_ticks = 0;
++            let mut s = self.shared.0.lock().unwrap();
++            s.torque = Some(true);
++            s.cutoff = false;
++            Ok(())
++        } else {
++            self.shared.0.lock().unwrap().torque = Some(false);
++            Err(IoError::Bus(format!(
++                "torque on did not take: {}",
++                join(&failed)
++            )))
++        }
++    }
++
++    fn reboot(&mut self, id: u8) -> Result<()> {
++        Err(IoError::Bus(format!(
++            "servo {id}: the Feetech driver (duck-brain P11) has no reboot; power-cycle the servo"
++        )))
++    }
++
++    /// The voltage and temperature the tick reads already brought — no bus traffic. Voltage is
++    /// the mean over the servos, as on the Dynamixel bus; a servo not read yet is left out.
++    fn slow_sensors(&mut self) -> Result<SlowSensors> {
++        let known: Vec<f64> = self
++            .volts
++            .iter()
++            .flatten()
++            .copied()
++            .filter(|v| *v > 0.0)
++            .collect();
++        if known.is_empty() {
++            return Err(IoError::ShortRead {
++                what: "servo voltage",
++                expected: NUM_JOINTS,
++                got: 0,
++            });
++        }
++        Ok(SlowSensors {
++            volts: known.iter().sum::<f64>() / known.len() as f64,
++            temps_c: self.temps.map(|t| t.unwrap_or(0.0)),
++        })
++    }
++
++    fn imu_stale(&self) -> ImuStale {
++        self.imu_stale
++    }
++
++    fn imu_ready(&self) -> bool {
++        self.imu.ready()
++    }
++
++    fn adapts_voltage(&self) -> bool {
++        self.cfg.voltage_adapt
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::host_imu::HostSample;
++    use feetech::emu::Emulator;
++
++    fn io(emu: Emulator, cfg: FeetechConfig) -> FeetechIo<Emulator> {
++        let mut io = FeetechIo::with_port(emu, cfg, Arc::default(), Arc::new(ImuFeed::new()));
++        assert!(io.census().unwrap().is_empty());
++        io
++    }
++
++    fn quick() -> FeetechConfig {
++        FeetechConfig {
++            read_timeout: Duration::from_millis(3),
++            ..FeetechConfig::default()
++        }
++    }
++
++    #[test]
++    fn counts_and_radians() {
++        assert_eq!(counts_to_rad(2048, 1.0), 0.0);
++        assert!((counts_to_rad(3072, 1.0) - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
++        assert!((counts_to_rad(3072, -1.0) + std::f64::consts::FRAC_PI_2).abs() < 1e-12);
++        assert_eq!(rad_to_counts(0.0, 1.0), 2048);
++        assert_eq!(rad_to_counts(std::f64::consts::FRAC_PI_2, -1.0), 1024);
++        assert_eq!(rad_to_counts(10.0, 1.0), 4095, "clamped");
++        for raw in [0u16, 1, 1000, 2048, 4095] {
++            assert_eq!(rad_to_counts(counts_to_rad(raw, -1.0), -1.0), raw);
++        }
++    }
++
++    /// The tick: a sync write of 42 and a sync read of 56 for seven bytes, all fifteen ids.
++    #[test]
++    fn a_tick_is_one_sync_write_and_one_sync_read() {
++        let mut emu = Emulator::new(&JOINT_IDS);
++        emu.servo_mut(12).unwrap().set(56, 2, 2048 + 512);
++        let mut io = io(
++            emu,
++            FeetechConfig {
++                temperature_every: 0,
++                ..quick()
++            },
++        );
++        let s = io.read().unwrap();
++        let j = JOINT_IDS.iter().position(|&id| id == 12).unwrap();
++        assert!((s.positions[j] - std::f64::consts::FRAC_PI_4).abs() < 1e-12);
++        io.write(&JointTargets::new(s.positions)).unwrap();
++        let log = &io.bus_mut().port_mut().log;
++        let tick: Vec<(u8, u8, u8)> = log.iter().rev().take(2).rev().copied().collect();
++        assert_eq!(tick, vec![(0xFE, 0x82, 56), (0xFE, 0x83, 42)]);
++    }
++
++    /// One servo silent for a while: the tick still succeeds, its joint holds the last position,
++    /// and the misses are counted against its id.
++    #[test]
++    fn a_silent_servo_holds_its_last_position_and_is_counted() {
++        let emu = Emulator::new(&JOINT_IDS);
++        let mut io = io(emu, quick());
++        let j = 3;
++        io.bus_mut()
++            .port_mut()
++            .servo_mut(JOINT_IDS[j])
++            .unwrap()
++            .set(56, 2, 2100);
++        let before = io.read().unwrap().positions[j];
++        io.bus_mut()
++            .port_mut()
++            .servo_mut(JOINT_IDS[j])
++            .unwrap()
++            .silent = true;
++        io.bus_mut()
++            .port_mut()
++            .servo_mut(JOINT_IDS[j])
++            .unwrap()
++            .set(56, 2, 3000);
++        for _ in 0..4 {
++            let s = io.read().expect("one silent servo is not a failed tick");
++            assert_eq!(s.positions[j], before);
++        }
++        let snap = io.shared().snapshot();
++        assert_eq!(snap.misses[j], 4);
++        assert_eq!(snap.consecutive_misses[j], 4);
++        assert_eq!(snap.misses.iter().sum::<u64>(), 4, "nobody else missed");
++        io.bus_mut()
++            .port_mut()
++            .servo_mut(JOINT_IDS[j])
++            .unwrap()
++            .silent = false;
++        assert_ne!(io.read().unwrap().positions[j], before);
++        assert_eq!(io.shared().snapshot().consecutive_misses[j], 0);
++    }
++
++    #[test]
++    fn nobody_answering_is_an_error() {
++        let emu = Emulator::new(&JOINT_IDS);
++        let mut io = io(emu, quick());
++        for id in JOINT_IDS {
++            io.bus_mut().port_mut().servo_mut(id).unwrap().silent = true;
++        }
++        assert!(io.read().is_err());
++    }
++
++    /// The direction sign applies both ways: a joint flipped in the config reads and commands
++    /// the mirror image.
++    #[test]
++    fn the_sign_flips_reads_and_goals() {
++        let mut cfg = quick();
++        cfg.sign[0] = -1.0;
++        cfg.voltage_adapt = false;
++        let mut emu = Emulator::new(&JOINT_IDS);
++        emu.servo_mut(JOINT_IDS[0]).unwrap().set(56, 2, 2048 + 100);
++        let mut io = io(emu, cfg);
++        let s = io.read().unwrap();
++        assert!(s.positions[0] < 0.0);
++        let mut t = s.positions;
++        t[0] = 0.5;
++        io.write(&JointTargets::new(t)).unwrap();
++        let goal = io
++            .bus_mut()
++            .port_mut()
++            .servo(JOINT_IDS[0])
++            .unwrap()
++            .get(42, 2);
++        assert_eq!(goal, rad_to_counts(0.5, -1.0));
++        assert!(goal < 2048);
++    }
++
++    /// The error sent is multiplied by 7.4 / V: at 6.0 V (and below, clamped) a 0.1 rad error
++    /// goes out as 0.1233 rad.
++    #[test]
++    fn voltage_adapt_scales_the_error_by_nominal_over_v() {
++        let mut emu = Emulator::new(&JOINT_IDS);
++        for id in JOINT_IDS {
++            emu.servo_mut(id).unwrap().set(62, 1, 50); // 5.0 V: below the band, above the cutoff
++        }
++        let mut io = io(emu, quick());
++        let s = io.read().unwrap();
++        let mut t = s.positions;
++        t[0] += 0.1;
++        io.write(&JointTargets::new(t)).unwrap();
++        let k = 7.4 / 6.0;
++        let snap = io.shared().snapshot();
++        assert!((snap.adapt - k).abs() < 1e-12, "{}", snap.adapt);
++        let goal = io
++            .bus_mut()
++            .port_mut()
++            .servo(JOINT_IDS[0])
++            .unwrap()
++            .get(42, 2);
++        assert_eq!(goal, rad_to_counts(s.positions[0] + 0.1 * k, 1.0));
++        // Off: the target goes out as it is.
++        let mut cfg = quick();
++        cfg.voltage_adapt = false;
++        let mut io = super::tests::io(Emulator::new(&JOINT_IDS), cfg);
++        let s = io.read().unwrap();
++        io.write(&JointTargets::new(s.positions)).unwrap();
++        assert_eq!(io.shared().snapshot().adapt, 1.0);
++    }
++
++    /// V is smoothed per tick from the lowest servo, seeded by the first reading.
++    #[test]
++    fn voltage_is_the_smoothed_minimum() {
++        let mut emu = Emulator::new(&JOINT_IDS);
++        emu.servo_mut(13).unwrap().set(62, 1, 70);
++        let mut io = io(
++            emu,
++            FeetechConfig {
++                voltage_alpha: 0.5,
++                ..quick()
++            },
++        );
++        io.read().unwrap();
++        assert_eq!(io.shared().snapshot().v_smoothed, Some(7.0));
++        io.bus_mut()
++            .port_mut()
++            .servo_mut(13)
++            .unwrap()
++            .set(62, 1, 74);
++        io.read().unwrap();
++        let snap = io.shared().snapshot();
++        assert!((snap.v_smoothed.unwrap() - 7.2).abs() < 1e-12);
++        assert_eq!(snap.v_min, Some(7.4));
++        assert_eq!(snap.v_median, Some(7.4));
++    }
++
++    /// Five ticks in a row below 4.5 V and the torque goes off; four do not.
++    #[test]
++    fn five_ticks_below_the_cutoff_take_torque_off() {
++        let mut io = io(Emulator::new(&JOINT_IDS), quick());
++        io.set_torque(true).unwrap();
++        let set_v = |io: &mut FeetechIo<Emulator>, v: u16| {
++            io.bus_mut().port_mut().servo_mut(24).unwrap().set(62, 1, v);
++        };
++        set_v(&mut io, 44);
++        for _ in 0..4 {
++            io.read().unwrap();
++        }
++        set_v(&mut io, 74);
++        io.read().unwrap();
++        assert!(!io.shared().snapshot().cutoff, "four is not five");
++        set_v(&mut io, 44);
++        for _ in 0..5 {
++            io.read().unwrap();
++        }
++        let snap = io.shared().snapshot();
++        assert!(snap.cutoff);
++        assert_eq!(snap.torque, Some(false));
++        assert_eq!(io.bus_mut().port_mut().servo(10).unwrap().get(40, 1), 0);
++        // Torque on again clears it.
++        set_v(&mut io, 74);
++        io.read().unwrap();
++        io.set_torque(true).unwrap();
++        assert!(!io.shared().snapshot().cutoff);
++    }
++
++    /// Velocity, by default, is the position change over the time between two reads.
++    #[test]
++    fn velocity_is_the_position_difference_over_time() {
++        let mut io = io(Emulator::new(&JOINT_IDS), quick());
++        io.read().unwrap();
++        std::thread::sleep(Duration::from_millis(20));
++        io.bus_mut()
++            .port_mut()
++            .servo_mut(20)
++            .unwrap()
++            .set(56, 2, 2048 + 41);
++        let t0 = Instant::now();
++        let s = io.read().unwrap();
++        let dt_max = 0.020 + t0.elapsed().as_secs_f64() + 0.010;
++        let dp = counts_to_rad(2048 + 41, 1.0);
++        assert!(
++            s.velocities[0] > dp / dt_max && s.velocities[0] < dp / 0.020,
++            "{}",
++            s.velocities[0]
++        );
++        // From the register instead.
++        let mut io = super::tests::io(
++            Emulator::new(&JOINT_IDS),
++            FeetechConfig {
++                velocity: VelocitySource::Register,
++                ..quick()
++            },
++        );
++        io.bus_mut()
++            .port_mut()
++            .servo_mut(20)
++            .unwrap()
++            .set(58, 2, 0x8000 | 100);
++        let s = io.read().unwrap();
++        assert!((s.velocities[0] + 100.0 * TAU / 4096.0).abs() < 1e-12);
++    }
++
++    /// The gain maps onto P as a fraction of the configured one, and skips a silent servo.
++    #[test]
++    fn set_gain_writes_p_in_proportion() {
++        let mut io = io(Emulator::new(&JOINT_IDS), quick());
++        io.read().unwrap();
++        io.set_gain(200).unwrap();
++        assert_eq!(io.bus_mut().port_mut().servo(10).unwrap().get(50, 1), 32);
++        io.set_gain(50).unwrap();
++        assert_eq!(io.bus_mut().port_mut().servo(10).unwrap().get(50, 1), 8);
++        io.bus_mut().port_mut().servo_mut(11).unwrap().silent = true;
++        io.read().unwrap();
++        let t = Instant::now();
++        io.set_gain(200).unwrap();
++        assert!(
++            t.elapsed() < Duration::from_millis(3),
++            "no wait on the silent servo"
++        );
++    }
++
++    /// The newest host sample goes into the read, and a tick that sees the same one again counts
++    /// as stale.
++    #[test]
++    fn the_host_imu_sample_rides_the_read() {
++        let feed = Arc::new(ImuFeed::new());
++        let mut io = FeetechIo::with_port(
++            Emulator::new(&JOINT_IDS),
++            quick(),
++            Arc::default(),
++            Arc::clone(&feed),
++        );
++        io.census().unwrap();
++        let tilted = ImuData {
++            gravity: [0.0, -1.0, 0.0],
++            ..ImuData::default()
++        };
++        feed.publish(
++            HostSample {
++                imu: tilted,
++                at: Instant::now(),
++                seq: 7,
++            },
++            true,
++        );
++        assert!(io.imu_ready());
++        assert_eq!(io.read().unwrap().imu.gravity, [0.0, -1.0, 0.0]);
++        io.read().unwrap();
++        assert_eq!(io.imu_stale(), ImuStale { total: 1, run: 1 });
++        assert!(io.shared().snapshot().imu_age_last_ms.is_some());
++    }
++
++    /// Torque on goes through the verified sequence and holds the present pose.
++    #[test]
++    fn torque_on_holds_the_present_pose() {
++        let mut emu = Emulator::new(&JOINT_IDS);
++        emu.servo_mut(13).unwrap().set(56, 2, 2600);
++        let mut io = io(emu, quick());
++        io.set_torque(true).unwrap();
++        let s = io.bus_mut().port_mut().servo(13).unwrap();
++        assert_eq!(
++            (s.get(42, 2), s.get(40, 1), s.get(41, 1), s.get(50, 1)),
++            (2600, 1, 0, 32)
++        );
++        assert_eq!(io.shared().snapshot().torque, Some(true));
++    }
++}
+diff --git a/duck-control/src/host_imu.rs b/duck-control/src/host_imu.rs
+new file mode 100644
+index 0000000..e9bad7c
+--- /dev/null
++++ b/duck-control/src/host_imu.rs
+@@ -0,0 +1,114 @@
++//! The body IMU read by the host rather than fetched over the servo bus (duck-brain patch P12).
++//!
++//! On the duck-brain robot the LSM6DSV16X sits on the Zero 3W's own I²C bus, not on an
++//! `imu_to_dxl` board, so the tick cannot get orientation in the same transaction as the joints.
++//! A reader thread (`robotd`'s `body_imu`, P12) polls the chip and publishes here; the bus driver
++//! (P11) takes the newest sample at the start of each tick, together with how old it is.
++
++use std::sync::Mutex;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::time::{Duration, Instant};
++
++use crate::imu::ImuData;
++
++/// One decoded sample and when the chip produced it.
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct HostSample {
++    pub imu: ImuData,
++    pub at: Instant,
++    /// Counts samples since the reader started; a tick that sees the same number twice got no
++    /// new sample.
++    pub seq: u64,
++}
++
++/// What the reader says about itself, for `robot.health`.
++#[derive(Debug, Clone, Default, PartialEq)]
++pub struct ReaderStatus {
++    /// `"/dev/i2c-3 0x6a"` once the chip answered and configured.
++    pub device: Option<String>,
++    /// Why there is no chip, or the last read error.
++    pub error: Option<String>,
++    /// FIFO polls and decoded samples since the reader started.
++    pub polls: u64,
++    pub samples: u64,
++    pub started: Option<Instant>,
++}
++
++/// The hand-off between the reader thread and the bus driver.
++#[derive(Default)]
++pub struct ImuFeed {
++    latest: Mutex<Option<HostSample>>,
++    ready: AtomicBool,
++    status: Mutex<ReaderStatus>,
++    /// A constant upright sample, always fresh — `robotd --static-imu`, for running the loop on
++    /// a bench with no IMU (the x86 servo-emulator check). Never on a robot that stands.
++    fixed: bool,
++}
++
++impl ImuFeed {
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// See [`Self::fixed`].
++    pub fn static_upright() -> Self {
++        Self {
++            fixed: true,
++            ready: AtomicBool::new(true),
++            ..Self::default()
++        }
++    }
++
++    pub fn is_static(&self) -> bool {
++        self.fixed
++    }
++
++    pub fn publish(&self, sample: HostSample, ready: bool) {
++        *self.latest.lock().unwrap() = Some(sample);
++        self.ready.store(ready, Ordering::Relaxed);
++    }
++
++    /// The newest sample, or `None` before the first one.
++    pub fn latest(&self) -> Option<HostSample> {
++        if self.fixed {
++            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++            return Some(HostSample {
++                imu: ImuData::default(),
++                at: Instant::now(),
++                seq: SEQ.fetch_add(1, Ordering::Relaxed),
++            });
++        }
++        *self.latest.lock().unwrap()
++    }
++
++    /// Whether the chip's SFLP output has converged ([`crate::imu::SflpDecoder::ready`]).
++    pub fn ready(&self) -> bool {
++        self.ready.load(Ordering::Relaxed)
++    }
++
++    pub fn update_status(&self, f: impl FnOnce(&mut ReaderStatus)) {
++        f(&mut self.status.lock().unwrap());
++    }
++
++    pub fn status(&self) -> ReaderStatus {
++        self.status.lock().unwrap().clone()
++    }
++
++    /// Polls per second since the reader started, `None` before a second has passed.
++    pub fn poll_hz(&self) -> Option<f64> {
++        let s = self.status();
++        let secs = s.started?.elapsed().as_secs_f64();
++        (secs >= 1.0).then(|| s.polls as f64 / secs)
++    }
++
++    pub fn sample_hz(&self) -> Option<f64> {
++        let s = self.status();
++        let secs = s.started?.elapsed().as_secs_f64();
++        (secs >= 1.0).then(|| s.samples as f64 / secs)
++    }
++}
++
++/// Age of `sample` at `now`, saturating at zero for a sample stamped a hair after `now`.
++pub fn age(sample: &HostSample, now: Instant) -> Duration {
++    now.saturating_duration_since(sample.at)
++}
+diff --git a/duck-control/src/io.rs b/duck-control/src/io.rs
+index 498fd3f..f40de07 100644
+--- a/duck-control/src/io.rs
++++ b/duck-control/src/io.rs
+@@ -202,6 +202,14 @@ pub trait RobotIo {
+     fn servo_identity(&mut self) -> Result<Option<[ServoIdentity; NUM_JOINTS]>> {
+         Ok(None)
+     }
++
++    /// Whether this backend compensates the servo supply itself (duck-brain P11: the Feetech
++    /// driver multiplies the error it sends by nominal / V). The control loop's own
++    /// `[policy] voltage_adapt`, which scales the action, then stands down — two compensations
++    /// would square the correction.
++    fn adapts_voltage(&self) -> bool {
++        false
++    }
+ }
+ 
+ /// What a servo can say about itself — see [`RobotIo::servo_identity`].
+diff --git a/duck-control/src/lib.rs b/duck-control/src/lib.rs
+index e4769b5..3957932 100644
+--- a/duck-control/src/lib.rs
++++ b/duck-control/src/lib.rs
+@@ -9,6 +9,10 @@
+ 
+ pub mod bus;
+ pub mod fall;
++/// The HD-1910 bus of the duck-brain robot (duck-brain P11).
++pub mod feetech;
++/// The body IMU on the host's I²C (duck-brain P12).
++pub mod host_imu;
+ pub mod imu;
+ pub mod io;
+ pub mod model;
+diff --git a/duck-control/src/safety.rs b/duck-control/src/safety.rs
+index 14db58c..abfa9ce 100644
+--- a/duck-control/src/safety.rs
++++ b/duck-control/src/safety.rs
+@@ -451,6 +451,11 @@ impl<T: RobotIo> Safety<T> {
+         self.io.measures_load()
+     }
+ 
++    /// See [`RobotIo::adapts_voltage`].
++    pub fn adapts_voltage(&self) -> bool {
++        self.io.adapts_voltage()
++    }
++
+     /// Borrow the wrapped IO. Test-only, and deliberately not public: handing this out in
+     /// production would defeat the point of safety owning the writer.
+     #[cfg(test)]
+diff --git a/duck-ipc-proto/src/lib.rs b/duck-ipc-proto/src/lib.rs
+index eb8021b..a90fec4 100644
+--- a/duck-ipc-proto/src/lib.rs
++++ b/duck-ipc-proto/src/lib.rs
+@@ -3708,6 +3708,62 @@ pub struct HealthResult {
+     /// Orientation source. Absent from an older `robotd`.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub imu: Option<ImuHealth>,
++    /// The Feetech bus, servo by servo (duck-brain P11). Absent on a Dynamixel robot.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub feetech: Option<FeetechHealth>,
++}
++
++/// What the Feetech driver has seen since it started (duck-brain P11). Percentiles are over the
++/// last ten seconds of ticks.
++#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
++pub struct FeetechHealth {
++    pub ticks: u64,
++    /// Time between the starts of successive tick reads, ms.
++    pub period_ms_p50: Option<f64>,
++    pub period_ms_p99: Option<f64>,
++    /// From the start of the read to the goal write, ms: how old the observation the goals were
++    /// computed from is when they go out.
++    pub obs_age_ms_p50: Option<f64>,
++    pub obs_age_ms_p99: Option<f64>,
++    /// Age of the IMU sample a tick used, at the start of its read, ms.
++    pub imu_age_ms_p50: Option<f64>,
++    pub imu_age_ms_p99: Option<f64>,
++    pub imu_age_ms_last: Option<f64>,
++    /// Ticks that got no new IMU sample, in total and running.
++    pub imu_stale_ticks: u64,
++    pub imu_stale_run: u64,
++    /// Lowest and median servo voltage of the last read, the smoothed lowest, and the factor
++    /// errors were last multiplied by (1 when the adaptation is off). Register 62 as read.
++    pub volts_min: Option<f64>,
++    pub volts_median: Option<f64>,
++    pub volts_smoothed: Option<f64>,
++    pub adapt: f64,
++    /// Torque was cut for undervoltage and has not been switched on since.
++    pub cutoff: bool,
++    /// Last torque state written, `None` before the first.
++    pub torque: Option<bool>,
++    /// Register writes that read back different and were rewritten; writes that never did.
++    pub rewrites: u64,
++    pub write_failures: u64,
++    /// Our own bytes heard back, packets dropped for a bad checksum, answers nobody asked for.
++    pub echoes: u64,
++    pub bad_packets: u64,
++    pub stray: u64,
++    pub servos: Vec<ServoHealth>,
++}
++
++/// One servo on the Feetech bus.
++#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
++pub struct ServoHealth {
++    pub id: u8,
++    pub joint: String,
++    /// Tick reads it did not answer, in total and running.
++    pub misses: u64,
++    pub consecutive_misses: u32,
++    pub volts: Option<f64>,
++    pub temp_c: Option<f64>,
++    /// The error byte of its last answer; 0 is none.
++    pub error: u8,
+ }
+ 
+ /// The control loop's rate and timing.
+diff --git a/feetech/Cargo.toml b/feetech/Cargo.toml
+new file mode 100644
+index 0000000..d8bf8ae
+--- /dev/null
++++ b/feetech/Cargo.toml
+@@ -0,0 +1,12 @@
++[package]
++name = "feetech"
++version.workspace = true
++edition.workspace = true
++license.workspace = true
++description = "Feetech STS/HLS servos (protocol v1) on a half-duplex serial bus (duck-brain P11)"
++
++# Small on purpose: `robotctl` links this for its `servo` commands, and robotctl is on the
++# recovery path — no async runtime, no ONNX, nothing but the serial port.
++[dependencies]
++# Same pin and the same reason as duck-control: no libudev, which the board's cross-build lacks.
++serialport = { version = "4.8", default-features = false }
+diff --git a/feetech/src/emu.rs b/feetech/src/emu.rs
+new file mode 100644
+index 0000000..07c4700
+--- /dev/null
++++ b/feetech/src/emu.rs
+@@ -0,0 +1,176 @@
++//! Servos made of memory, for tests: a [`Port`] that answers the way the HD-1910 register map
++//! says a bus of them would. Not a model of the motor — a servo with torque on is simply at its
++//! goal — and nothing here claims timing.
++
++use std::collections::VecDeque;
++use std::io;
++use std::time::Duration;
++
++use crate::{BROADCAST, PING, Parser, Port, READ, SYNC_READ, SYNC_WRITE, WRITE, status};
++
++pub struct Servo {
++    pub id: u8,
++    pub regs: [u8; 256],
++    /// Answers nothing — unplugged, or a dead cable.
++    pub silent: bool,
++    /// Ignore this many writes before taking them: a servo that drops a write and has to be
++    /// told again.
++    pub ignore_writes: u32,
++    /// Never take a write to this register — a servo that will not, say, switch torque on.
++    pub refuse: Option<u8>,
++}
++
++impl Servo {
++    fn new(id: u8) -> Self {
++        let mut s = Self {
++            id,
++            regs: [0; 256],
++            silent: false,
++            ignore_writes: 0,
++            refuse: None,
++        };
++        s.set(56, 2, 2048);
++        s.set(42, 2, 2048);
++        s.set(62, 1, 74);
++        s.set(63, 1, 30);
++        s.set(50, 1, 32);
++        s.set(51, 1, 40);
++        s
++    }
++
++    pub fn get(&self, addr: u8, width: u8) -> u16 {
++        crate::from_le(&self.regs[usize::from(addr)..usize::from(addr) + usize::from(width)])
++    }
++
++    pub fn set(&mut self, addr: u8, width: u8, value: u16) {
++        let bytes = crate::le(value, width);
++        self.regs[usize::from(addr)..usize::from(addr) + bytes.len()].copy_from_slice(&bytes);
++    }
++
++    fn write(&mut self, addr: u8, data: &[u8]) {
++        if self.ignore_writes > 0 {
++            self.ignore_writes -= 1;
++            return;
++        }
++        if self.refuse == Some(addr) {
++            return;
++        }
++        let a = usize::from(addr);
++        self.regs[a..a + data.len()].copy_from_slice(data);
++        // Torque on: the servo is where it was told to be.
++        if self.regs[40] == 1 {
++            self.regs[56] = self.regs[42];
++            self.regs[57] = self.regs[43];
++        }
++    }
++}
++
++pub struct Emulator {
++    servos: Vec<Servo>,
++    out: VecDeque<u8>,
++    /// Hand every byte sent straight back first, as a half-duplex adapter may.
++    pub echo: bool,
++    parser: Parser,
++    /// Instructions seen, in order: (id, instruction, first parameter — the address).
++    pub log: Vec<(u8, u8, u8)>,
++}
++
++impl Emulator {
++    pub fn new(ids: &[u8]) -> Self {
++        Self {
++            servos: ids.iter().map(|&id| Servo::new(id)).collect(),
++            out: VecDeque::new(),
++            echo: false,
++            parser: Parser::default(),
++            log: Vec::new(),
++        }
++    }
++
++    pub fn servo_mut(&mut self, id: u8) -> Option<&mut Servo> {
++        self.servos.iter_mut().find(|s| s.id == id)
++    }
++
++    pub fn servo(&self, id: u8) -> Option<&Servo> {
++        self.servos.iter().find(|s| s.id == id)
++    }
++
++    fn live(&mut self, id: u8) -> Option<&mut Servo> {
++        self.servos.iter_mut().find(|s| s.id == id && !s.silent)
++    }
++
++    fn handle(&mut self, id: u8, instr: u8, params: &[u8]) {
++        self.log
++            .push((id, instr, params.first().copied().unwrap_or(0)));
++        match (instr, params) {
++            (PING, _) => {
++                if self.live(id).is_some() {
++                    self.out.extend(status(id, 0, &[]));
++                }
++            }
++            (READ, [addr, len]) => {
++                let (a, n) = (usize::from(*addr), usize::from(*len));
++                if let Some(s) = self.live(id) {
++                    let data = s.regs[a..a + n].to_vec();
++                    self.out.extend(status(id, 0, &data));
++                }
++            }
++            (WRITE, [addr, data @ ..]) => {
++                if let Some(s) = self.live(id) {
++                    s.write(*addr, data);
++                    self.out.extend(status(id, 0, &[]));
++                }
++            }
++            (SYNC_READ, [addr, len, ids @ ..]) if id == BROADCAST => {
++                let (a, n) = (usize::from(*addr), usize::from(*len));
++                for &target in ids {
++                    if let Some(s) = self.live(target) {
++                        let data = s.regs[a..a + n].to_vec();
++                        self.out.extend(status(target, 0, &data));
++                    }
++                }
++            }
++            (SYNC_WRITE, [addr, len, rest @ ..]) if id == BROADCAST => {
++                let chunk = 1 + usize::from(*len);
++                for entry in rest.chunks(chunk) {
++                    if entry.len() == chunk
++                        && let Some(s) = self.live(entry[0])
++                    {
++                        s.write(*addr, &entry[1..]);
++                    }
++                }
++            }
++            _ => {}
++        }
++    }
++}
++
++impl Port for Emulator {
++    fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
++        if self.echo {
++            self.out.extend(bytes);
++        }
++        self.parser.push(bytes);
++        while let Some((packet, _)) = self.parser.next_packet() {
++            // Instruction packets parse as status packets with the instruction in `error`.
++            self.handle(packet.id, packet.error, &packet.params);
++        }
++        Ok(())
++    }
++
++    fn recv(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
++        if self.out.is_empty() {
++            std::thread::sleep(timeout);
++            return Ok(0);
++        }
++        let n = buf.len().min(self.out.len());
++        for slot in buf.iter_mut().take(n) {
++            *slot = self.out.pop_front().expect("counted");
++        }
++        Ok(n)
++    }
++
++    fn discard_input(&mut self) -> io::Result<()> {
++        self.out.clear();
++        Ok(())
++    }
++}
+diff --git a/feetech/src/lib.rs b/feetech/src/lib.rs
+new file mode 100644
+index 0000000..3367e29
+--- /dev/null
++++ b/feetech/src/lib.rs
+@@ -0,0 +1,751 @@
++//! Feetech STS/HLS servos on a half-duplex TTL bus — the duck-brain robot's HD-1910s
++//! (duck-brain patch P11).
++//!
++//! The framing is Feetech's "protocol v1", the Dynamixel 1.0 layout, checked against rustypot
++//! 1.8.0 (`src/dynamixel_protocol/v1.rs`):
++//!
++//! ```text
++//! instruction  FF FF id len instr params… chk    len = params + 2
++//! status       FF FF id len err   params… chk    chk = !(id + len + instr|err + Σ params)
++//! ```
++//!
++//! Multi-byte registers are little-endian. `SYNC_READ` (0x82) goes to the broadcast id with
++//! `[addr, len, id…]` and every listed servo answers with its own status packet; `SYNC_WRITE`
++//! (0x83) carries `[addr, len, (id, data…)…]` and nobody answers.
++//!
++//! Why not rustypot's controller, which speaks the same framing: its sync read gives up on the
++//! first servo that does not answer, and it has no way to drop the echo a half-duplex adapter
++//! can hand back. The control tick needs the opposite of both — every answer that did arrive,
++//! per servo, by a deadline — so the bus layer here is a streaming parser and a deadline.
++
++use std::io::{self, Read, Write};
++use std::time::{Duration, Instant};
++
++pub mod emu;
++
++/// The id every servo listens to.
++pub const BROADCAST: u8 = 0xFE;
++
++/// Instructions.
++pub const PING: u8 = 0x01;
++pub const READ: u8 = 0x02;
++pub const WRITE: u8 = 0x03;
++pub const SYNC_READ: u8 = 0x82;
++pub const SYNC_WRITE: u8 = 0x83;
++
++/// The HD-1910 registers the robot uses: address, width in bytes. From the duck-brain build's
++/// own register table (docs/patches/P11-feetech-driver.md), which agrees with rustypot's STS3215
++/// map for every address below except 50/51 (STS keeps P/D in EEPROM at 21/22; on the HD-1910
++/// they are RAM copies at 50/51).
++pub mod reg {
++    pub const TORQUE: (u8, u8) = (40, 1);
++    pub const ACCELERATION: (u8, u8) = (41, 1);
++    pub const GOAL: (u8, u8) = (42, 2);
++    pub const SPEED: (u8, u8) = (46, 2);
++    pub const TORQUE_LIMIT: (u8, u8) = (48, 2);
++    pub const P: (u8, u8) = (50, 1);
++    pub const D: (u8, u8) = (51, 1);
++    pub const POSITION: (u8, u8) = (56, 2);
++    pub const PRESENT_SPEED: (u8, u8) = (58, 2);
++    pub const VOLTAGE: (u8, u8) = (62, 1);
++    pub const TEMPERATURE: (u8, u8) = (63, 1);
++    pub const CURRENT: (u8, u8) = (69, 2);
++}
++
++/// Position counts per turn; 2048 is the joint's zero.
++pub const COUNTS_PER_TURN: f64 = 4096.0;
++pub const CENTER: f64 = 2048.0;
++
++/// `!(Σ bytes)` over id, length, instruction/error and parameters.
++pub fn checksum(body: &[u8]) -> u8 {
++    !body.iter().fold(0u8, |sum, b| sum.wrapping_add(*b))
++}
++
++/// One instruction packet.
++pub fn instruction(id: u8, instr: u8, params: &[u8]) -> Vec<u8> {
++    let mut p = Vec::with_capacity(params.len() + 6);
++    p.extend_from_slice(&[0xFF, 0xFF, id, (params.len() + 2) as u8, instr]);
++    p.extend_from_slice(params);
++    p.push(checksum(&p[2..]));
++    p
++}
++
++/// One status packet — what a servo sends back. Public for the emulator and the tests.
++pub fn status(id: u8, error: u8, params: &[u8]) -> Vec<u8> {
++    instruction(id, error, params)
++}
++
++/// Sign and magnitude in 16 bits, bit 15 the sign: how the servo reports speed and current
++/// (and position, should it ever go negative).
++pub fn sign_magnitude(raw: u16) -> i32 {
++    let magnitude = i32::from(raw & 0x7FFF);
++    if raw & 0x8000 != 0 {
++        -magnitude
++    } else {
++        magnitude
++    }
++}
++
++pub fn to_sign_magnitude(value: i32) -> u16 {
++    let magnitude = value.unsigned_abs().min(0x7FFF) as u16;
++    if value < 0 {
++        magnitude | 0x8000
++    } else {
++        magnitude
++    }
++}
++
++/// A status packet.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Status {
++    pub id: u8,
++    /// The servo's error byte; zero when all is well.
++    pub error: u8,
++    pub params: Vec<u8>,
++}
++
++/// Turns a byte stream into packets. Bytes before a header, and packets whose checksum fails,
++/// are dropped one header at a time, so a corrupted packet costs itself and nothing after it.
++#[derive(Debug, Default)]
++pub struct Parser {
++    buf: Vec<u8>,
++    /// Packets dropped for a bad checksum or an impossible length.
++    pub bad: u64,
++}
++
++impl Parser {
++    pub fn push(&mut self, bytes: &[u8]) {
++        self.buf.extend_from_slice(bytes);
++    }
++
++    pub fn clear(&mut self) {
++        self.buf.clear();
++    }
++
++    /// The next whole packet and its raw bytes, or `None` until more arrive.
++    pub fn next_packet(&mut self) -> Option<(Status, Vec<u8>)> {
++        loop {
++            let Some(start) = self.buf.windows(2).position(|w| w == [0xFF, 0xFF]) else {
++                // Keep a trailing 0xFF: it may be the first half of a header.
++                let keep = usize::from(self.buf.last() == Some(&0xFF));
++                let drop = self.buf.len() - keep;
++                self.buf.drain(..drop);
++                return None;
++            };
++            self.buf.drain(..start);
++            if self.buf.len() < 4 {
++                return None;
++            }
++            // `FF FF FF id`: an id is never 0xFF, so the header starts one byte later.
++            if self.buf[2] == 0xFF {
++                self.buf.drain(..1);
++                continue;
++            }
++            let len = usize::from(self.buf[3]);
++            if len < 2 {
++                self.bad += 1;
++                self.buf.drain(..2);
++                continue;
++            }
++            let total = 4 + len;
++            if self.buf.len() < total {
++                return None;
++            }
++            if checksum(&self.buf[2..total - 1]) != self.buf[total - 1] {
++                self.bad += 1;
++                self.buf.drain(..2);
++                continue;
++            }
++            let raw: Vec<u8> = self.buf.drain(..total).collect();
++            let status = Status {
++                id: raw[2],
++                error: raw[4],
++                params: raw[5..total - 1].to_vec(),
++            };
++            return Some((status, raw));
++        }
++    }
++}
++
++/// The byte pipe under [`Bus`]: a serial port on the robot, an emulator in tests.
++pub trait Port: Send {
++    fn send(&mut self, bytes: &[u8]) -> io::Result<()>;
++    /// Whatever has arrived, waiting at most `timeout` for the first byte. `Ok(0)` when nothing
++    /// came in time.
++    fn recv(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize>;
++    /// Forget anything not read yet: the tail of an earlier answer must not be parsed into this one.
++    fn discard_input(&mut self) -> io::Result<()>;
++}
++
++/// A tty, opened 8N1 at `baud`.
++pub struct SerialPort(Box<dyn serialport::SerialPort>);
++
++impl SerialPort {
++    pub fn open(path: &str, baud: u32) -> io::Result<Self> {
++        serialport::new(path, baud)
++            .timeout(Duration::from_millis(10))
++            .open()
++            .map(Self)
++            .map_err(io::Error::other)
++    }
++}
++
++impl Port for SerialPort {
++    fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
++        self.0.write_all(bytes)
++    }
++
++    fn recv(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
++        // On Linux this only stores the value; the read polls with it.
++        self.0
++            .set_timeout(timeout.max(Duration::from_micros(100)))
++            .map_err(io::Error::other)?;
++        match self.0.read(buf) {
++            Ok(n) => Ok(n),
++            Err(e) if e.kind() == io::ErrorKind::TimedOut => Ok(0),
++            Err(e) => Err(e),
++        }
++    }
++
++    fn discard_input(&mut self) -> io::Result<()> {
++        self.0
++            .clear(serialport::ClearBuffer::Input)
++            .map_err(io::Error::other)
++    }
++}
++
++/// Whether the adapter hands our own bytes back.
++///
++/// A half-duplex TTL bus has TX and RX on one wire, and whether the board's UART hears itself
++/// depends on how the wire is joined — not known for this robot (замерить: `robotctl servo
++/// table`, then `echoes` in its footer). `Auto` drops an answer byte-identical to the request
++/// once per transaction, and any packet from the broadcast id (only our own sync instructions
++/// carry it); `Off` takes every packet as an answer, which reads garbage if there is an echo.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Echo {
++    Auto,
++    Off,
++}
++
++/// What the bus has seen besides answers.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct Counters {
++    /// Our own packets heard back.
++    pub echoes: u64,
++    /// Packets dropped for a bad checksum or an impossible length.
++    pub bad_packets: u64,
++    /// Valid packets from an id that was not asked, a second answer from one that was, or an
++    /// answer of the wrong length.
++    pub stray: u64,
++}
++
++/// A bus: one request, the answers that arrive by the deadline.
++pub struct Bus<P: Port> {
++    port: P,
++    parser: Parser,
++    /// How long a request waits for its answers (замерить; config `[feetech] read_timeout_ms`).
++    pub timeout: Duration,
++    pub echo: Echo,
++    counters: Counters,
++}
++
++impl<P: Port> Bus<P> {
++    pub fn new(port: P, timeout: Duration, echo: Echo) -> Self {
++        Self {
++            port,
++            parser: Parser::default(),
++            timeout,
++            echo,
++            counters: Counters::default(),
++        }
++    }
++
++    pub fn counters(&self) -> Counters {
++        Counters {
++            bad_packets: self.parser.bad,
++            ..self.counters
++        }
++    }
++
++    pub fn port_mut(&mut self) -> &mut P {
++        &mut self.port
++    }
++
++    fn transmit(&mut self, packet: &[u8]) -> io::Result<()> {
++        self.port.discard_input()?;
++        self.parser.clear();
++        self.port.send(packet)
++    }
++
++    /// Answers from `ids`, each at most once, until all have answered or `deadline` passes.
++    fn collect(
++        &mut self,
++        sent: &[u8],
++        ids: &[u8],
++        len: Option<usize>,
++        deadline: Instant,
++    ) -> io::Result<Vec<Option<Status>>> {
++        let mut out: Vec<Option<Status>> = vec![None; ids.len()];
++        let mut left = ids.len();
++        let mut echo_pending = self.echo == Echo::Auto;
++        let mut buf = [0u8; 1024];
++        loop {
++            while let Some((status, raw)) = self.parser.next_packet() {
++                if self.echo == Echo::Auto
++                    && (status.id == BROADCAST || (echo_pending && raw == sent))
++                {
++                    echo_pending = echo_pending && raw != sent;
++                    self.counters.echoes += 1;
++                    continue;
++                }
++                match ids.iter().position(|&id| id == status.id) {
++                    Some(k) if out[k].is_none() && len.is_none_or(|n| status.params.len() == n) => {
++                        out[k] = Some(status);
++                        left -= 1;
++                    }
++                    _ => self.counters.stray += 1,
++                }
++            }
++            if left == 0 {
++                break;
++            }
++            let now = Instant::now();
++            if now >= deadline {
++                break;
++            }
++            let n = self.port.recv(&mut buf, deadline - now)?;
++            if n == 0 && Instant::now() >= deadline {
++                break;
++            }
++            self.parser.push(&buf[..n]);
++        }
++        Ok(out)
++    }
++
++    pub fn ping(&mut self, id: u8) -> io::Result<bool> {
++        let p = instruction(id, PING, &[]);
++        self.transmit(&p)?;
++        let deadline = Instant::now() + self.timeout;
++        Ok(self.collect(&p, &[id], Some(0), deadline)?[0].is_some())
++    }
++
++    /// `len` bytes from `addr` of one servo, or `None` when it did not answer.
++    pub fn read(&mut self, id: u8, addr: u8, len: u8) -> io::Result<Option<Status>> {
++        let p = instruction(id, READ, &[addr, len]);
++        self.transmit(&p)?;
++        let deadline = Instant::now() + self.timeout;
++        Ok(self
++            .collect(&p, &[id], Some(usize::from(len)), deadline)?
++            .remove(0))
++    }
++
++    /// Write `data` at `addr` of one servo, waiting for its acknowledgement, which a servo set
++    /// not to acknowledge writes never sends — so `None` is not a failure on its own.
++    pub fn write(&mut self, id: u8, addr: u8, data: &[u8]) -> io::Result<Option<Status>> {
++        let mut params = vec![addr];
++        params.extend_from_slice(data);
++        let p = instruction(id, WRITE, &params);
++        self.transmit(&p)?;
++        let deadline = Instant::now() + self.timeout;
++        Ok(self.collect(&p, &[id], Some(0), deadline)?.remove(0))
++    }
++
++    /// `len` bytes from `addr` of every servo in `ids`, one entry per id, `None` for a servo that
++    /// did not answer in time.
++    pub fn sync_read(&mut self, ids: &[u8], addr: u8, len: u8) -> io::Result<Vec<Option<Status>>> {
++        let mut params = vec![addr, len];
++        params.extend_from_slice(ids);
++        let p = instruction(BROADCAST, SYNC_READ, &params);
++        self.transmit(&p)?;
++        let deadline = Instant::now() + self.timeout;
++        self.collect(&p, ids, Some(usize::from(len)), deadline)
++    }
++
++    /// The same `len` bytes at `addr` of each servo, one value per servo; nobody answers.
++    pub fn sync_write(&mut self, addr: u8, len: u8, data: &[(u8, &[u8])]) -> io::Result<()> {
++        let mut params = Vec::with_capacity(2 + data.len() * (1 + usize::from(len)));
++        params.extend_from_slice(&[addr, len]);
++        for (id, bytes) in data {
++            debug_assert_eq!(bytes.len(), usize::from(len));
++            params.push(*id);
++            params.extend_from_slice(bytes);
++        }
++        let p = instruction(BROADCAST, SYNC_WRITE, &params);
++        self.transmit(&p)
++    }
++}
++
++/// A register value as bytes, little-endian, `width` 1 or 2.
++pub fn le(value: u16, width: u8) -> Vec<u8> {
++    match width {
++        1 => vec![value as u8],
++        _ => value.to_le_bytes().to_vec(),
++    }
++}
++
++/// Bytes back to a value, little-endian.
++pub fn from_le(bytes: &[u8]) -> u16 {
++    match bytes {
++        [b] => u16::from(*b),
++        [lo, hi, ..] => u16::from_le_bytes([*lo, *hi]),
++        [] => 0,
++    }
++}
++
++/// Write one register on every servo in `ids` and read it back, rewriting the servos that read
++/// back different, up to `retries` more times. Returns, per id, how many rewrites it took, or
++/// `Err` per id that never read back right (or never answered).
++///
++/// A sync write then a sync read: two transactions however many servos, which is what keeps the
++/// torque-on sequence short enough to run inside one control tick.
++///
++/// `on_mismatch` sees every read-back that disagreed, with the attempt it happened on (0 for
++/// the first write) — for the journal.
++pub fn write_verified<P: Port>(
++    bus: &mut Bus<P>,
++    ids: &[u8],
++    (addr, width): (u8, u8),
++    values: &[u16],
++    retries: u32,
++    on_mismatch: &mut dyn FnMut(&Mismatch, u32),
++) -> io::Result<Vec<Result<u32, Mismatch>>> {
++    let mut result: Vec<Result<u32, Mismatch>> = ids.iter().map(|_| Ok(0)).collect();
++    let mut pending: Vec<usize> = (0..ids.len()).collect();
++    for attempt in 0..=retries {
++        let bytes: Vec<(u8, Vec<u8>)> = pending
++            .iter()
++            .map(|&k| (ids[k], le(values[k], width)))
++            .collect();
++        let refs: Vec<(u8, &[u8])> = bytes.iter().map(|(id, b)| (*id, b.as_slice())).collect();
++        bus.sync_write(addr, width, &refs)?;
++        let asked: Vec<u8> = pending.iter().map(|&k| ids[k]).collect();
++        let back = bus.sync_read(&asked, addr, width)?;
++        let mut still = Vec::new();
++        for (slot, &k) in pending.iter().enumerate() {
++            let got = back[slot].as_ref().map(|s| from_le(&s.params));
++            if got == Some(values[k]) {
++                result[k] = Ok(attempt);
++            } else {
++                let m = Mismatch {
++                    id: ids[k],
++                    addr,
++                    wrote: values[k],
++                    read: got,
++                };
++                on_mismatch(&m, attempt);
++                result[k] = Err(m);
++                still.push(k);
++            }
++        }
++        pending = still;
++        if pending.is_empty() {
++            break;
++        }
++    }
++    Ok(result)
++}
++
++/// A register that did not read back what was written.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Mismatch {
++    pub id: u8,
++    pub addr: u8,
++    pub wrote: u16,
++    /// `None` when the servo did not answer the read at all.
++    pub read: Option<u16>,
++}
++
++impl std::fmt::Display for Mismatch {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self.read {
++            Some(v) => write!(
++                f,
++                "id {} reg {}: wrote {}, reads {}",
++                self.id, self.addr, self.wrote, v
++            ),
++            None => write!(f, "id {} reg {}: no answer", self.id, self.addr),
++        }
++    }
++}
++
++/// The values the torque-on sequence writes (config `[feetech]`).
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct TorqueOn {
++    /// RAM 50 and 51.
++    pub p: u8,
++    pub d: u8,
++    /// 48. 1000 by the duck-brain measurements of 13–14.10.2026.
++    pub torque_limit: u16,
++    /// 46. 10000; 0 means "stop", not "unlimited".
++    pub speed: u16,
++    /// Rewrites after a read-back that disagrees.
++    pub retries: u32,
++}
++
++/// Torque on, the duck-brain way (measurements of 13–14.10.2026), on every servo in `ids`:
++///
++/// 0. goal (42) = present position (56), so torque coming on moves nothing;
++/// 1. P (50) and D (51), RAM;
++/// 2. torque limit (48), then speed (46);
++/// 3. torque (40) = 1;
++/// 4. acceleration (41) = 1, then 0 — *under* torque: written with torque off, some servos keep
++///    the old profile and travel on it for 0.3 s.
++///
++/// Every write is read back and rewritten up to `retries` times. A step that still disagrees
++/// stops the sequence; if torque was already on by then it is taken off again, so the caller's
++/// "it failed" and the servos agree. Returns what never read back right — empty is success.
++pub fn torque_on<P: Port>(
++    bus: &mut Bus<P>,
++    ids: &[u8],
++    cfg: &TorqueOn,
++    on_mismatch: &mut dyn FnMut(&Mismatch, u32),
++) -> io::Result<Vec<Mismatch>> {
++    let present = bus.sync_read(ids, reg::POSITION.0, reg::POSITION.1)?;
++    let mut failed: Vec<Mismatch> = ids
++        .iter()
++        .zip(&present)
++        .filter(|(_, s)| s.is_none())
++        .map(|(&id, _)| Mismatch {
++            id,
++            addr: reg::POSITION.0,
++            wrote: 0,
++            read: None,
++        })
++        .collect();
++    if !failed.is_empty() {
++        return Ok(failed);
++    }
++    let goals: Vec<u16> = present
++        .iter()
++        .map(|s| from_le(&s.as_ref().expect("checked above").params))
++        .collect();
++    let all = |v: u16| vec![v; ids.len()];
++    let steps: [((u8, u8), Vec<u16>); 8] = [
++        (reg::GOAL, goals),
++        (reg::P, all(u16::from(cfg.p))),
++        (reg::D, all(u16::from(cfg.d))),
++        (reg::TORQUE_LIMIT, all(cfg.torque_limit)),
++        (reg::SPEED, all(cfg.speed)),
++        (reg::TORQUE, all(1)),
++        (reg::ACCELERATION, all(1)),
++        (reg::ACCELERATION, all(0)),
++    ];
++    let mut torque_written = false;
++    for (register, values) in steps {
++        torque_written |= register == reg::TORQUE;
++        let result = write_verified(bus, ids, register, &values, cfg.retries, on_mismatch)?;
++        failed = result.into_iter().filter_map(Result::err).collect();
++        if !failed.is_empty() {
++            if torque_written {
++                // Some servos may have torque by now; leave every one of them off.
++                let _ = write_verified(bus, ids, reg::TORQUE, &all(0), cfg.retries, &mut |_, _| {});
++            }
++            return Ok(failed);
++        }
++    }
++    Ok(failed)
++}
++
++/// Torque off (40 = 0) on every servo in `ids`, read back like any other write. Nothing else is
++/// touched: the RAM registers go back to factory values when the servo loses power anyway.
++pub fn torque_off<P: Port>(
++    bus: &mut Bus<P>,
++    ids: &[u8],
++    retries: u32,
++    on_mismatch: &mut dyn FnMut(&Mismatch, u32),
++) -> io::Result<Vec<Mismatch>> {
++    let result = write_verified(
++        bus,
++        ids,
++        reg::TORQUE,
++        &vec![0; ids.len()],
++        retries,
++        on_mismatch,
++    )?;
++    Ok(result.into_iter().filter_map(Result::err).collect())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use emu::Emulator;
++
++    /// rustypot's v1 framing, by hand: a PING to id 1 is FF FF 01 02 01 FB.
++    #[test]
++    fn packets_frame_like_protocol_v1() {
++        assert_eq!(
++            instruction(1, PING, &[]),
++            vec![0xFF, 0xFF, 0x01, 0x02, 0x01, 0xFB]
++        );
++        // READ id 1, addr 56, 2 bytes.
++        let p = instruction(1, READ, &[56, 2]);
++        assert_eq!(p[3], 4);
++        assert_eq!(p[7], !(1u8 + 4 + 2 + 56 + 2));
++    }
++
++    #[test]
++    fn the_parser_resyncs_past_garbage_and_bad_checksums() {
++        let mut parser = Parser::default();
++        let good = status(12, 0, &[1, 2]);
++        let mut bad = status(13, 0, &[3, 4]);
++        *bad.last_mut().unwrap() ^= 0x55;
++        parser.push(&[0x00, 0xFF, 0x13]);
++        parser.push(&bad);
++        parser.push(&[0xFF]);
++        parser.push(&good[..3]);
++        assert!(
++            parser.next_packet().is_none(),
++            "half a packet is not a packet"
++        );
++        parser.push(&good[3..]);
++        let (s, raw) = parser.next_packet().expect("the good packet");
++        assert_eq!((s.id, s.params.as_slice()), (12, &[1u8, 2][..]));
++        assert_eq!(raw, good);
++        assert_eq!(parser.bad, 1);
++    }
++
++    #[test]
++    fn sign_magnitude_round_trips() {
++        for v in [-32767, -1, 0, 1, 300, 32767] {
++            assert_eq!(sign_magnitude(to_sign_magnitude(v)), v);
++        }
++        assert_eq!(sign_magnitude(0x8000 | 5), -5);
++    }
++
++    fn bus(emu: Emulator) -> Bus<Emulator> {
++        Bus::new(emu, Duration::from_millis(5), Echo::Auto)
++    }
++
++    /// One servo silent: the others still answer, in their slots, and the call does not fail.
++    #[test]
++    fn a_silent_servo_is_a_none_not_an_error() {
++        let mut emu = Emulator::new(&[10, 11, 12]);
++        emu.servo_mut(11).unwrap().silent = true;
++        let mut b = bus(emu);
++        let got = b.sync_read(&[10, 11, 12], 56, 7).unwrap();
++        assert!(got[0].is_some() && got[1].is_none() && got[2].is_some());
++        assert_eq!(got[2].as_ref().unwrap().params.len(), 7);
++    }
++
++    /// With an echoing adapter, `Auto` drops our own packet and still reads the answer; a
++    /// unicast READ's echo would otherwise parse as an answer from that very servo.
++    #[test]
++    fn auto_echo_drops_our_own_packet() {
++        let mut emu = Emulator::new(&[12]);
++        emu.echo = true;
++        emu.servo_mut(12).unwrap().set(56, 2, 3000);
++        let mut b = bus(emu);
++        let s = b.read(12, 56, 2).unwrap().expect("answer");
++        assert_eq!(from_le(&s.params), 3000);
++        b.sync_write(42, 2, &[(12, &[0, 8])]).unwrap();
++        assert_eq!(
++            b.sync_read(&[12], 56, 2).unwrap()[0]
++                .as_ref()
++                .map(|s| s.params.len()),
++            Some(2)
++        );
++        assert!(b.counters().echoes >= 2, "{:?}", b.counters());
++    }
++
++    /// A write a servo ignores the first time is retried, and the retry is counted.
++    #[test]
++    fn writes_are_verified_and_retried() {
++        let mut emu = Emulator::new(&[10, 11]);
++        emu.servo_mut(11).unwrap().ignore_writes = 2;
++        let mut b = bus(emu);
++        let mut seen = Vec::new();
++        let r = write_verified(&mut b, &[10, 11], reg::P, &[20, 20], 5, &mut |m, a| {
++            seen.push((m.id, a))
++        })
++        .unwrap();
++        assert_eq!(r, vec![Ok(0), Ok(2)]);
++        assert_eq!(
++            seen,
++            vec![(11, 0), (11, 1)],
++            "each disagreeing read-back is reported"
++        );
++        let mut emu = Emulator::new(&[10]);
++        emu.servo_mut(10).unwrap().ignore_writes = 99;
++        let mut b = bus(emu);
++        let r = write_verified(&mut b, &[10], reg::P, &[20], 5, &mut |_, _| {}).unwrap();
++        assert!(matches!(
++            r[0],
++            Err(Mismatch {
++                id: 10,
++                addr: 50,
++                wrote: 20,
++                read: Some(32)
++            })
++        ));
++    }
++
++    const TORQUE: TorqueOn = TorqueOn {
++        p: 32,
++        d: 40,
++        torque_limit: 1000,
++        speed: 10000,
++        retries: 5,
++    };
++
++    /// The order of the duck-brain measurements, and 41 written only once torque is on.
++    #[test]
++    fn torque_on_writes_the_sequence_in_order_and_holds_the_present_position() {
++        let mut emu = Emulator::new(&[12, 13]);
++        emu.servo_mut(12).unwrap().set(56, 2, 2500);
++        emu.servo_mut(12).unwrap().set(42, 2, 1000); // a stale goal from before
++        let mut b = bus(emu);
++        let failed = torque_on(&mut b, &[12, 13], &TORQUE, &mut |_, _| {}).unwrap();
++        assert!(failed.is_empty(), "{failed:?}");
++        let emu = b.port_mut();
++        let s = emu.servo(12).unwrap();
++        assert_eq!(s.get(42, 2), 2500, "goal = present before torque");
++        assert_eq!(s.get(56, 2), 2500, "and so nothing moved");
++        assert_eq!(
++            (s.get(50, 1), s.get(51, 1), s.get(48, 2), s.get(46, 2)),
++            (32, 40, 1000, 10000)
++        );
++        assert_eq!((s.get(40, 1), s.get(41, 1)), (1, 0));
++        // The sync writes, by register, in order, none repeated.
++        let order: Vec<u8> = emu
++            .log
++            .iter()
++            .filter(|(_, i, _)| *i == SYNC_WRITE)
++            .map(|(_, _, addr)| *addr)
++            .collect();
++        assert_eq!(order, vec![42, 50, 51, 48, 46, 40, 41, 41]);
++    }
++
++    /// A servo that will not take torque leaves the whole set off.
++    #[test]
++    fn a_failed_torque_write_leaves_every_servo_off() {
++        let mut emu = Emulator::new(&[12, 13]);
++        emu.servo_mut(13).unwrap().refuse = Some(40);
++        let mut b = bus(emu);
++        let mut retries = 0;
++        let failed = torque_on(&mut b, &[12, 13], &TORQUE, &mut |m, _| {
++            if m.addr == 40 {
++                retries += 1;
++            }
++        })
++        .unwrap();
++        assert_eq!(failed.len(), 1);
++        assert_eq!((failed[0].id, failed[0].addr), (13, 40));
++        assert_eq!(retries, 6, "the first write and five rewrites");
++        assert_eq!(
++            b.port_mut().servo(12).unwrap().get(40, 1),
++            0,
++            "12 is off again"
++        );
++    }
++
++    /// A silent servo is reported, and nothing is switched on.
++    #[test]
++    fn torque_on_with_a_silent_servo_switches_nothing_on() {
++        let mut emu = Emulator::new(&[12, 13]);
++        emu.servo_mut(13).unwrap().silent = true;
++        let mut b = bus(emu);
++        let failed = torque_on(&mut b, &[12, 13], &TORQUE, &mut |_, _| {}).unwrap();
++        assert_eq!(failed.iter().map(|m| m.id).collect::<Vec<_>>(), vec![13]);
++        assert_eq!(b.port_mut().servo(12).unwrap().get(40, 1), 0);
++    }
++}
+diff --git a/robotctl/Cargo.toml b/robotctl/Cargo.toml
+index a6fb1e3..b6fab69 100644
+--- a/robotctl/Cargo.toml
++++ b/robotctl/Cargo.toml
+@@ -36,6 +36,8 @@ pad-imu = { path = "../pad-imu" }
+ # its config with, which is what makes the editor unable to disagree with the daemon. Pure
+ # serde + toml, so the recovery-path rule above still holds.
+ robotd-params = { path = "../robotd-params" }
++# duck-brain P11: `robotctl servo`, the HD-1910 bus by hand. Framing and a serial port, no more.
++feetech = { path = "../feetech" }
+ toml = "0.9"
+ # Edits `robotd.toml` losslessly: comments, ordering and unknown keys survive. The plain
+ # `toml` crate would re-serialize the file and destroy every comment in it.
+diff --git a/robotctl/src/configure.rs b/robotctl/src/configure.rs
+index 0402f5a..733160b 100644
+--- a/robotctl/src/configure.rs
++++ b/robotctl/src/configure.rs
+@@ -135,8 +135,9 @@ fn apply_for(key: &str) -> Option<Apply> {
+         // Read once at startup by both `padd` and `netpadd`, each to decide whether it is the one
+         // to run (`--should-run`). `apply_for` names one daemon; `plan_for_keys` adds `padd`.
+         "netpad" => Apply::Restart("netpadd"),
+-        "bus" | "control" | "update_gate" | "policy" | "safety" | "chorale" | "theremin"
+-        | "pickup" | "audio" => Apply::Restart("robotd"),
++        // `feetech`: duck-brain P11, the HD-1910 bus robotd opens once at startup.
++        "bus" | "feetech" | "control" | "update_gate" | "policy" | "safety" | "chorale"
++        | "theremin" | "pickup" | "audio" => Apply::Restart("robotd"),
+         _ => return None,
+     })
+ }
+diff --git a/robotctl/src/main.rs b/robotctl/src/main.rs
+index 0493a49..e0afb57 100644
+--- a/robotctl/src/main.rs
++++ b/robotctl/src/main.rs
+@@ -50,6 +50,8 @@ mod imu_view;
+ mod led;
+ mod monitor;
+ mod path_map;
++/// duck-brain P11: the Feetech bus, by hand.
++mod servo;
+ mod show;
+ mod vetbook;
+ 
+@@ -162,6 +164,16 @@ enum Namespace {
+         command: led::LedCommand,
+     },
+ 
++    /// The Feetech HD-1910 bus, straight through the serial port (duck-brain P11): read and write
++    /// a register, torque on or off by id, a table of every joint. Stop robotd first.
++    #[command(subcommand_required = true, arg_required_else_help = true)]
++    Servo {
++        #[command(flatten)]
++        bus: servo::BusArgs,
++        #[command(subcommand)]
++        command: servo::ServoCommand,
++    },
++
+     /// Watch the head IMU live: roll, pitch and yaw of the head, and where it measures up.
+     ///
+     /// Head frame: `x` forward, `y` left, `z` up with the head level, so a level head reads
+@@ -5378,6 +5390,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
+         Namespace::Led { command } => {
+             return led::run(Path::new(led::LEDS_DIR), command);
+         }
++        Namespace::Servo { bus, command } => {
++            return servo::run(&bus, command);
++        }
+         Namespace::Theremin { off } => {
+             return run_theremin(&cli.robot_socket, off);
+         }
+diff --git a/robotctl/src/servo.rs b/robotctl/src/servo.rs
+new file mode 100644
+index 0000000..49fb22c
+--- /dev/null
++++ b/robotctl/src/servo.rs
+@@ -0,0 +1,284 @@
++//! `robotctl servo` — the Feetech HD-1910 bus, straight through the serial port (duck-brain P11).
++//!
++//! A bench tool for the duck-brain robot: read and write a register by id, torque on or off, and
++//! a table of position, voltage, temperature and current for every joint. It opens the port
++//! itself, so robotd has to be stopped first (`sudo systemctl stop robotd`); the tty is opened
++//! exclusively, and a running robotd shows up here as "busy".
++//!
++//! Torque on is the same verified sequence robotd runs (`feetech::torque_on`), so a servo
++//! brought up by hand is brought up the way the daemon would.
++
++use std::path::{Path, PathBuf};
++use std::time::Duration;
++
++use clap::Subcommand;
++use feetech::{Bus, Echo, SerialPort, reg};
++use robotd_params::{FeetechEcho, Params};
++
++use super::{Failure, exit};
++
++type Result<T> = std::result::Result<T, Failure>;
++
++/// The joints in robotd's order, with their ids — the same table as `duck_ipc_proto`.
++fn joints() -> impl Iterator<Item = (u8, &'static str)> {
++    duck_ipc_proto::JOINT_IDS
++        .into_iter()
++        .zip(duck_ipc_proto::JOINT_NAMES)
++}
++
++#[derive(Subcommand, Debug)]
++pub(super) enum ServoCommand {
++    /// Position (56), voltage (62), temperature (63) and current (69) of every joint.
++    Table,
++    /// Which joint ids answer a ping.
++    Ping,
++    /// Read a register: `robotctl servo read 12 56` (width from the register table, or --len).
++    Read {
++        id: u8,
++        addr: u8,
++        #[arg(long)]
++        len: Option<u8>,
++    },
++    /// Write a register and read it back. RAM only (40 and up) unless --eeprom.
++    Write {
++        id: u8,
++        addr: u8,
++        value: u16,
++        #[arg(long)]
++        len: Option<u8>,
++        /// Allow an address below 40, the EEPROM. robotd never writes there; offsets and ids are
++        /// set when a servo is calibrated.
++        #[arg(long)]
++        eeprom: bool,
++    },
++    /// Torque on or off, for one id or `all`. On is robotd's verified sequence: goal = present,
++    /// P/D, torque limit, speed, torque, acceleration 1 then 0.
++    Torque {
++        /// A joint id, or `all`.
++        target: String,
++        /// `on` or `off`.
++        state: String,
++    },
++}
++
++/// Global options for the bus, read from robotd.toml unless given.
++#[derive(clap::Args, Debug)]
++pub(super) struct BusArgs {
++    /// robotd.toml to take the port, line rate and torque values from.
++    #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
++    pub params: PathBuf,
++    /// Serial port, overriding `[bus] port`.
++    #[arg(long)]
++    pub port: Option<String>,
++}
++
++/// Width of a register this robot uses, or 1.
++fn width(addr: u8) -> u8 {
++    [
++        reg::TORQUE,
++        reg::ACCELERATION,
++        reg::GOAL,
++        reg::SPEED,
++        reg::TORQUE_LIMIT,
++        reg::P,
++        reg::D,
++        reg::POSITION,
++        reg::PRESENT_SPEED,
++        reg::VOLTAGE,
++        reg::TEMPERATURE,
++        reg::CURRENT,
++    ]
++    .iter()
++    .find(|(a, _)| *a == addr)
++    .map_or(1, |(_, w)| *w)
++}
++
++fn params(path: &Path) -> Result<Params> {
++    // An absent default file is an unprovisioned board: defaults. A broken one is an error, and
++    // the error already names the file.
++    Params::load(path, path != Path::new(robotd_params::DEFAULT_PATH))
++        .map_err(|e| Failure::new(exit::FAILED, e.to_string()))
++}
++
++fn open(p: &Params, port: &str) -> Result<Bus<SerialPort>> {
++    let serial = SerialPort::open(port, p.feetech.baud).map_err(|e| {
++        if std::path::Path::new(port).exists() {
++            Failure::new(
++                exit::BUSY,
++                format!("{port}: {e} — is robotd running? sudo systemctl stop robotd"),
++            )
++        } else {
++            Failure::new(
++                exit::FAILED,
++                format!("{port}: no such port — is UART2 enabled (overlay uart2-m0)?"),
++            )
++        }
++    })?;
++    let echo = match p.feetech.echo {
++        FeetechEcho::Auto => Echo::Auto,
++        FeetechEcho::Off => Echo::Off,
++    };
++    Ok(Bus::new(
++        serial,
++        Duration::from_secs_f64(p.feetech.read_timeout_ms / 1000.0),
++        echo,
++    ))
++}
++
++fn io_err(e: std::io::Error) -> Failure {
++    Failure::new(exit::FAILED, format!("bus: {e}"))
++}
++
++pub(super) fn run(args: &BusArgs, command: ServoCommand) -> Result<()> {
++    let p = params(&args.params)?;
++    let port = args.port.clone().unwrap_or_else(|| p.bus.port.clone());
++    let mut bus = open(&p, &port)?;
++    let signs = p.feetech.sign.to_array();
++    match command {
++        ServoCommand::Table => {
++            let ids: Vec<u8> = joints().map(|(id, _)| id).collect();
++            // 56..70: position, speed, load, voltage, temperature, …, current at 69.
++            let rows = bus.sync_read(&ids, 56, 15).map_err(io_err)?;
++            println!(" id  joint             pos   rad(sign)    V     °C   current  err");
++            for (k, (id, name)) in joints().enumerate() {
++                match &rows[k] {
++                    Some(s) => {
++                        let b = &s.params;
++                        let pos = feetech::from_le(&b[0..2]);
++                        let rad = f64::from(signs[k])
++                            * (f64::from(feetech::sign_magnitude(pos)) - feetech::CENTER)
++                            * std::f64::consts::TAU
++                            / feetech::COUNTS_PER_TURN;
++                        let current = feetech::sign_magnitude(feetech::from_le(&b[13..15]));
++                        println!(
++                            "{id:>3}  {name:<16} {pos:>4}  {rad:>+8.3}   {:>4.1}  {:>4}  {current:>7}  {:#04x}",
++                            f64::from(b[6]) * 0.1,
++                            b[7],
++                            s.error
++                        );
++                    }
++                    None => println!("{id:>3}  {name:<16}    — no answer"),
++                }
++            }
++            let c = bus.counters();
++            println!(
++                "voltage is register 62 as read (the servos read ~0.7 V low); current in servo units\n\
++                 echoes {}  bad packets {}  stray {}",
++                c.echoes, c.bad_packets, c.stray
++            );
++        }
++        ServoCommand::Ping => {
++            for (id, name) in joints() {
++                let ok = bus.ping(id).map_err(io_err)?;
++                println!(
++                    "{id:>3}  {name:<16} {}",
++                    if ok { "answers" } else { "— no answer" }
++                );
++            }
++        }
++        ServoCommand::Read { id, addr, len } => {
++            let len = len.unwrap_or_else(|| width(addr));
++            match bus.read(id, addr, len).map_err(io_err)? {
++                Some(s) => {
++                    let v = feetech::from_le(&s.params);
++                    println!(
++                        "id {id} reg {addr} = {v} ({:#06x}; signed by bit 15: {})  err {:#04x}",
++                        v,
++                        feetech::sign_magnitude(v),
++                        s.error
++                    );
++                }
++                None => return Err(Failure::new(exit::FAILED, format!("id {id}: no answer"))),
++            }
++        }
++        ServoCommand::Write {
++            id,
++            addr,
++            value,
++            len,
++            eeprom,
++        } => {
++            if addr < 40 && !eeprom {
++                return Err(Failure::new(
++                    exit::USAGE,
++                    format!(
++                        "reg {addr} is EEPROM; robotd never writes there — add --eeprom if you mean it"
++                    ),
++                ));
++            }
++            let len = len.unwrap_or_else(|| width(addr));
++            let r = feetech::write_verified(
++                &mut bus,
++                &[id],
++                (addr, len),
++                &[value],
++                p.feetech.write_retries,
++                &mut |m, a| {
++                    eprintln!("attempt {a}: {m}");
++                },
++            )
++            .map_err(io_err)?;
++            match &r[0] {
++                Ok(0) => println!("id {id} reg {addr} = {value}, read back"),
++                Ok(n) => println!("id {id} reg {addr} = {value}, read back after {n} rewrite(s)"),
++                Err(m) => return Err(Failure::new(exit::FAILED, m.to_string())),
++            }
++        }
++        ServoCommand::Torque { target, state } => {
++            let ids: Vec<u8> = if target == "all" {
++                joints().map(|(id, _)| id).collect()
++            } else {
++                vec![target.parse().map_err(|_| {
++                    Failure::new(exit::USAGE, format!("{target:?}: a joint id or `all`"))
++                })?]
++            };
++            let on = match state.as_str() {
++                "on" => true,
++                "off" => false,
++                other => {
++                    return Err(Failure::new(
++                        exit::USAGE,
++                        format!("{other:?}: `on` or `off`"),
++                    ));
++                }
++            };
++            let mut report = |m: &feetech::Mismatch, a: u32| eprintln!("attempt {a}: {m}");
++            let failed = if on {
++                let cfg = feetech::TorqueOn {
++                    p: p.feetech.p,
++                    d: p.feetech.d,
++                    torque_limit: p.feetech.torque_limit,
++                    speed: p.feetech.speed,
++                    retries: p.feetech.write_retries,
++                };
++                feetech::torque_on(&mut bus, &ids, &cfg, &mut report)
++            } else {
++                feetech::torque_off(&mut bus, &ids, p.feetech.write_retries, &mut report)
++            }
++            .map_err(io_err)?;
++            if failed.is_empty() {
++                println!("torque {}: {ids:?}", if on { "on" } else { "off" });
++            } else {
++                let what: Vec<String> = failed.iter().map(ToString::to_string).collect();
++                return Err(Failure::new(
++                    exit::FAILED,
++                    format!("did not take: {}", what.join("; ")),
++                ));
++            }
++        }
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn widths_follow_the_register_table() {
++        assert_eq!(width(42), 2);
++        assert_eq!(width(40), 1);
++        assert_eq!(width(69), 2);
++        assert_eq!(width(5), 1);
++    }
++}
+diff --git a/robotd-params/src/edit.rs b/robotd-params/src/edit.rs
+index 17e9446..560ec0d 100644
+--- a/robotd-params/src/edit.rs
++++ b/robotd-params/src/edit.rs
+@@ -1175,6 +1175,8 @@ mod tests {
+             vec![
+                 "board",
+                 "bus",
++                // duck-brain P11: the HD-1910 bus, beside the bus it replaces.
++                "feetech",
+                 "control",
+                 "update_gate",
+                 "policy",
+diff --git a/robotd-params/src/lib.rs b/robotd-params/src/lib.rs
+index ee9608d..3b11ce3 100644
+--- a/robotd-params/src/lib.rs
++++ b/robotd-params/src/lib.rs
+@@ -70,6 +70,9 @@ pub struct Params {
+     /// Which electronic board this robot is built on. [`board`] says who reads it.
+     pub board: board::BoardParams,
+     pub bus: Bus,
++    /// The Feetech HD-1910 bus of the duck-brain robot (duck-brain P11); read when
++    /// `[bus] driver = "feetech"`.
++    pub feetech: FeetechParams,
+     pub control: Control,
+     pub update_gate: UpdateGate,
+     pub policy: PolicyParams,
+@@ -1000,6 +1003,41 @@ impl HeadImuParams {
+     }
+ }
+ 
++/// duck-brain P11: `[feetech]` is checked only on a Feetech robot, and then strictly.
++#[cfg(test)]
++mod feetech_tests {
++    use super::*;
++
++    fn load(body: &str) -> Result<Params, ParamsError> {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("robotd.toml");
++        std::fs::write(&path, body).unwrap();
++        Params::load(&path, true)
++    }
++
++    #[test]
++    fn a_feetech_robot_loads_with_signs_by_joint_name() {
++        let p = load("[bus]\ndriver = \"feetech\"\n[feetech.sign]\nleft_knee = -1\n").unwrap();
++        assert_eq!(p.bus.driver, BusDriver::Feetech);
++        let signs = p.feetech.sign.to_array();
++        assert_eq!(signs[3], -1);
++        assert_eq!(signs.iter().filter(|s| **s == 1).count(), 14);
++        assert_eq!((p.feetech.p, p.feetech.d, p.feetech.speed), (32, 40, 10000));
++    }
++
++    #[test]
++    fn bad_feetech_values_are_refused_by_name() {
++        let err = load("[bus]\ndriver = \"feetech\"\n[feetech.sign]\nmouth = 2\n").unwrap_err();
++        assert!(err.to_string().contains("feetech.sign.mouth"), "{err}");
++        let err = load("[bus]\ndriver = \"feetech\"\n[feetech]\nread_timeout_ms = 25.0\n").unwrap_err();
++        assert!(err.to_string().contains("feetech.read_timeout_ms"), "{err}");
++        let err = load("[bus]\ndriver = \"feetech\"\n[feetech]\nspeed = 0\n").unwrap_err();
++        assert!(err.to_string().contains("feetech.speed"), "{err}");
++        // A Dynamixel robot never reads the section, so it never fails over it.
++        assert!(load("[feetech]\nspeed = 0\n").is_ok());
++    }
++}
++
+ #[cfg(test)]
+ mod head_imu_tests {
+     use super::*;
+@@ -1229,6 +1267,16 @@ pub struct PolicyParams {
+     pub nominal_voltage: f64,
+ }
+ 
++/// A joint's name by index, in [`JointSigns::to_array`] order — for error messages.
++fn duck_ipc_proto_joint(i: usize) -> &'static str {
++    const NAMES: [&str; 15] = [
++        "left_hip_yaw", "left_hip_roll", "left_hip_pitch", "left_knee", "left_ankle",
++        "neck_pitch", "head_pitch", "head_yaw", "head_roll", "mouth",
++        "right_hip_yaw", "right_hip_roll", "right_hip_pitch", "right_knee", "right_ankle",
++    ];
++    NAMES.get(i).copied().unwrap_or("?")
++}
++
+ /// The literal that disables an optional policy slot, per the prototype's `--x-policy None`.
+ ///
+ /// Public because three places need to agree on it: this crate resolving config, `robotctl`
+@@ -2156,6 +2204,183 @@ pub struct Bus {
+     /// the bus drops, `update_gate` sees an unhealthy robot, and a release that turned this on
+     /// against firmware that cannot do it is rolled back on its own.
+     pub fast_sync_read: bool,
++    /// Which servos are on the bus: Pollen's Dynamixel XL330s (protocol 2.0, an `imu_to_dxl`
++    /// board at id 200) or the duck-brain robot's Feetech HD-1910s (protocol v1, servos only;
++    /// `[feetech]`). duck-brain P11.
++    pub driver: BusDriver,
++}
++
++/// See [`Bus::driver`].
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
++#[serde(rename_all = "lowercase")]
++pub enum BusDriver {
++    #[default]
++    Dynamixel,
++    Feetech,
++}
++
++/// [`BusDriver`] as the file spells it.
++pub const BUS_DRIVER_LABELS: &[&str] = &["dynamixel", "feetech"];
++
++/// `[feetech]` — the duck-brain robot's HD-1910 bus (duck-brain P11).
++///
++/// Register map, torque sequence and voltage rules are the duck-brain measurements of 13–14.10.2026
++/// (docs/patches/P11-feetech-driver.md in duck-brain). Values nobody has measured yet are marked
++/// so in the shipped `robotd-feetech.toml`: they are starting points, not facts.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields, default)]
++pub struct FeetechParams {
++    /// Line rate: 1 Mbit/s.
++    pub baud: u32,
++    /// How long a read waits for the servos' answers, ms. A servo that has not answered by then
++    /// is a miss for this tick. Must leave room for the write and the policy inside one period.
++    pub read_timeout_ms: f64,
++    /// Whether the half-duplex adapter echoes what the board sends — see `feetech::Echo`.
++    pub echo: FeetechEcho,
++    /// RAM P (50) and D (51) written at torque on. 32/40 are the servo's factory values.
++    pub p: u8,
++    pub d: u8,
++    /// Torque limit (48) and speed (46) written at torque on. Speed 0 means stop, not unlimited.
++    pub torque_limit: u16,
++    pub speed: u16,
++    /// Rewrites after a register reads back different from what was written.
++    pub write_retries: u32,
++    /// Multiply the error sent to each servo by `adapt_nominal_v / V`, V the smoothed lowest
++    /// servo voltage (62) clamped to `adapt_min_v`–`adapt_max_v`. Replaces `[policy]
++    /// voltage_adapt` on this bus, which stands down.
++    pub voltage_adapt: bool,
++    pub adapt_nominal_v: f64,
++    pub adapt_min_v: f64,
++    pub adapt_max_v: f64,
++    /// Time constant of the exponential smoothing of V, seconds.
++    pub voltage_tau_s: f64,
++    /// Torque off when the lowest servo reads below `cutoff_v` for `cutoff_ticks` ticks running.
++    /// Register 62 as read — the servos read about 0.7 V low.
++    pub cutoff_v: f64,
++    pub cutoff_ticks: u32,
++    /// Joint velocity in the observation: the position difference per tick, or register 58.
++    pub velocity: FeetechVelocity,
++    /// Register 58's unit, rad/s per count.
++    pub speed_rad_per_count: f64,
++    /// Direction per joint, +1 or −1.
++    pub sign: JointSigns,
++}
++
++/// See [`FeetechParams::echo`].
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
++#[serde(rename_all = "lowercase")]
++pub enum FeetechEcho {
++    #[default]
++    Auto,
++    Off,
++}
++
++pub const FEETECH_ECHO_LABELS: &[&str] = &["auto", "off"];
++
++/// See [`FeetechParams::velocity`].
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum FeetechVelocity {
++    #[default]
++    PositionDelta,
++    Register,
++}
++
++pub const FEETECH_VELOCITY_LABELS: &[&str] = &["position_delta", "register"];
++
++/// One direction sign per joint, by name — a table someone edits with the robot in front of them.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields, default)]
++pub struct JointSigns {
++    pub left_hip_yaw: i8,
++    pub left_hip_roll: i8,
++    pub left_hip_pitch: i8,
++    pub left_knee: i8,
++    pub left_ankle: i8,
++    pub neck_pitch: i8,
++    pub head_pitch: i8,
++    pub head_yaw: i8,
++    pub head_roll: i8,
++    pub mouth: i8,
++    pub right_hip_yaw: i8,
++    pub right_hip_roll: i8,
++    pub right_hip_pitch: i8,
++    pub right_knee: i8,
++    pub right_ankle: i8,
++}
++
++impl Default for JointSigns {
++    fn default() -> Self {
++        Self::from_array([1; 15])
++    }
++}
++
++impl JointSigns {
++    /// In `duck_ipc_proto::JOINT_NAMES` order.
++    pub fn to_array(&self) -> [i8; 15] {
++        [
++            self.left_hip_yaw,
++            self.left_hip_roll,
++            self.left_hip_pitch,
++            self.left_knee,
++            self.left_ankle,
++            self.neck_pitch,
++            self.head_pitch,
++            self.head_yaw,
++            self.head_roll,
++            self.mouth,
++            self.right_hip_yaw,
++            self.right_hip_roll,
++            self.right_hip_pitch,
++            self.right_knee,
++            self.right_ankle,
++        ]
++    }
++
++    pub fn from_array(a: [i8; 15]) -> Self {
++        Self {
++            left_hip_yaw: a[0],
++            left_hip_roll: a[1],
++            left_hip_pitch: a[2],
++            left_knee: a[3],
++            left_ankle: a[4],
++            neck_pitch: a[5],
++            head_pitch: a[6],
++            head_yaw: a[7],
++            head_roll: a[8],
++            mouth: a[9],
++            right_hip_yaw: a[10],
++            right_hip_roll: a[11],
++            right_hip_pitch: a[12],
++            right_knee: a[13],
++            right_ankle: a[14],
++        }
++    }
++}
++
++impl Default for FeetechParams {
++    fn default() -> Self {
++        Self {
++            baud: 1_000_000,
++            read_timeout_ms: 12.0,
++            echo: FeetechEcho::Auto,
++            p: 32,
++            d: 40,
++            torque_limit: 1000,
++            speed: 10000,
++            write_retries: 5,
++            voltage_adapt: true,
++            adapt_nominal_v: 7.4,
++            adapt_min_v: 6.0,
++            adapt_max_v: 9.5,
++            voltage_tau_s: 1.0,
++            cutoff_v: 4.5,
++            cutoff_ticks: 5,
++            velocity: FeetechVelocity::PositionDelta,
++            speed_rad_per_count: std::f64::consts::TAU / 4096.0,
++            sign: JointSigns::default(),
++        }
++    }
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+@@ -2226,6 +2451,7 @@ impl Default for Bus {
+         Self {
+             port: "/dev/ttyS2".into(),
+             fast_sync_read: true,
++            driver: BusDriver::Dynamixel,
+         }
+     }
+ }
+@@ -2272,6 +2498,12 @@ pub enum ParamsError {
+     },
+     #[error("{path}: control.hz must be between 1 and 1000, got {got}")]
+     Rate { path: String, got: u32 },
++    #[error("{path}: invalid {key}: {reason}")]
++    Setting {
++        path: String,
++        key: String,
++        reason: String,
++    },
+     #[error("{path}: invalid controller setting {key}: {reason}")]
+     PadSetting {
+         path: String,
+@@ -2494,6 +2726,43 @@ impl Params {
+                 ));
+             }
+         }
++        // Gated on the driver, like netpad: a Dynamixel robot never reads `[feetech]`.
++        if self.bus.driver == BusDriver::Feetech {
++            let setting = |key: &str, reason: String| ParamsError::Setting {
++                path: path.display().to_string(),
++                key: format!("feetech.{key}"),
++                reason,
++            };
++            let f = &self.feetech;
++            let period_ms = 1000.0 / f64::from(self.control.hz);
++            if !(f.read_timeout_ms > 0.0 && f.read_timeout_ms < period_ms) {
++                return Err(setting(
++                    "read_timeout_ms",
++                    format!("{} must be above 0 and below one tick ({period_ms:.1} ms)", f.read_timeout_ms),
++                ));
++            }
++            if let Some(i) = f.sign.to_array().iter().position(|s| *s != 1 && *s != -1) {
++                return Err(setting(
++                    &format!("sign.{}", duck_ipc_proto_joint(i)),
++                    "must be 1 or -1".into(),
++                ));
++            }
++            if !(f.adapt_min_v > 0.0 && f.adapt_min_v < f.adapt_max_v) {
++                return Err(setting("adapt_min_v", "must be above 0 and below adapt_max_v".into()));
++            }
++            if !(f.voltage_tau_s > 0.0 && f.voltage_tau_s.is_finite()) {
++                return Err(setting("voltage_tau_s", "must be a positive number of seconds".into()));
++            }
++            if f.cutoff_ticks == 0 {
++                return Err(setting("cutoff_ticks", "must be at least 1".into()));
++            }
++            if f.p == 0 {
++                return Err(setting("p", "0 is no position control at all".into()));
++            }
++            if f.speed == 0 {
++                return Err(setting("speed", "0 means stop, not unlimited".into()));
++            }
++        }
+         // An inverted band would pause and resume on the same probability, every tick.
+         let (pause, resume) = (self.pickup.pause_threshold, self.pickup.resume_threshold);
+         if !(0.0 < resume && resume < pause && pause < 1.0) {
+diff --git a/robotd-params/src/registry.rs b/robotd-params/src/registry.rs
+index e82f813..16dee51 100644
+--- a/robotd-params/src/registry.rs
++++ b/robotd-params/src/registry.rs
+@@ -116,6 +116,48 @@ pub const REGISTRY: &[Entry] = &[
+         Kind::Bool,
+         "Read the bus with fast sync read — needs XL330 firmware v46+",
+     ),
++    entry(
++        "bus.driver",
++        Kind::Choice(crate::BUS_DRIVER_LABELS),
++        "Servos on the bus: dynamixel (Pollen) or feetech (duck-brain HD-1910)",
++    ),
++    // ── [feetech] (duck-brain P11) ───────────────────────────────────────────
++    entry("feetech.baud", Kind::Integer, "Feetech bus line rate, bit/s"),
++    entry("feetech.read_timeout_ms", Kind::Float, "How long a tick waits for servo answers, ms"),
++    entry(
++        "feetech.echo",
++        Kind::Choice(crate::FEETECH_ECHO_LABELS),
++        "Drop our own bytes if the half-duplex adapter echoes them",
++    ),
++    entry("feetech.p", Kind::Integer, "RAM P (50) written at torque on"),
++    entry("feetech.d", Kind::Integer, "RAM D (51) written at torque on"),
++    entry("feetech.torque_limit", Kind::Integer, "Torque limit (48) written at torque on"),
++    entry("feetech.speed", Kind::Integer, "Speed (46) written at torque on; 0 is stop"),
++    entry("feetech.write_retries", Kind::Integer, "Rewrites after a read-back mismatch"),
++    entry(
++        "feetech.voltage_adapt",
++        Kind::Bool,
++        "Multiply the error sent by nominal / smoothed lowest servo voltage",
++    ),
++    entry("feetech.adapt_nominal_v", Kind::Float, "Voltage the gains belong to, V"),
++    entry("feetech.adapt_min_v", Kind::Float, "Lower clamp of V for the adaptation"),
++    entry("feetech.adapt_max_v", Kind::Float, "Upper clamp of V for the adaptation"),
++    entry("feetech.voltage_tau_s", Kind::Float, "Smoothing time constant of V, s"),
++    entry("feetech.cutoff_v", Kind::Float, "Torque off below this servo voltage…"),
++    entry("feetech.cutoff_ticks", Kind::Integer, "…for this many ticks in a row"),
++    entry(
++        "feetech.velocity",
++        Kind::Choice(crate::FEETECH_VELOCITY_LABELS),
++        "Joint velocity source: position difference per tick, or register 58",
++    ),
++    entry("feetech.speed_rad_per_count", Kind::Float, "Register 58 unit, rad/s per count"),
++    entry(
++        "feetech.sign",
++        Kind::Record(
++            "left_hip_yaw = 1\nleft_hip_roll = 1\nleft_hip_pitch = 1\nleft_knee = 1\nleft_ankle = 1\nneck_pitch = 1\nhead_pitch = 1\nhead_yaw = 1\nhead_roll = 1\nmouth = 1\nright_hip_yaw = 1\nright_hip_roll = 1\nright_hip_pitch = 1\nright_knee = 1\nright_ankle = 1",
++        ),
++        "Direction of each joint, 1 or -1 — measured on the assembled robot",
++    ),
+     // ── [control] ────────────────────────────────────────────────────────────
+     entry("control.hz", Kind::Integer, "Control loop rate"),
+     entry(
+diff --git a/robotd/Cargo.toml b/robotd/Cargo.toml
+index c3e64b3..1d27ac6 100644
+--- a/robotd/Cargo.toml
++++ b/robotd/Cargo.toml
+@@ -8,6 +8,8 @@ description = "Robot control daemon — skeleton"
+ [dependencies]
+ duck-ipc-proto = { path = "../duck-ipc-proto" }
+ duck-control = { path = "../duck-control" }
++# duck-brain P11: the HD-1910 bus's framing and torque-on, for `[feetech]`.
++feetech = { path = "../feetech" }
+ robotd-params = { path = "../robotd-params" }
+ kinematics = { path = "../kinematics" }
+ odometry = { path = "../odometry" }
+diff --git a/robotd/src/feetech_bus.rs b/robotd/src/feetech_bus.rs
+new file mode 100644
+index 0000000..e9726fd
+--- /dev/null
++++ b/robotd/src/feetech_bus.rs
+@@ -0,0 +1,184 @@
++//! The Feetech HD-1910 bus in `robotd` (duck-brain patch P11): `[bus] driver = "feetech"`.
++//!
++//! The driver is `duck_control::feetech`; this is what the daemon does around it — turn
++//! `[feetech]` into its config, wait for every servo before the loop starts, and say what the bus
++//! is doing in `robot.health`.
++
++use std::sync::Arc;
++use std::sync::atomic::Ordering;
++use std::time::Duration;
++
++use duck_control::feetech::{FeetechConfig, FeetechIo, FeetechShared, VelocitySource};
++use duck_control::host_imu::ImuFeed;
++use duck_control::{JOINT_IDS, JOINT_NAMES, NUM_JOINTS};
++use duck_ipc_proto as proto;
++use robotd_params::{FeetechEcho, FeetechVelocity, Params};
++
++use crate::{RobotState, STARTUP_READ_LOG_EVERY, STARTUP_RETRY_INTERVAL};
++
++/// `[feetech]` as the driver takes it.
++pub fn config(params: &Params) -> FeetechConfig {
++    let f = &params.feetech;
++    let period = params.period().as_secs_f64();
++    FeetechConfig {
++        baud: f.baud,
++        read_timeout: Duration::from_secs_f64(f.read_timeout_ms / 1000.0),
++        echo: match f.echo {
++            FeetechEcho::Auto => feetech::Echo::Auto,
++            FeetechEcho::Off => feetech::Echo::Off,
++        },
++        sign: f.sign.to_array().map(f64::from),
++        torque: feetech::TorqueOn {
++            p: f.p,
++            d: f.d,
++            torque_limit: f.torque_limit,
++            speed: f.speed,
++            retries: f.write_retries,
++        },
++        gain_ref: params.policy.gain,
++        voltage_adapt: f.voltage_adapt,
++        nominal_v: f.adapt_nominal_v,
++        adapt_band: (f.adapt_min_v, f.adapt_max_v),
++        // An exponential filter with time constant τ, sampled once a tick.
++        voltage_alpha: 1.0 - (-period / f.voltage_tau_s).exp(),
++        cutoff_v: f.cutoff_v,
++        cutoff_ticks: f.cutoff_ticks,
++        velocity: match f.velocity {
++            FeetechVelocity::PositionDelta => VelocitySource::PositionDelta,
++            FeetechVelocity::Register => VelocitySource::Register,
++        },
++        speed_rad_per_count: f.speed_rad_per_count,
++        // About once a second.
++        temperature_every: params.control.hz.max(1),
++    }
++}
++
++/// Open the bus and wait until every servo has answered once — a joint that has never answered
++/// has no position to hold. The same waiting rules as the Dynamixel bus: one line now, one every
++/// thirty attempts, the missing ids in `robot.health`.
++///
++/// `None` only if shutdown is asked for while waiting.
++pub async fn open_waiting(
++    params: &Params,
++    state: &RobotState,
++    imu: Arc<ImuFeed>,
++) -> Option<FeetechIo> {
++    let cfg = config(params);
++    let shared = Arc::new(FeetechShared::default());
++    let port = params.bus.port.as_str();
++    let mut io: Option<FeetechIo> = None;
++    let mut attempt = 0u32;
++    if params.policy.voltage_adapt && cfg.voltage_adapt {
++        tracing::info!(
++            "[feetech] voltage_adapt multiplies the servo error; [policy] voltage_adapt stands down"
++        );
++    }
++    while !state.shutdown.load(Ordering::Relaxed) {
++        let loud = attempt == 0 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY);
++        if io.is_none() {
++            match FeetechIo::open(port, cfg.clone(), Arc::clone(&shared), Arc::clone(&imu)) {
++                Ok(opened) => io = Some(opened),
++                Err(e) => {
++                    if loud {
++                        tracing::error!(error = %e, port, attempt, "cannot open the Feetech bus; waiting");
++                    }
++                }
++            }
++        }
++        let mut missing = Vec::new();
++        if let Some(bus) = io.as_mut() {
++            match bus.census() {
++                Ok(silent) if silent.is_empty() => {
++                    state.startup_bus_failures.store(0, Ordering::Relaxed);
++                    state.startup_missing.store(Arc::new(Vec::new()));
++                    let _ = state.feetech.set(Arc::clone(&shared));
++                    tracing::info!(
++                        port,
++                        servos = NUM_JOINTS,
++                        "Feetech bus up: every servo answers"
++                    );
++                    return io;
++                }
++                Ok(silent) => {
++                    if loud {
++                        if silent.len() == NUM_JOINTS {
++                            tracing::error!(
++                                attempt,
++                                "no servo answers on the Feetech bus; waiting, is servo power on?"
++                            );
++                        } else {
++                            tracing::error!(
++                                ?silent,
++                                attempt,
++                                "servos not answering on the Feetech bus; waiting"
++                            );
++                        }
++                    }
++                    missing = silent;
++                }
++                Err(e) => {
++                    if loud {
++                        tracing::error!(error = %e, attempt, "Feetech bus read failed; reopening");
++                    }
++                    io = None;
++                }
++            }
++        }
++        attempt += 1;
++        state.startup_missing.store(Arc::new(missing));
++        state.startup_bus_failures.store(attempt, Ordering::Relaxed);
++        tokio::time::sleep(STARTUP_RETRY_INTERVAL).await;
++    }
++    None
++}
++
++/// `robot.health`'s `feetech` block.
++pub fn health(shared: &FeetechShared) -> proto::FeetechHealth {
++    let s = shared.snapshot();
++    proto::FeetechHealth {
++        ticks: s.ticks,
++        period_ms_p50: s.period_ms.0,
++        period_ms_p99: s.period_ms.1,
++        obs_age_ms_p50: s.obs_age_ms.0,
++        obs_age_ms_p99: s.obs_age_ms.1,
++        imu_age_ms_p50: s.imu_age_ms.0,
++        imu_age_ms_p99: s.imu_age_ms.1,
++        imu_age_ms_last: s.imu_age_last_ms,
++        imu_stale_ticks: s.imu_stale.total,
++        imu_stale_run: s.imu_stale.run,
++        volts_min: s.v_min,
++        volts_median: s.v_median,
++        volts_smoothed: s.v_smoothed,
++        adapt: s.adapt,
++        cutoff: s.cutoff,
++        torque: s.torque,
++        rewrites: s.rewrites,
++        write_failures: s.write_failures,
++        echoes: s.echoes,
++        bad_packets: s.bad_packets,
++        stray: s.stray,
++        servos: (0..NUM_JOINTS)
++            .map(|j| proto::ServoHealth {
++                id: JOINT_IDS[j],
++                joint: JOINT_NAMES[j].to_owned(),
++                misses: s.misses[j],
++                consecutive_misses: s.consecutive_misses[j],
++                volts: s.volts[j],
++                temp_c: s.temps_c[j],
++                error: s.errors[j],
++            })
++            .collect(),
++    }
++}
++
++/// `robotd init` on a Feetech robot: refused, with the way that works. The standalone ramp goes to
++/// Pollen's compiled home pose, which is not this robot's; `robotctl robot init` with the daemon
++/// running ramps to the walking policy's own HOME (P6), over two seconds, through the verified
++/// torque-on.
++pub fn refuse_init() -> std::process::ExitCode {
++    tracing::error!(
++        "robotd init does not drive the Feetech bus: start robotd and run `robotctl robot init` \
++         (torque on, then a 2 s ramp to the walking policy's HOME)"
++    );
++    std::process::ExitCode::FAILURE
++}
+diff --git a/robotd/src/main.rs b/robotd/src/main.rs
+index 885849d..9d87e5f 100644
+--- a/robotd/src/main.rs
++++ b/robotd/src/main.rs
+@@ -20,6 +20,8 @@
+ 
+ mod chorale;
+ mod control;
++/// duck-brain P11: the Feetech HD-1910 bus.
++mod feetech_bus;
+ mod head_imu;
+ mod idle_head;
+ mod intents;
+@@ -291,6 +293,12 @@ struct Args {
+     #[arg(long)]
+     vetbook: Option<PathBuf>,
+ 
++    /// With `[bus] driver = "feetech"`: feed the loop a constant upright IMU sample instead of the
++    /// host IMU (duck-brain P11). For running the loop against a servo emulator on a bench with no
++    /// IMU at all — fall detection sees a robot that never tilts, so never on a robot that stands.
++    #[arg(long)]
++    static_imu: bool,
++
+     #[command(subcommand)]
+     command: Option<Command>,
+ }
+@@ -617,6 +625,10 @@ struct RobotState {
+     head_imu: head_imu::HeadImuStatus,
+     /// Which board this robot is (`[board] version`). Decides the body IMU's mount.
+     board: robotd_params::board::Board,
++    /// The Feetech driver's numbers, once its bus is up (duck-brain P11).
++    feetech: std::sync::OnceLock<Arc<duck_control::feetech::FeetechShared>>,
++    /// The host-read body IMU's hand-off, on a Feetech robot (duck-brain P11/P12).
++    host_imu: std::sync::OnceLock<Arc<duck_control::host_imu::ImuFeed>>,
+     /// Why the policy is not loaded, if it is not. Set once at startup; the loop keeps
+     /// running and holds the pose, so a broken bundle is a rollback rather than a crash.
+     policy_error: ArcSwapOption<String>,
+@@ -761,6 +773,8 @@ impl RobotState {
+             head_imu_tx: tokio::sync::broadcast::Sender::new(head_imu::FRAME_BUFFER),
+             head_imu: head_imu::HeadImuStatus::new(),
+             board: params.board.version,
++            feetech: std::sync::OnceLock::new(),
++            host_imu: std::sync::OnceLock::new(),
+             policy_error: ArcSwapOption::empty(),
+             policy_change_error: ArcSwapOption::empty(),
+             policies: ArcSwap::from_pointee(PolicyNames::of(&params.policy.resolved())),
+@@ -826,6 +840,7 @@ impl RobotState {
+                     consecutive_stale_blocks: self.imu_stale_run.load(Ordering::Relaxed),
+                     missing: self.startup_imu_missing.load(Ordering::Relaxed),
+                 }),
++                feetech: self.feetech.get().map(|shared| feetech_bus::health(shared)),
+             };
+ 
+         let unhealthy = |reason: String| describe(false, false, Some(reason));
+@@ -912,6 +927,15 @@ impl RobotState {
+             return degraded(format!("the last policy change did not take — {reason}"));
+         }
+ 
++        // The pack, not the release (duck-brain P11): degraded, like a missing servo.
++        if self.feetech.get().is_some_and(|f| f.snapshot().cutoff) {
++            return degraded(
++                "servo supply fell below [feetech] cutoff_v; torque is off — charge, then \
++                 robotctl robot relax and init"
++                    .into(),
++            );
++        }
++
+         let errors = self.consecutive_errors.load(Ordering::Relaxed);
+         if errors >= self.max_consecutive_errors {
+             return unhealthy(format!("{errors} consecutive bus read failures"));
+@@ -1052,6 +1076,9 @@ async fn main() -> ExitCode {
+             }
+         };
+         duck_ipc_proto::log_startup_identity!("robotd");
++        if params.bus.driver == robotd_params::BusDriver::Feetech {
++            return feetech_bus::refuse_init();
++        }
+         return run_init(&params, duration);
+     }
+ 
+@@ -1222,6 +1249,7 @@ fn spawn_control_thread(
+     let period = params.period();
+     let fake = args.fake;
+     let sim = args.sim.clone();
++    let static_imu = args.static_imu;
+     let bus = params.bus.clone();
+     let params = params.clone();
+     // So a reload can re-read `[policy]` without a restart. The path rather than the loaded
+@@ -1277,6 +1305,27 @@ fn spawn_control_thread(
+                 return;
+             }
+ 
++            // duck-brain P11: the HD-1910 bus. Same waiting shape as below, its own census.
++            if params.bus.driver == robotd_params::BusDriver::Feetech {
++                let imu = Arc::clone(state.host_imu.get_or_init(|| {
++                    Arc::new(if static_imu {
++                        tracing::warn!("--static-imu: the IMU is a constant upright sample — bench only");
++                        duck_control::host_imu::ImuFeed::static_upright()
++                    } else {
++                        duck_control::host_imu::ImuFeed::new()
++                    })
++                }));
++                runtime.block_on(async move {
++                    let waiting_voice = WaitingVoice::start(&params, Arc::clone(&intents));
++                    let io = feetech_bus::open_waiting(&params, &state, imu).await;
++                    drop(waiting_voice);
++                    if let Some(io) = io {
++                        control_loop(io, state, intents, params, params_path, period, poweroff).await;
++                    }
++                });
++                return;
++            }
++
+             // Waiting, not one shot. `open_bus` verifies motor registers, which means it
+             // talks to the servos — so on an unpowered board it fails and this used to fall
+             // straight off the end of the thread. No control loop was ever created, and
+@@ -3568,7 +3617,8 @@ async fn control_loop<T: RobotIo>(
+         // action by (nominal / measured) holds the robot's response steady as the pack
+         // sags. The EMA is clamped to a plausible band so a bad reading cannot become a
+         // wild scale.
+-        let scale_mult = if policy_cfg.voltage_adapt && battery_v > 0.0 {
++        // A bus that compensates by itself (duck-brain P11) replaces this one rather than adding.
++        let scale_mult = if policy_cfg.voltage_adapt && !safety.adapts_voltage() && battery_v > 0.0 {
+             policy_cfg.nominal_voltage / battery_v.clamp(6.0, 9.5)
+         } else {
+             1.0
+-- 
+2.43.0
+

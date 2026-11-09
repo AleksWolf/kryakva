@@ -1,0 +1,13 @@
+{
+    "configuration": "default",
+    "documentId": "1d24afb7e30158ea0f2613bd",
+    "documentMicroversion": "baf25b48cb7b1ba0210c0ef9",
+    "elementId": "b9a3ab34f119242caddba168",
+    "fullConfiguration": "default",
+    "id": "MEPSPiuIJqBljN3bI",
+    "isStandardContent": false,
+    "name": "bearing_22x16x4 <7>",
+    "partId": "JFD",
+    "suppressed": false,
+    "type": "Part"
+}

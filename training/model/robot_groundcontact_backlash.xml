@@ -1,0 +1,352 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mujoco model="microduck">
+  <compiler angle="radian" meshdir="assets" autolimits="true" />
+  <default>
+    <default class="microduck">
+      <joint frictionloss="0.1" armature="0.005" />
+      <position kp="50" dampratio="1" />
+      <default class="visual">
+        <geom type="mesh" contype="0" conaffinity="0" group="2" />
+      </default>
+      <default class="collision">
+        <geom group="3" />
+      </default>
+    </default>
+  </default>
+  <default>
+    <default class="perfect_actuator">
+      <geom contype="0" conaffinity="0" />
+      <joint damping="0.15" frictionloss="0.1" armature="0.001" />
+      <position kp="10.0" kv="0.1" forcerange="-20.0 20.0" />
+    </default>
+    <default class="chosen_actuator_old">
+      <geom contype="0" conaffinity="0" />
+      <joint damping="0.048" frictionloss="0.006" armature="0.002" />
+      <position kp="0.52" kv="0.0" forcerange="-0.91 0.91" ctrlrange="-10.0 10.0" />
+    </default>
+    <default class="chosen_actuator_new">
+      <geom contype="0" conaffinity="0" />
+      <joint damping="0.041" frictionloss="0.032" armature="0.002" />
+      <position kp="0.386" kv="0.0" forcerange="-0.67 0.67" ctrlrange="-10.0 10.0" />
+    </default>
+    <default class="chosen_actuator_antoine">
+      <geom contype="0" conaffinity="0" />
+      <joint damping="0.044" frictionloss="0.013" armature="0.0017" />
+      <position kp="0.43" kv="0.0" forcerange="-0.75 0.75" ctrlrange="-10.0 10.0" />
+    </default>
+    <default class="chosen_actuator">
+      <geom contype="0" conaffinity="0" />
+      <joint damping="0.053" frictionloss="0.0048" armature="0.0018" />
+      <position kp="0.55" kv="0.0" forcerange="-0.96 0.96" ctrlrange="-10.0 10.0" />
+    </default>
+    <default class="passive_wheel">
+      <geom contype="0" conaffinity="0" />
+      <joint damping="0.0" frictionloss="0.0" armature="0.0001" />
+    </default>
+    <default class="passive_joint">
+      <geom contype="0" conaffinity="0" />
+      <joint damping="0.0" frictionloss="0.0" armature="0.0001" />
+    </default>
+  </default>
+  <sensor>
+    <framequat name="orientation" objtype="site" noise="0.001" objname="imu" />
+    <gyro name="angular-velocity" site="imu" noise="0.005" />
+    <gyro name="imu_ang_vel" site="imu" />
+    <velocimeter name="imu_lin_vel" site="imu" />
+    <accelerometer name="imu_accel" site="imu" />
+    <subtreeangmom name="root_angmom" body="trunk_base" />
+  </sensor>
+  <default>
+    <default class="self_collision_only">
+      <geom group="3" contype="2" conaffinity="2" />
+    </default>
+    <equality solref="0.002 1" solimp="0.99 0.999 0.0005 0.5 2" />
+  </default>
+  <!-- Backlash injected by add_backlash.py: 0.5 deg total play (symmetric +/-0.25 deg) — HD-1910 datasheet <= 0.5 deg, bench 17.10 servo 24: 0.53 deg -->
+  <default>
+    <default class="backlash">
+      <!-- stiff limit constraint: with a range this small the default
+           solref (0.02,1) lets the joint overshoot its limits ~2x under
+           load. 0.01 = 2*sim_dt (mjlab velocity tasks run dt=0.005),
+           the stiffest stable setting; solimp raises the impedance so
+           the gear-teeth contact is nearly rigid. -->
+      <joint damping="0.01" frictionloss="0" armature="0.001" limited="true" range="-0.0043633231299858239 0.0043633231299858239" solreflimit="0.01 1" solimplimit="0.95 0.999 0.0001 0.5 2"/>
+    </default>
+  </default>
+  <worldbody>
+    <body name="trunk_base" pos="0 0 0.12" quat="1 0 0 0" childclass="microduck">
+      <freejoint name="trunk_base_freejoint" />
+      <inertial pos="-0.02233 -2.84931e-06 0.00342858" mass="0.204138" fullinertia="0.000133783 0.000153211 0.000115557 -6.289e-09 -2.70775e-05 2.2393e-08" />
+      <geom type="mesh" class="visual" pos="-0.0165 -0.535111 0.025" quat="0.707107 0 0 0.707107" mesh="power_board_simplified" material="power_board_simplified_material" />
+      <geom type="mesh" class="visual" pos="-0.01235 0 0.0008" quat="0.707107 0 0 0.707107" mesh="right_shell" material="right_shell_material" />
+      <geom type="mesh" class="visual" pos="-0.01235 -0 0.0008" quat="0.707107 0 0 0.707107" mesh="trunk_base" material="trunk_base_material" />
+      <geom type="mesh" class="visual" pos="-0.01235 0 0.0008" quat="0.707107 0 0 0.707107" mesh="left_shell" material="left_shell_material" />
+      <geom type="mesh" class="visual" pos="-0.03525 0.285681 -0.00487431" quat="0 -0.707107 0.707107 0" mesh="np_f550" material="np_f550_material" />
+      <geom type="mesh" class="collision" pos="-0.03525 0.285681 -0.00487431" quat="0 -0.707107 0.707107 0" mesh="np_f550" />
+      <geom type="mesh" class="visual" pos="-0.01235 -0 0.0008" quat="0.707107 0 0 0.707107" mesh="power_support" material="power_support_material" />
+      <geom type="mesh" class="self_collision_only" pos="-0.01235 -0 0.0008" quat="0.707107 0 0 0.707107" mesh="power_support" material="power_support_material" />
+      <geom type="mesh" class="visual" pos="-0.021 0.20065 -0.01415" quat="0.5 -0.5 0.5 -0.5" mesh="imu_lsm6dsv16x_module_simplified" material="imu_lsm6dsv16x_module_simplified_material" />
+      <geom type="mesh" class="visual" pos="0.006 0.0075 0.0035" quat="0 0.707107 0.707107 0" mesh="hd1910_servo_simplified" material="hd1910_servo_simplified_material" />
+      <geom type="mesh" class="visual" pos="0.006 -0.0275 0.0035" quat="0 0.707107 0.707107 0" mesh="hd1910_servo_simplified" material="hd1910_servo_simplified_material" />
+      <site group="3" name="imu" pos="-0.0194 -5.29439e-05 -0.0183086" quat="1 0 0 0" />
+      <body name="yaw2roll" pos="0.006 0.0175 -0.003" quat="0 -0.707107 -0.707107 -0">
+        <joint axis="0 0 1" name="left_hip_yaw" type="hinge" range="-0.24434609527920614 0.5235987755982988" class="chosen_actuator" />
+        <joint axis="0 0 1" name="passive_left_hip_yaw_backlash" type="hinge" class="backlash"/>
+        <inertial pos="1.22241e-06 0.000430029 0.0172797" mass="0.0324036" fullinertia="6.41275e-06 5.79627e-06 2.91211e-06 -4e-10 -4.53e-10 -1.14854e-07" />
+        <geom type="mesh" class="visual" pos="0.02045 -0.0377 0.07845" quat="0 1 0 0" mesh="yaw2roll" material="yaw2roll_material" />
+        <geom type="mesh" class="visual" pos="-0.01 0.008 0.01445" quat="0.707107 -0.707107 0 -0" mesh="hd1910_servo_simplified" material="hd1910_servo_simplified_material" />
+        <geom type="mesh" class="visual" pos="0 -0.442111 0.00195" quat="0 0.707107 0.707107 0" mesh="bearing_22x16x4_simplified" material="bearing_22x16x4_simplified_material" />
+        <geom type="mesh" class="visual" pos="0.02045 -0.0377 0.07845" quat="0 1 0 0" mesh="bearing_roll" material="bearing_roll_material" />
+        <body name="hip_l" pos="-0 0.0145 0.01445" quat="0.707107 -0.707107 0 -0">
+          <joint axis="0 0 1" name="left_hip_roll" type="hinge" range="-0.3839724354387525 0.3839724354387525" class="chosen_actuator" />
+          <joint axis="0 0 1" name="passive_left_hip_roll_backlash" type="hinge" class="backlash"/>
+          <inertial pos="0.011941 5.685e-09 -0.006002" mass="0.0139895" fullinertia="1.91195e-06 3.10147e-06 2.18168e-06 0 1.08314e-06 -0" />
+          <geom type="mesh" class="visual" pos="0.025 0 -0.458661" quat="0.707107 -0 -0.707107 -0" mesh="bearing_22x16x4_simplified" material="bearing_22x16x4_simplified_material" />
+          <geom type="mesh" class="visual" pos="0.02045 -0.064 -0.0522" quat="0.707107 -0.707107 0 0" mesh="hip" material="hip_material" />
+          <geom type="mesh" class="collision" pos="0.02045 -0.064 -0.0522" quat="0.707107 -0.707107 0 0" mesh="hip" />
+          <geom type="mesh" class="visual" pos="0 -0.442111 -0.00155" quat="0.707107 -0 -0 0.707107" mesh="bearing_22x16x4_simplified" material="bearing_22x16x4_simplified_material" />
+          <body name="upper_leg_left" pos="0.02395 0 -0.01655" quat="0.5 -0.5 0.5 -0.5">
+            <joint axis="0 0 1" name="left_hip_pitch" type="hinge" range="-1.5707963267948966 1.5707963267948966" class="chosen_actuator" />
+            <joint axis="0 0 1" name="passive_left_hip_pitch_backlash" type="hinge" class="backlash"/>
+            <inertial pos="0.00671804 0.0220628 0.0146177" mass="0.0555621" fullinertia="1.84086e-05 1.05352e-05 2.17018e-05 -5.2018e-06 7.526e-09 -1.4757e-08" />
+            <geom type="mesh" class="visual" pos="0.064 0.03565 -0.0035" quat="0.707107 -0 -0.707107 -0" mesh="rigidity_plate" material="rigidity_plate_material" />
+            <geom type="mesh" class="visual" pos="0.022 0.02565 0.0065" quat="0 0.707107 0.707107 0" mesh="hd1910_servo_simplified" material="hd1910_servo_simplified_material" />
+            <geom type="mesh" class="visual" pos="-0.01 0 0.0065" quat="0 1 0 0" mesh="hd1910_servo_simplified" material="hd1910_servo_simplified_material" />
+            <geom type="mesh" class="visual" pos="0.064 0.03565 -0.0035" quat="0.707107 -0 -0.707107 -0" mesh="upper_leg_left" material="upper_leg_left_material" />
+            <body name="leg" pos="0.022 0.03565 0" quat="0 -0.707107 -0.707107 -0">
+              <joint axis="0 0 1" name="left_knee" type="hinge" range="-1.9024088846738192 1.3788101090755203" class="chosen_actuator" />
+              <joint axis="0 0 1" name="passive_left_knee_backlash" type="hinge" class="backlash"/>
+              <inertial pos="-1.20466e-06 0.0279198 -0.00584171" mass="0.0325929" fullinertia="1.06968e-05 3.20896e-06 9.5711e-06 -1.8e-11 -5.26e-10 1.89321e-06" />
+              <geom type="mesh" class="visual" pos="0.01 0.042 -0.01654" quat="0 0 1 -0" mesh="hd1910_servo_simplified" material="hd1910_servo_simplified_material" />
+              <geom type="mesh" class="visual" pos="0.0096 0.042 -0.0078" quat="0 -0.707107 0 0.707107" mesh="ankle_axle" material="ankle_axle_material" />
+              <geom type="mesh" class="visual" pos="0 0.042 0.00346" quat="0.5 0.5 0.5 -0.5" mesh="leg" material="leg_material" />
+              <geom type="mesh" class="collision" pos="0 0.042 0.00346" quat="0.5 0.5 0.5 -0.5" mesh="leg" material="leg_material" />
+              <geom type="mesh" class="visual" pos="0.442111 0 -0.00104" quat="0 -0 -0 1" mesh="bearing_22x16x4_simplified" material="bearing_22x16x4_simplified_material" />
+              <body name="ankle_left" pos="-0 0.042 -0.02304" quat="0 0 1 -0">
+                <joint axis="0 0 1" name="left_ankle" type="hinge" range="-1.2740903539558606 1.1519173063162575" class="chosen_actuator" />
+                <joint axis="0 0 1" name="passive_left_ankle_backlash" type="hinge" class="backlash"/>
+                <inertial pos="0.00680937 0.0139166 -0.0156936" mass="0.0341562" fullinertia="7.06832e-06 1.35902e-05 9.61702e-06 -2.29102e-07 -8.9337e-08 2.3912e-08" />
+                <geom type="mesh" class="visual" pos="-0.470611 -0 -0.030165" quat="0 1 0 0" mesh="bearing_15x10x3_simplified" material="bearing_15x10x3_simplified_material" />
+                <geom type="mesh" class="visual" pos="0 0.0096 -0.0147" quat="0.5 0.5 -0.5 0.5" mesh="sole_left" material="sole_left_material" />
+                <geom type="mesh" name="left_foot_collision" class="collision" pos="0 0.0096 -0.0147" quat="0.5 0.5 -0.5 0.5" mesh="sole_left" material="sole_left_material" />
+                <geom type="mesh" class="visual" pos="0 0.0096 -0.0147" quat="0.5 0.5 -0.5 0.5" mesh="foot_left" material="foot_left_material" />
+                <geom type="mesh" class="visual" pos="0 0.0096 -0.0147" quat="0.5 0.5 -0.5 0.5" mesh="ankle_left" material="ankle_left_material" />
+                <site group="3" name="left_foot" pos="0 0.02384 -0.0147" quat="0.707107 0.707107 -0 0" />
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+      <body name="neck" pos="0.0269 0.0145 0.0346" quat="0.707107 0.707107 0 0">
+        <joint axis="0 0 1" name="neck_pitch" type="hinge" range="-2.705260340591211 0.9075712110370514" class="chosen_actuator" />
+        <joint axis="0 0 1" name="passive_neck_pitch_backlash" type="hinge" class="backlash"/>
+        <inertial pos="0 0.025 0.0139667" mass="0.0490068" fullinertia="2.2255e-05 4.00186e-06 2.13458e-05 8.23e-10 0 0" />
+        <geom type="mesh" class="visual" pos="0.03925 -0.0338 -0.0106" quat="0.5 -0.5 -0.5 -0.5" mesh="neck" material="neck_material" />
+        <geom type="mesh" class="visual" pos="0.03925 0.0838 0.0396" quat="0.5 0.5 0.5 -0.5" mesh="neck" material="neck_material" />
+        <geom type="mesh" class="visual" pos="-0.01 0 0.0065" quat="0 1 0 0" mesh="hd1910_servo_simplified" material="hd1910_servo_simplified_material" />
+        <geom type="mesh" class="visual" pos="0.01 0.05 0.0065" quat="0 0 1 0" mesh="hd1910_servo_simplified" material="hd1910_servo_simplified_material" />
+        <body name="neck_pitch" pos="-0 0.05 0" quat="0 -0 -1 -0">
+          <joint axis="0 0 1" name="head_pitch" type="hinge" range="-1.4835298641951802 1.5184364492350666" class="chosen_actuator" />
+          <joint axis="0 0 1" name="passive_head_pitch_backlash" type="hinge" class="backlash"/>
+          <inertial pos="8.6e-11 0.0131775 -0.0144819" mass="0.00927113" fullinertia="1.55305e-06 1.38997e-06 8.22133e-07 -0 0 2.212e-09" />
+          <geom type="mesh" class="visual" pos="0.442111 0.01679 -0.0145" quat="0 -0 0.707107 0.707107" mesh="bearing_22x16x4_simplified" material="bearing_22x16x4_simplified_material" />
+          <geom type="mesh" class="visual" pos="0 0.02854 -0.0145" quat="0.5 -0.5 -0.5 -0.5" mesh="neck_pitch" material="neck_pitch_material" />
+          <body name="yaw_roll_motion" pos="-0 0.01874 -0.0145" quat="0.707107 -0.707107 -0 -0">
+            <joint axis="0 0 1" name="head_yaw" type="hinge" range="-1.5707963267948966 1.5707963267948966" class="chosen_actuator" />
+            <joint axis="0 0 1" name="passive_head_yaw_backlash" type="hinge" class="backlash"/>
+            <inertial pos="0.000330571 0.00533892 0.0148234" mass="0.0380578" fullinertia="5.52994e-06 5.89448e-06 7.35425e-06 1.23249e-07 -7.82e-10 -6.9266e-08" />
+            <geom type="mesh" class="visual" pos="0 -0 0.0098" quat="0.707107 0 0 -0.707107" mesh="bearing_neck" material="bearing_neck_material" />
+            <geom type="mesh" class="visual" pos="-0.01 0 0.0065" quat="0 1 0 0" mesh="hd1910_servo_simplified" material="hd1910_servo_simplified_material" />
+            <geom type="mesh" class="visual" pos="-0.01795 -0 0.456611" quat="0.707107 0 0.707107 0" mesh="bearing_22x16x4_simplified" material="bearing_22x16x4_simplified_material" />
+            <geom type="mesh" class="visual" pos="0.02005 -0.442111 0.0145" quat="0.5 -0.5 -0.5 0.5" mesh="bearing_22x16x4_simplified" material="bearing_22x16x4_simplified_material" />
+            <geom type="mesh" class="visual" pos="0 -0 0.00985" quat="0.707107 0 0 -0.707107" mesh="yaw_roll_motion" material="yaw_roll_motion_material" />
+            <body name="jaw_soft" pos="0.01795 -0 0.0145" quat="0.5 -0.5 0.5 -0.5">
+              <joint axis="0 0 1" name="head_roll" type="hinge" range="-0.2617993877991494 0.2617993877991494" class="chosen_actuator" />
+              <joint axis="0 0 1" name="passive_head_roll_backlash" type="hinge" class="backlash"/>
+              <inertial pos="0.00121605 -0.00576525 -0.0341175" mass="0.236255" fullinertia="0.000311586 0.000389567 0.000176317 1.0823e-06 4.8376e-06 -1.43461e-05" />
+              <geom type="mesh" class="visual" pos="-0.417711 -0.0153 -0.07198" quat="1 0 -0 0" mesh="mic_ics43434_round_simplified" material="mic_ics43434_round_simplified_material" />
+              <geom type="mesh" class="visual" pos="0 0.0045 -0.01798" quat="0.707107 0.707107 0 0" mesh="bottom_head_shell" material="bottom_head_shell_material" />
+              <geom type="mesh" class="collision" pos="0 0.0045 -0.01798" quat="0.707107 0.707107 0 0" mesh="bottom_head_shell" />
+              <geom type="mesh" class="visual" pos="-0.361086 -0.0124 0.01222" quat="0.707107 0.707107 -0 0" mesh="speaker_2535_simplified" material="speaker_2535_simplified_material" />
+              <geom type="mesh" class="visual" pos="-0 0.0045 -0.01798" quat="0.707107 0.707107 0 -0" mesh="motor_support" material="motor_support_material" />
+              <geom type="mesh" class="visual" pos="-0 0.0047 -0.01778" quat="0.707107 0.707107 0 0" mesh="face_part" material="face_part_material" />
+              <geom type="mesh" class="visual" pos="0.347721 -0.01685 -0.03433" quat="0 -0 0.707107 -0.707107" mesh="max98357a_module_simplified" material="max98357a_module_simplified_material" />
+              <geom type="mesh" class="visual" pos="0.0335 -0.01315 -0.01813" quat="0.5 0.5 0.5 0.5" mesh="hd1910_servo_simplified" material="hd1910_servo_simplified_material" />
+              <geom type="mesh" class="visual" pos="-0 0.0045 -0.01813" quat="0.707107 0.707107 0 0" mesh="jaw" material="jaw_material" />
+              <geom type="mesh" class="collision" pos="-0 0.0045 -0.01813" quat="0.707107 0.707107 0 0" mesh="jaw" />
+              <geom type="mesh" class="visual" pos="-0.0395 -0.00315 0.452631" quat="0.707107 -0 0.707107 -0" mesh="bearing_15x10x3_simplified" material="bearing_15x10x3_simplified_material" />
+              <geom type="mesh" class="visual" pos="-0 0.0045 -0.01813" quat="0.707107 0.707107 0 0" mesh="jaw_soft" material="jaw_soft_material" />
+              <geom type="mesh" class="visual" pos="-0 -0.01 0.0065" quat="0 0.707107 0.707107 0" mesh="hd1910_servo_simplified" material="hd1910_servo_simplified_material" />
+              <geom type="mesh" class="visual" pos="-6.85648e-07 0.105699 -0.06598" quat="0 0.707107 -0.707107 0" mesh="camera_8m_219_simplified" material="camera_8m_219_simplified_material" />
+              <geom type="mesh" class="visual" pos="-0.249594 -0.0109806 -0.0484151" quat="0 -1 -0 -0" mesh="uc01_simple" material="uc01_simple_material" />
+              <geom type="mesh" class="visual" pos="0.06252 -0.00028 -0.05918" quat="0 0 -0 1" mesh="radxa_zero_3w_simplified" material="radxa_zero_3w_simplified_material" />
+              <geom type="mesh" class="visual" pos="0 0.0047 -0.01778" quat="0.707107 0.707107 -0 -0" mesh="noenoeil" material="noenoeil_material" />
+              <geom type="mesh" class="visual" pos="-0 0.0045 -0.0182742" quat="0.707107 0.707107 0 0" mesh="soft_mouth_top" material="soft_mouth_top_material" />
+              <geom type="mesh" class="visual" pos="-0.000184926 0.0045 -0.0179692" quat="0.707107 0.707107 -0 0" mesh="top_head_shell" material="top_head_shell_material" />
+              <geom type="mesh" class="collision" pos="-0.000184926 0.0045 -0.0179692" quat="0.707107 0.707107 -0 0" mesh="top_head_shell" />
+              <geom type="mesh" class="visual" pos="0.0205 0.149 -0.06898" quat="0 0.707107 -0.707107 0" mesh="tof_vl53l8cx_board_simplified" material="tof_vl53l8cx_board_simplified_material" />
+              <site group="3" name="head_camera" pos="-6.85648e-07 -0.0153013 -0.08166" quat="0.5 0.5 0.5 -0.5" />
+              <camera name="head_camera" pos="-6.85648e-07 -0.0153013 -0.08166" quat="0 0 -1 0" />
+              <site group="3" name="tof" pos="0.0225 -0.0153 -0.07373" quat="0.5 0.5 0.5 -0.5" />
+              <site group="3" name="mouth_tip" pos="-0 0.0083 -0.07783" quat="0.5 0.5 0.5 -0.5" />
+              <site group="3" name="head_imu" pos="-0.000437711 -0.0144761 -0.07328" quat="0 1 0 -0" />
+            </body>
+          </body>
+        </body>
+      </body>
+      <body name="bearing_roll" pos="0.006 -0.0175 -0.003" quat="0 -0.707107 -0.707107 0">
+        <joint axis="0 0 1" name="right_hip_yaw" type="hinge" range="-0.5235987755982988 0.24434609527920614" class="chosen_actuator" />
+        <joint axis="0 0 1" name="passive_right_hip_yaw_backlash" type="hinge" class="backlash"/>
+        <inertial pos="1.22241e-06 0.000430029 0.0172797" mass="0.0324036" fullinertia="6.41275e-06 5.79627e-06 2.91211e-06 -4e-10 -4.53e-10 -1.14854e-07" />
+        <geom type="mesh" class="visual" pos="-0.01 0.008 0.01445" quat="0.707107 -0.707107 -0 -0" mesh="hd1910_servo_simplified" material="hd1910_servo_simplified_material" />
+        <geom type="mesh" class="visual" pos="0 -0.442111 0.00195" quat="0 0.707107 0.707107 0" mesh="bearing_22x16x4_simplified" material="bearing_22x16x4_simplified_material" />
+        <geom type="mesh" class="visual" pos="0.02045 -0.0377 0.07845" quat="0 1 0 0" mesh="yaw2roll" material="yaw2roll_material" />
+        <geom type="mesh" class="visual" pos="0.02045 -0.0377 0.07845" quat="0 1 0 0" mesh="bearing_roll" material="bearing_roll_material" />
+        <body name="hip_l_2" pos="-0 0.0145 0.01445" quat="0 -0 -0.707107 -0.707107">
+          <joint axis="0 0 1" name="right_hip_roll" type="hinge" range="-0.38397243543875337 0.3839724354387516" class="chosen_actuator" />
+          <joint axis="0 0 1" name="passive_right_hip_roll_backlash" type="hinge" class="backlash"/>
+          <inertial pos="0.011941 5.685e-09 -0.006002" mass="0.0139895" fullinertia="1.91195e-06 3.10147e-06 2.18168e-06 0 1.08314e-06 -0" />
+          <geom type="mesh" class="visual" pos="0.025 0 -0.458661" quat="0.707107 0 -0.707107 0" mesh="bearing_22x16x4_simplified" material="bearing_22x16x4_simplified_material" />
+          <geom type="mesh" class="visual" pos="0.02045 -0.064 -0.0522" quat="0.707107 -0.707107 -0 0" mesh="hip" material="hip_material" />
+          <geom type="mesh" class="collision" pos="0.02045 -0.064 -0.0522" quat="0.707107 -0.707107 -0 0" mesh="hip" />
+          <geom type="mesh" class="visual" pos="0 0.442111 -0.00155" quat="0.707107 0 0 -0.707107" mesh="bearing_22x16x4_simplified" material="bearing_22x16x4_simplified_material" />
+          <body name="upper_leg_right" pos="0.02395 0 -0.01655" quat="0.5 -0.5 0.5 -0.5">
+            <joint axis="0 0 1" name="right_hip_pitch" type="hinge" range="-1.5707963267948974 1.5707963267948957" class="chosen_actuator" />
+            <joint axis="0 0 1" name="passive_right_hip_pitch_backlash" type="hinge" class="backlash"/>
+            <inertial pos="-0.00671662 0.0220613 0.0146177" mass="0.0555622" fullinertia="1.84065e-05 1.05362e-05 2.17007e-05 5.20233e-06 -6.678e-09 -1.5607e-08" />
+            <geom type="mesh" class="visual" pos="-0.022 0.04565 0.0065" quat="0 -0.707107 0.707107 0" mesh="hd1910_servo_simplified" material="hd1910_servo_simplified_material" />
+            <geom type="mesh" class="visual" pos="-0.064 0.03565 0.0075" quat="0.707107 0 0.707107 -0" mesh="rigidity_plate" material="rigidity_plate_material" />
+            <geom type="mesh" class="visual" pos="-0.064 0.03565 -0.0771" quat="0.707107 0 0.707107 0" mesh="upper_leg_right" material="upper_leg_right_material" />
+            <geom type="mesh" class="visual" pos="-0.01 -0 0.0065" quat="0 1 0 0" mesh="hd1910_servo_simplified" material="hd1910_servo_simplified_material" />
+            <body name="leg_2" pos="-0.022 0.03565 0" quat="0 -0.707107 0.707107 0">
+              <joint axis="0 0 1" name="right_knee" type="hinge" range="-1.3788101090755203 1.9024088846738423" class="chosen_actuator" />
+              <joint axis="0 0 1" name="passive_right_knee_backlash" type="hinge" class="backlash"/>
+              <inertial pos="-1.20466e-06 0.0279051 -0.00584171" mass="0.0325929" fullinertia="1.06902e-05 3.20896e-06 9.56449e-06 -1.8e-11 -5.26e-10 1.89165e-06" />
+              <geom type="mesh" class="visual" pos="-0.442111 -0 -0.00104" quat="1 0 0 -0" mesh="bearing_22x16x4_simplified" material="bearing_22x16x4_simplified_material" />
+              <geom type="mesh" class="visual" pos="0.01 0.04198 -0.01654" quat="0 0 -1 -0" mesh="hd1910_servo_simplified" material="hd1910_servo_simplified_material" />
+              <geom type="mesh" class="visual" pos="0.0096 0.042 -0.0078" quat="0 0.707107 0 -0.707107" mesh="ankle_axle" material="ankle_axle_material" />
+              <geom type="mesh" class="visual" pos="0 0.042 0.00346" quat="0.5 0.5 0.5 -0.5" mesh="leg" material="leg_material" />
+              <geom type="mesh" class="collision" pos="0 0.042 0.00346" quat="0.5 0.5 0.5 -0.5" mesh="leg" material="leg_material" />
+              <body name="ankle_right" pos="0 0.04198 -0.02304" quat="0 0 1 -0">
+                <joint axis="0 0 1" name="right_ankle" type="hinge" range="-1.1519173063162575 1.2740903539558606" class="chosen_actuator" />
+                <joint axis="0 0 1" name="passive_right_ankle_backlash" type="hinge" class="backlash"/>
+                <inertial pos="-0.00680992 0.0139164 -0.0156937" mass="0.0341564" fullinertia="7.06833e-06 1.35904e-05 9.61718e-06 2.29003e-07 8.9434e-08 2.3932e-08" />
+                <geom type="mesh" class="visual" pos="0.470611 0 -0.033165" quat="0 -0 0 -1" mesh="bearing_15x10x3_simplified" material="bearing_15x10x3_simplified_material" />
+                <geom type="mesh" class="visual" pos="-0 0.0096 -0.0867" quat="0.5 0.5 0.5 -0.5" mesh="ankle_right" material="ankle_right_material" />
+                <geom type="mesh" class="visual" pos="-0 0.0096 -0.0867" quat="0.5 0.5 0.5 -0.5" mesh="foot_right" material="foot_right_material" />
+                <geom type="mesh" class="visual" pos="0 0.0096 -0.0867" quat="0.5 0.5 0.5 -0.5" mesh="sole_right" material="sole_right_material" />
+                <geom type="mesh" name="right_foot_collision" class="collision" pos="0 0.0096 -0.0867" quat="0.5 0.5 0.5 -0.5" mesh="sole_right" material="sole_right_material" />
+                <site group="3" name="right_foot" pos="0 0.02386 -0.0147" quat="0 0 0.707107 -0.707107" />
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  <asset>
+    <mesh file="foot_right.stl" />
+    <mesh file="bearing_22x16x4_simplified.stl" />
+    <mesh file="leg.stl" />
+    <mesh file="bearing_15x10x3_simplified.stl" />
+    <mesh file="ankle_axle.stl" />
+    <mesh file="radxa_zero_3w_simplified.stl" />
+    <mesh file="soft_mouth_top.stl" />
+    <mesh file="speaker_2535_simplified.stl" />
+    <mesh file="bearing_neck.stl" />
+    <mesh file="yaw2roll.stl" />
+    <mesh file="rigidity_plate.stl" />
+    <mesh file="right_shell.stl" />
+    <mesh file="power_board_simplified.stl" />
+    <mesh file="neck_pitch.stl" />
+    <mesh file="top_head_shell.stl" />
+    <mesh file="ankle_right.stl" />
+    <mesh file="jaw_soft.stl" />
+    <mesh file="bottom_head_shell.stl" />
+    <mesh file="jaw.stl" />
+    <mesh file="face_part.stl" />
+    <mesh file="uc01_simple.stl" />
+    <mesh file="left_shell.stl" />
+    <mesh file="imu_lsm6dsv16x_module_simplified.stl" />
+    <mesh file="upper_leg_right.stl" />
+    <mesh file="hd1910_servo_simplified.stl" />
+    <mesh file="motor_support.stl" />
+    <mesh file="max98357a_module_simplified.stl" />
+    <mesh file="np_f550.stl" />
+    <mesh file="ankle_left.stl" />
+    <mesh file="bearing_roll.stl" />
+    <mesh file="trunk_base.stl" />
+    <mesh file="neck.stl" />
+    <mesh file="camera_8m_219_simplified.stl" />
+    <mesh file="noenoeil.stl" />
+    <mesh file="hip.stl" />
+    <mesh file="upper_leg_left.stl" />
+    <mesh file="sole_right.stl" />
+    <mesh file="foot_left.stl" />
+    <mesh file="mic_ics43434_round_simplified.stl" />
+    <mesh file="tof_vl53l8cx_board_simplified.stl" />
+    <mesh file="sole_left.stl" />
+    <mesh file="power_support.stl" />
+    <mesh file="yaw_roll_motion.stl" />
+    <material name="power_board_simplified_material" rgba="0.498039 0.498039 0.498039 1" />
+    <material name="right_shell_material" rgba="0.615686 0.811765 0.929412 1" />
+    <material name="trunk_base_material" rgba="0.647059 0.647059 0.647059 1" />
+    <material name="left_shell_material" rgba="0.615686 0.811765 0.929412 1" />
+    <material name="np_f550_material" rgba="0.498039 0.498039 0.498039 1" />
+    <material name="power_support_material" rgba="0.917647 0.917647 0.917647 1" />
+    <material name="imu_lsm6dsv16x_module_simplified_material" rgba="0.768627 0.886275 0.952941 1" />
+    <material name="hd1910_servo_simplified_material" rgba="0.615686 0.811765 0.929412 1" />
+    <material name="yaw2roll_material" rgba="0.972549 0.529412 0.00392157 1" />
+    <material name="bearing_22x16x4_simplified_material" rgba="0.917647 0.917647 0.917647 1" />
+    <material name="bearing_roll_material" rgba="0.768627 0.886275 0.952941 1" />
+    <material name="hip_material" rgba="0.917647 0.917647 0.917647 1" />
+    <material name="rigidity_plate_material" rgba="0.647059 0.647059 0.647059 1" />
+    <material name="upper_leg_left_material" rgba="0.231373 0.380392 0.705882 1" />
+    <material name="ankle_axle_material" rgba="0.917647 0.917647 0.917647 1" />
+    <material name="leg_material" rgba="0.615686 0.811765 0.929412 1" />
+    <material name="bearing_15x10x3_simplified_material" rgba="0.768627 0.886275 0.952941 1" />
+    <material name="sole_left_material" rgba="0.231373 0.380392 0.705882 1" />
+    <material name="foot_left_material" rgba="0.647059 0.647059 0.647059 1" />
+    <material name="ankle_left_material" rgba="0.615686 0.811765 0.929412 1" />
+    <material name="neck_material" rgba="0.231373 0.380392 0.705882 1" />
+    <material name="neck_pitch_material" rgba="0.231373 0.380392 0.705882 1" />
+    <material name="bearing_neck_material" rgba="0.647059 0.647059 0.647059 1" />
+    <material name="yaw_roll_motion_material" rgba="0.917647 0.917647 0.917647 1" />
+    <material name="mic_ics43434_round_simplified_material" rgba="0.647059 0.647059 0.647059 1" />
+    <material name="bottom_head_shell_material" rgba="0.768627 0.886275 0.952941 1" />
+    <material name="speaker_2535_simplified_material" rgba="0.615686 0.811765 0.929412 1" />
+    <material name="motor_support_material" rgba="0.972549 0.529412 0.00392157 1" />
+    <material name="face_part_material" rgba="0.231373 0.380392 0.705882 1" />
+    <material name="max98357a_module_simplified_material" rgba="0.980392 0.713725 0.00392157 1" />
+    <material name="jaw_material" rgba="0.498039 0.498039 0.498039 1" />
+    <material name="jaw_soft_material" rgba="0.615686 0.811765 0.929412 1" />
+    <material name="camera_8m_219_simplified_material" rgba="0.231373 0.380392 0.705882 1" />
+    <material name="uc01_simple_material" rgba="0.972549 0.529412 0.00392157 1" />
+    <material name="radxa_zero_3w_simplified_material" rgba="0.647059 0.647059 0.647059 1" />
+    <material name="noenoeil_material" rgba="0.647059 0.647059 0.647059 1" />
+    <material name="soft_mouth_top_material" rgba="0.980392 0.713725 0.00392157 1" />
+    <material name="top_head_shell_material" rgba="0.615686 0.811765 0.929412 1" />
+    <material name="tof_vl53l8cx_board_simplified_material" rgba="0.917647 0.917647 0.917647 1" />
+    <material name="upper_leg_right_material" rgba="0.231373 0.380392 0.705882 1" />
+    <material name="ankle_right_material" rgba="0.615686 0.811765 0.929412 1" />
+    <material name="foot_right_material" rgba="0.647059 0.647059 0.647059 1" />
+    <material name="sole_right_material" rgba="0.231373 0.380392 0.705882 1" />
+  </asset>
+  <actuator>
+    <position class="chosen_actuator" name="left_hip_yaw" joint="left_hip_yaw" />
+    <position class="chosen_actuator" name="left_hip_roll" joint="left_hip_roll" />
+    <position class="chosen_actuator" name="left_hip_pitch" joint="left_hip_pitch" />
+    <position class="chosen_actuator" name="left_knee" joint="left_knee" />
+    <position class="chosen_actuator" name="left_ankle" joint="left_ankle" />
+    <position class="chosen_actuator" name="neck_pitch" joint="neck_pitch" />
+    <position class="chosen_actuator" name="head_pitch" joint="head_pitch" />
+    <position class="chosen_actuator" name="head_yaw" joint="head_yaw" />
+    <position class="chosen_actuator" name="head_roll" joint="head_roll" />
+    <position class="chosen_actuator" name="right_hip_yaw" joint="right_hip_yaw" />
+    <position class="chosen_actuator" name="right_hip_roll" joint="right_hip_roll" />
+    <position class="chosen_actuator" name="right_hip_pitch" joint="right_hip_pitch" />
+    <position class="chosen_actuator" name="right_knee" joint="right_knee" />
+    <position class="chosen_actuator" name="right_ankle" joint="right_ankle" />
+  </actuator>
+  <equality />
+</mujoco>

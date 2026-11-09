@@ -1,0 +1,962 @@
+From 1c40f1fb310ca1924344187718cca10aa9e8628e Mon Sep 17 00:00:00 2001
+From: duck-brain <duck-brain@localhost>
+Date: Mon, 19 Oct 2026 07:55:06 +0000
+Subject: [PATCH] duck-brain P17: a network's own servo gains, target filter
+ and limits (`<net>.runtime.json`)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The P5 walk (walk_hd1910_p5_v1) was trained with the servos at P = 5,
+D = 0, its action applied whole (scale 1.0), the target filtered every
+20 ms tick and no supply compensation. None of that is in the ONNX
+metadata, and all of it differs from the networks before it.
+
+A network may now carry a manifest beside its file,
+`<stem>.runtime.json`: servo_p, servo_d, action_scale, target_alpha,
+voltage_adapt, clip_lo/clip_hi (action order) and, optionally, the HOME
+at full precision (default_joint_pos is rounded to three decimals). It
+is read and checked at load; a wrong one fails the load, as a wrong
+network does. A network without one runs as before.
+
+While such a network drives:
+- target: raw = clip(home + action_scale * a, clip_lo, clip_hi), then
+  target = previous + target_alpha * (raw - previous) on all 14 joints
+  it drives, the head included; at the start of driving `previous` is
+  the goal the servos held (Controller::anchor_to), not the first raw
+  target; Pollen's head/leg low-pass and its action voltage scaling
+  stand aside (the latter unless voltage_adapt);
+- servos (RobotIo::set_servo_runtime, Feetech only): the 14 joints run
+  at its P/D — written at torque-on, read back, with the torque-on's
+  41 = 0 check unchanged, or at once if torque is already on; P keeps
+  following the gain in proportion; the mouth keeps [feetech]'s P/D; the
+  driver's 7.4 / V error factor is off unless voltage_adapt. While no
+  network drives, the walking network's settings hold, so bring-up's
+  torque-on is at them. A P/D that does not read back fails the
+  torque-on.
+robot.health: feetech.servos[].p / .d as read back.
+
+Checked against the trace the policy came with (500 ticks): our ONNX
+run and our action -> target give max |a - a_ref| 5.6e-17 and
+max |target - target_ref| 7.0e-8 (cargo test -p robotd -- --ignored
+duck_brain_p5).
+---
+ duck-control/src/feetech.rs | 241 ++++++++++++++++++++++++++++++++++--
+ duck-control/src/io.rs      |  19 +++
+ duck-control/src/policy.rs  | 120 ++++++++++++++++++
+ duck-control/src/safety.rs  |   8 ++
+ duck-ipc-proto/src/lib.rs   |   6 +
+ robotd/src/control.rs       | 160 +++++++++++++++++++++++-
+ robotd/src/feetech_bus.rs   |   2 +
+ robotd/src/main.rs          |  24 ++++
+ 8 files changed, 563 insertions(+), 17 deletions(-)
+
+diff --git a/duck-control/src/feetech.rs b/duck-control/src/feetech.rs
+index 3f1f0db..55f795a 100644
+--- a/duck-control/src/feetech.rs
++++ b/duck-control/src/feetech.rs
+@@ -28,7 +28,9 @@ use feetech::{Bus, Echo, Mismatch, Port, SerialPort, TorqueOn, reg};
+ 
+ use crate::host_imu::{ImuFeed, age};
+ use crate::imu::ImuData;
+-use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
++use crate::io::{
++    ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, ServoRuntime, SlowSensors,
++};
+ use crate::model::{JOINT_IDS, JOINT_NAMES, MOUTH_INDEX, NUM_JOINTS};
+ 
+ /// Where the observation's joint velocity comes from (`[feetech] velocity`).
+@@ -165,6 +167,8 @@ struct Stats {
+     torque_on_time: Option<Duration>,
+     mouth_torque_on_time: Option<Duration>,
+     torque_on_rewrites: [u32; NUM_JOINTS],
++    servo_p: [Option<u8>; NUM_JOINTS],
++    servo_d: [Option<u8>; NUM_JOINTS],
+     counters: feetech::Counters,
+     imu_stale: ImuStale,
+     imu_age_last: Option<Duration>,
+@@ -217,6 +221,9 @@ pub struct FeetechSnapshot {
+     pub mouth_torque_on_ms: Option<f64>,
+     /// Rewrites of 41 = 0 at the last torque-on, per joint (indexed as `JOINT_NAMES`).
+     pub torque_on_rewrites: [u32; NUM_JOINTS],
++    /// P (50) and D (51) each servo last read back, per joint; `None` before the first write.
++    pub servo_p: [Option<u8>; NUM_JOINTS],
++    pub servo_d: [Option<u8>; NUM_JOINTS],
+     pub echoes: u64,
+     pub bad_packets: u64,
+     pub stray: u64,
+@@ -266,6 +273,8 @@ impl FeetechShared {
+             torque_on_ms: s.torque_on_time.map(|d| d.as_secs_f64() * 1000.0),
+             mouth_torque_on_ms: s.mouth_torque_on_time.map(|d| d.as_secs_f64() * 1000.0),
+             torque_on_rewrites: s.torque_on_rewrites,
++            servo_p: s.servo_p,
++            servo_d: s.servo_d,
+             echoes: s.counters.echoes,
+             bad_packets: s.counters.bad_packets,
+             stray: s.counters.stray,
+@@ -309,6 +318,9 @@ pub struct FeetechIo<P: Port = SerialPort> {
+     low_ticks: u32,
+     cutoff: bool,
+     kp: Option<u16>,
++    /// The driving network's servo settings (duck-brain P17), `None` for `[feetech]`'s. For the
++    /// 14 joints the policy drives; the mouth always runs at `[feetech]`'s.
++    runtime: Option<ServoRuntime>,
+     read_started: Option<Instant>,
+     imu_seq: Option<u64>,
+     imu_stale: ImuStale,
+@@ -354,6 +366,7 @@ impl<P: Port> FeetechIo<P> {
+             low_ticks: 0,
+             cutoff: false,
+             kp: None,
++            runtime: None,
+             read_started: None,
+             imu_seq: None,
+             imu_stale: ImuStale::default(),
+@@ -404,11 +417,34 @@ impl<P: Port> FeetechIo<P> {
+             .collect()
+     }
+ 
+-    fn mapped_p(&self, kp: u16) -> u8 {
+-        let p = f64::from(self.cfg.torque.p) * f64::from(kp) / f64::from(self.cfg.gain_ref.max(1));
++    /// P for servo `id` at gain `kp`: its base P — the driving network's for the joints it drives
++    /// (P17), else `[feetech] p` — in proportion to `kp` over the policy gain.
++    /// What the servos read back for P (50) and, when written, D (51), for `robot.health`.
++    fn record_pd(&self, ids: &[u8], p: &[u16], d: Option<&[u16]>) {
++        let mut s = self.shared.0.lock().unwrap();
++        for (k, &id) in ids.iter().enumerate() {
++            if let Some(j) = JOINT_IDS.iter().position(|&x| x == id) {
++                s.servo_p[j] = Some(p[k] as u8);
++                if let Some(d) = d {
++                    s.servo_d[j] = Some(d[k] as u8);
++                }
++            }
++        }
++    }
++
++    fn mapped_p(&self, id: u8, kp: u16) -> u8 {
++        let p = f64::from(self.pd(id).0) * f64::from(kp) / f64::from(self.cfg.gain_ref.max(1));
+         p.round().clamp(1.0, 254.0) as u8
+     }
+ 
++    /// Base P and D of servo `id`.
++    fn pd(&self, id: u8) -> (u8, u8) {
++        match self.runtime {
++            Some(rt) if id != JOINT_IDS[MOUTH_INDEX] => (rt.p, rt.d),
++            _ => (self.cfg.torque.p, self.cfg.torque.d),
++        }
++    }
++
+     fn log_mismatch(m: &Mismatch, attempt: u32) {
+         let joint = JOINT_IDS
+             .iter()
+@@ -653,7 +689,9 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+     fn write(&mut self, targets: &JointTargets) -> Result<()> {
+         // The servo's P loop pushes with a torque that follows its supply; multiplying the error
+         // by nominal / V holds that push where it was at the nominal voltage.
+-        let k = match (self.cfg.voltage_adapt, self.v_smoothed) {
++        // Not under a network trained without it (P17).
++        let adapt = self.cfg.voltage_adapt && self.runtime.is_none_or(|rt| rt.voltage_adapt);
++        let k = match (adapt, self.v_smoothed) {
+             (true, Some(v)) => {
+                 self.cfg.nominal_v / v.clamp(self.cfg.adapt_band.0, self.cfg.adapt_band.1)
+             }
+@@ -689,16 +727,19 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+     }
+ 
+     fn set_gain(&mut self, kp: u16) -> Result<()> {
+-        let p = self.mapped_p(kp);
+         // Only the servos that answer: a silent one would cost every verification attempt a
+         // full timeout, and the tick with it. It gets its gain with the next torque-on.
+         let ids = self.present_ids();
++        let values: Vec<u16> = ids
++            .iter()
++            .map(|&id| u16::from(self.mapped_p(id, kp)))
++            .collect();
+         let mut rewrites = 0u64;
+         let failed = feetech::write_verified(
+             &mut self.bus,
+             &ids,
+             reg::P,
+-            &vec![u16::from(p); ids.len()],
++            &values,
+             self.cfg.torque.retries,
+             &mut |m, a| {
+                 rewrites += 1;
+@@ -712,10 +753,11 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+         self.count_writes(&failed, rewrites);
+         if failed.is_empty() {
+             self.kp = Some(kp);
++            self.record_pd(&ids, &values, None);
+             Ok(())
+         } else {
+             Err(IoError::Bus(format!(
+-                "P gain {p} did not take: {}",
++                "P gain did not take: {}",
+                 join(&failed)
+             )))
+         }
+@@ -725,13 +767,22 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+         if !on {
+             return self.torque_off_all();
+         }
++        // The 14 joints the policy drives first, then the mouth on its own: the policy has no
++        // action for the mouth, and the time that matters to walking is the 14's. The joints at
++        // the driving network's P/D when it has its own (P17), the mouth at `[feetech]`'s.
++        let mouth = JOINT_IDS[MOUTH_INDEX];
++        let kp = self.kp.unwrap_or(self.cfg.gain_ref);
++        let joint_id = JOINT_IDS[0];
+         let cfg = TorqueOn {
+-            p: self.mapped_p(self.kp.unwrap_or(self.cfg.gain_ref)),
++            p: self.mapped_p(joint_id, kp),
++            d: self.pd(joint_id).1,
++            ..self.cfg.torque
++        };
++        let mouth_cfg = TorqueOn {
++            p: self.mapped_p(mouth, kp),
++            d: self.pd(mouth).1,
+             ..self.cfg.torque
+         };
+-        // The 14 joints the policy drives first, then the mouth on its own: the policy has no
+-        // action for the mouth, and the time that matters to walking is the 14's.
+-        let mouth = JOINT_IDS[MOUTH_INDEX];
+         let joints: Vec<u8> = JOINT_IDS
+             .iter()
+             .copied()
+@@ -752,7 +803,7 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+         let mut mouth_took = None;
+         if failed.is_empty() {
+             let started = Instant::now();
+-            let second = feetech::torque_on(&mut self.bus, &[mouth], &cfg, &mut note)
++            let second = feetech::torque_on(&mut self.bus, &[mouth], &mouth_cfg, &mut note)
+                 .map_err(|e| IoError::Bus(format!("torque on: {e}")))?;
+             let took = started.elapsed();
+             log_torque_on("mouth", 1, took, &second);
+@@ -765,6 +816,15 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+             reports.push(second);
+         }
+         self.count_writes(&failed, rewrites);
++        if failed.is_empty() {
++            let ids: Vec<u8> = JOINT_IDS.to_vec();
++            let p: Vec<u16> = ids
++                .iter()
++                .map(|&id| u16::from(self.mapped_p(id, kp)))
++                .collect();
++            let d: Vec<u16> = ids.iter().map(|&id| u16::from(self.pd(id).1)).collect();
++            self.record_pd(&ids, &p, Some(&d));
++        }
+         let mut per_joint = [0u32; NUM_JOINTS];
+         let mut stuck = Vec::new();
+         for report in &reports {
+@@ -841,6 +901,69 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+         self.cfg.voltage_adapt
+     }
+ 
++    /// The driving network's servo settings (P17). With torque on, P and D of the 14 joints are
++    /// written at once, each read back; otherwise they wait for the torque-on. A write that does
++    /// not take is an error, and the settings are kept so the next change or torque-on retries.
++    fn set_servo_runtime(&mut self, runtime: Option<ServoRuntime>) -> Result<()> {
++        if runtime == self.runtime {
++            return Ok(());
++        }
++        self.runtime = runtime;
++        tracing::info!(
++            p = self.pd(JOINT_IDS[0]).0,
++            d = self.pd(JOINT_IDS[0]).1,
++            voltage_adapt = self.cfg.voltage_adapt && runtime.is_none_or(|rt| rt.voltage_adapt),
++            from = if runtime.is_some() {
++                "the network's runtime manifest"
++            } else {
++                "[feetech]"
++            },
++            "servo settings of the 14 joints"
++        );
++        if self.shared.0.lock().unwrap().torque != Some(true) {
++            return Ok(());
++        }
++        let mouth = JOINT_IDS[MOUTH_INDEX];
++        let ids: Vec<u8> = self
++            .present_ids()
++            .into_iter()
++            .filter(|&id| id != mouth)
++            .collect();
++        let kp = self.kp.unwrap_or(self.cfg.gain_ref);
++        let p: Vec<u16> = ids
++            .iter()
++            .map(|&id| u16::from(self.mapped_p(id, kp)))
++            .collect();
++        let d: Vec<u16> = ids.iter().map(|&id| u16::from(self.pd(id).1)).collect();
++        let mut rewrites = 0u64;
++        let mut failed = Vec::new();
++        for (register, values) in [(reg::P, &p), (reg::D, &d)] {
++            failed.extend(
++                feetech::write_verified(
++                    &mut self.bus,
++                    &ids,
++                    register,
++                    values,
++                    self.cfg.torque.retries,
++                    &mut |m, a| {
++                        rewrites += 1;
++                        Self::log_mismatch(m, a);
++                    },
++                )
++                .map_err(|e| IoError::Bus(format!("P/D: {e}")))?
++                .into_iter()
++                .filter_map(std::result::Result::err),
++            );
++        }
++        self.count_writes(&failed, rewrites);
++        if failed.is_empty() {
++            self.record_pd(&ids, &p, Some(&d));
++            Ok(())
++        } else {
++            Err(IoError::Bus(format!("P/D did not take: {}", join(&failed))))
++        }
++    }
++
+     fn journal(&self) -> Option<serde_json::Value> {
+         serde_json::to_value(&self.journal).ok()
+     }
+@@ -1310,4 +1433,98 @@ mod tests {
+         assert_eq!(mouth.get(48, 2), 0);
+         assert!(mouth.accel_writes.is_empty());
+     }
++
++    const P5: ServoRuntime = ServoRuntime {
++        p: 5,
++        d: 0,
++        voltage_adapt: false,
++    };
++
++    /// P17: a network's own P/D go to the 14 joints at torque-on, read back; the mouth keeps
++    /// `[feetech]`'s; robot.health carries what each servo holds.
++    #[test]
++    fn a_network_runtime_sets_p_and_d_of_the_fourteen_at_torque_on() {
++        let mut io = io(Emulator::new(&JOINT_IDS), quick());
++        io.set_servo_runtime(Some(P5)).unwrap();
++        io.set_torque(true).unwrap();
++        let mouth = JOINT_IDS[MOUTH_INDEX];
++        let emu = io.bus_mut().port_mut();
++        for id in JOINT_IDS {
++            let s = emu.servo(id).unwrap();
++            let want = if id == mouth { (32, 40) } else { (5, 0) };
++            assert_eq!((s.get(50, 1), s.get(51, 1)), want, "id {id}");
++            assert!(!s.accel_writes.contains(&1), "id {id}: 41 = 1 never");
++        }
++        let snap = io.shared().snapshot();
++        for (j, &id) in JOINT_IDS.iter().enumerate() {
++            let want = if id == mouth {
++                (Some(32), Some(40))
++            } else {
++                (Some(5), Some(0))
++            };
++            assert_eq!((snap.servo_p[j], snap.servo_d[j]), want, "id {id}");
++        }
++    }
++
++    /// With torque already on, a change of network writes P/D at once; back to none, `[feetech]`'s.
++    #[test]
++    fn a_runtime_change_under_torque_writes_p_and_d_at_once() {
++        let mut io = io(Emulator::new(&JOINT_IDS), quick());
++        io.set_torque(true).unwrap();
++        assert_eq!(io.bus_mut().port_mut().servo(12).unwrap().get(50, 1), 32);
++        io.set_servo_runtime(Some(P5)).unwrap();
++        let s = io.bus_mut().port_mut().servo(12).unwrap();
++        assert_eq!((s.get(50, 1), s.get(51, 1)), (5, 0));
++        assert_eq!(
++            io.bus_mut().port_mut().servo(34).unwrap().get(50, 1),
++            32,
++            "the mouth"
++        );
++        // The gain scales the network's P, as it scaled the configured one.
++        io.set_gain(100).unwrap();
++        assert_eq!(
++            io.bus_mut().port_mut().servo(12).unwrap().get(50, 1),
++            3,
++            "5 × 100/200, rounded"
++        );
++        io.set_gain(200).unwrap();
++        io.set_servo_runtime(None).unwrap();
++        let s = io.bus_mut().port_mut().servo(12).unwrap();
++        assert_eq!((s.get(50, 1), s.get(51, 1)), (32, 40));
++    }
++
++    /// A P/D that does not read back fails the torque-on, so the policy does not start on it.
++    #[test]
++    fn a_runtime_p_that_does_not_take_fails_the_torque_on() {
++        let mut emu = Emulator::new(&JOINT_IDS);
++        emu.servo_mut(22).unwrap().refuse = Some(50);
++        emu.servo_mut(22).unwrap().set(50, 1, 32);
++        let mut io = io(emu, quick());
++        io.set_servo_runtime(Some(P5)).unwrap();
++        assert!(io.set_torque(true).is_err());
++        assert_eq!(io.shared().snapshot().torque, Some(false));
++    }
++
++    /// No supply compensation under a network trained without it.
++    #[test]
++    fn a_runtime_without_voltage_adapt_sends_the_target_as_it_is() {
++        let mut emu = Emulator::new(&JOINT_IDS);
++        for id in JOINT_IDS {
++            emu.servo_mut(id).unwrap().set(62, 1, 50);
++        }
++        let mut io = io(emu, quick());
++        io.set_servo_runtime(Some(P5)).unwrap();
++        let s = io.read().unwrap();
++        let mut t = s.positions;
++        t[0] += 0.1;
++        io.write(&JointTargets::new(t)).unwrap();
++        assert_eq!(io.shared().snapshot().adapt, 1.0);
++        let goal = io
++            .bus_mut()
++            .port_mut()
++            .servo(JOINT_IDS[0])
++            .unwrap()
++            .get(42, 2);
++        assert_eq!(goal, rad_to_counts(s.positions[0] + 0.1, 1.0));
++    }
+ }
+diff --git a/duck-control/src/io.rs b/duck-control/src/io.rs
+index 4c109f1..c12fa16 100644
+--- a/duck-control/src/io.rs
++++ b/duck-control/src/io.rs
+@@ -211,6 +211,14 @@ pub trait RobotIo {
+         false
+     }
+ 
++    /// The servo settings the driving network was trained at (duck-brain P17: its runtime
++    /// manifest), or `None` for the configured ones. Kept until changed; a backend writes them at
++    /// the next torque-on, or at once when torque is already on. Nothing to do by default.
++    fn set_servo_runtime(&mut self, runtime: Option<ServoRuntime>) -> Result<()> {
++        let _ = runtime;
++        Ok(())
++    }
++
+     /// What this backend saw and sent on the last tick, for the tick journal (duck-brain P13).
+     /// `None` from a backend with nothing to add to what the loop already knows.
+     fn journal(&self) -> Option<serde_json::Value> {
+@@ -218,6 +226,17 @@ pub trait RobotIo {
+     }
+ }
+ 
++/// See [`RobotIo::set_servo_runtime`]: what a network asks of the servos of the joints it drives.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct ServoRuntime {
++    /// Position gain at the policy's own gain, register units (Feetech 50).
++    pub p: u8,
++    /// Derivative gain (Feetech 51).
++    pub d: u8,
++    /// Whether the backend's supply compensation runs under this network.
++    pub voltage_adapt: bool,
++}
++
+ /// What a servo can say about itself — see [`RobotIo::servo_identity`].
+ #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+ pub struct ServoIdentity {
+diff --git a/duck-control/src/policy.rs b/duck-control/src/policy.rs
+index 3c967a8..2ea3c89 100644
+--- a/duck-control/src/policy.rs
++++ b/duck-control/src/policy.rs
+@@ -405,6 +405,13 @@ impl Policy {
+         self.network(net).action_scale
+     }
+ 
++    /// What this network was trained at beyond its metadata — servo gains, target filter, limits —
++    /// from the manifest beside it (duck-brain P17). `None` for a network without one, which runs
++    /// the way every network did before.
++    pub fn runtime(&self, net: Net) -> Option<&Runtime> {
++        self.network(net).runtime.as_ref()
++    }
++
+     /// The clock this network observes.
+     pub fn clock(&self, net: Net) -> Clock {
+         self.network(net).clock
+@@ -565,9 +572,80 @@ struct Network {
+     /// From the metadata (P6): the HOME the actions are offsets from, and their scale.
+     home: Option<[f64; NUM_JOINTS]>,
+     action_scale: Option<f64>,
++    /// The manifest beside the file (P17).
++    runtime: Option<Runtime>,
+     last_input: Vec<f32>,
+ }
+ 
++/// A network's runtime manifest (duck-brain P17): `<file stem>.runtime.json` beside the `.onnx`,
++/// for what training assumed that the ONNX metadata does not carry. With one, the network's
++/// target is `clip(home + action_scale · a, clip_lo, clip_hi)` filtered every tick by
++/// `target += target_alpha · (raw − target)`, the servos of the joints it drives run at
++/// `servo_p` / `servo_d`, and supply compensation runs only if `voltage_adapt`.
++#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct Runtime {
++    /// Position gain, register units, at the policy's own gain (`[policy] gain`).
++    pub servo_p: u8,
++    pub servo_d: u8,
++    pub action_scale: f64,
++    pub target_alpha: f64,
++    pub voltage_adapt: bool,
++    /// Target limits, radians, in action order (the 14 joints without the mouth).
++    pub clip_lo: [f64; ACTION_LEN],
++    pub clip_hi: [f64; ACTION_LEN],
++    /// The HOME at full precision, in action order: `default_joint_pos` in the metadata is
++    /// rounded to three decimals (P5 walk: −0.087 for −0.0873), which is 4.6e-4 rad off in
++    /// both the observation and the target. Replaces the metadata's, and must round to it.
++    #[serde(default)]
++    pub home: Option<[f64; ACTION_LEN]>,
++    /// Where the numbers came from — for whoever reads the file, not used.
++    #[serde(default)]
++    pub source: Option<String>,
++}
++
++/// The manifest of the network at `path`, if there is one. A manifest that is there and wrong
++/// fails the load, as a wrong network does: running without it is running a different policy.
++fn runtime_manifest(
++    path: &Path,
++    metadata_scale: Option<f64>,
++    metadata_home: Option<&[f64; NUM_JOINTS]>,
++) -> Result<Option<Runtime>, PolicyError> {
++    let manifest = path.with_extension("runtime.json");
++    let text = match std::fs::read_to_string(&manifest) {
++        Ok(text) => text,
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
++        Err(source) => return Err(PolicyError::Read { path: manifest, source }),
++    };
++    let bad = |what, expected: &str, got: String| shape_error(&manifest, what, expected, got);
++    let rt: Runtime = serde_json::from_str(&text).map_err(|e| bad("runtime manifest", "valid JSON", e.to_string()))?;
++    if rt.servo_p == 0 || rt.servo_p > 254 || rt.servo_d > 254 {
++        return Err(bad("servo_p / servo_d", "1..=254 / 0..=254", format!("{} / {}", rt.servo_p, rt.servo_d)));
++    }
++    if !(rt.action_scale.is_finite() && rt.action_scale > 0.0 && rt.action_scale <= 2.0) {
++        return Err(bad("action_scale", "a number in (0, 2]", rt.action_scale.to_string()));
++    }
++    if let Some(trained) = metadata_scale
++        && (trained - rt.action_scale).abs() > 1e-9
++    {
++        return Err(bad("action_scale", &format!("{trained}, as in the network's metadata"), rt.action_scale.to_string()));
++    }
++    if !(rt.target_alpha.is_finite() && rt.target_alpha > 0.0 && rt.target_alpha <= 1.0) {
++        return Err(bad("target_alpha", "a number in (0, 1]", rt.target_alpha.to_string()));
++    }
++    if rt.clip_lo.iter().zip(&rt.clip_hi).any(|(lo, hi)| !(lo.is_finite() && hi.is_finite() && lo < hi)) {
++        return Err(bad("clip_lo / clip_hi", "finite, lo < hi for every joint", format!("{:?} / {:?}", rt.clip_lo, rt.clip_hi)));
++    }
++    if let Some(home) = &rt.home {
++        // Half a unit of the metadata's third decimal, and a hair for its own float error.
++        let off = |slot: usize| metadata_home.map_or(0.0, |m| (m[if slot < MOUTH_INDEX { slot } else { slot + 1 }] - home[slot]).abs());
++        if (0..ACTION_LEN).any(|slot| !home[slot].is_finite() || off(slot) > 0.0005 + 1e-9) {
++            return Err(bad("home", "finite, and default_joint_pos to three decimals", format!("{home:?}")));
++        }
++    }
++    Ok(Some(rt))
++}
++
+ struct LstmState {
+     h: Tensor<f32>,
+     c: Tensor<f32>,
+@@ -752,6 +830,17 @@ fn open(path: &Path) -> Result<Network, PolicyError> {
+             custom("default_joint_pos").as_deref(), custom("action_scale").as_deref())?;
+         (clock, home, scale)
+     };
++    let runtime = runtime_manifest(path, action_scale, home.as_ref())?;
++    let home = match runtime.as_ref().and_then(|rt| rt.home) {
++        Some(precise) => {
++            let mut pose = home.unwrap_or(DEFAULT_POSITION);
++            for (slot, value) in precise.iter().enumerate() {
++                pose[if slot < MOUTH_INDEX { slot } else { slot + 1 }] = *value;
++            }
++            Some(pose)
++        }
++        None => home,
++    };
+     let inputs = session.inputs();
+     let outputs = session.outputs();
+     let width = if clock == Clock::None { OBS_LEN } else { OBS_LEN + PHASE_LEN };
+@@ -846,6 +935,7 @@ fn open(path: &Path) -> Result<Network, PolicyError> {
+         period: None,
+         home,
+         action_scale,
++        runtime,
+         last_input: Vec::with_capacity(OBS_LEN + PHASE_LEN),
+     })
+ }
+@@ -914,6 +1004,36 @@ pub fn trained_pose(
+ mod tests {
+     use super::*;
+ 
++    /// A runtime manifest beside a (pretend) network, in a fresh directory.
++    fn manifest(name: &str, json: &str) -> PathBuf {
++        let dir = std::env::temp_dir().join(format!("duck-runtime-{}-{name}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        std::fs::write(dir.join("net.runtime.json"), json).unwrap();
++        dir.join("net.onnx")
++    }
++
++    const MANIFEST: &str = r#"{"servo_p": 5, "servo_d": 0, "action_scale": 1.0, "target_alpha": 0.7,
++        "voltage_adapt": false, "clip_lo": [-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
++        "clip_hi": [1,1,1,1,1,1,1,1,1,1,1,1,1,1]"#;
++
++    /// P17: none beside the file is none; one is read; one that disagrees with the network's
++    /// metadata, or is not what it says, fails the load.
++    #[test]
++    fn runtime_manifests_are_read_and_checked() {
++        assert_eq!(runtime_manifest(Path::new("/nonexistent/net.onnx"), None, None).unwrap(), None);
++        let rt = runtime_manifest(&manifest("ok", &format!("{MANIFEST}}}")), Some(1.0), None).unwrap().unwrap();
++        assert_eq!((rt.servo_p, rt.servo_d, rt.target_alpha, rt.voltage_adapt), (5, 0, 0.7, false));
++        assert!(runtime_manifest(&manifest("scale", &format!("{MANIFEST}}}")), Some(0.3), None).is_err());
++        let typo = MANIFEST.replace("target_alpha", "alpha");
++        assert!(runtime_manifest(&manifest("typo", &format!("{typo}}}")), None, None).is_err());
++        let near = format!("{MANIFEST}, \"home\": [0,-0.0873,0,0,0,0,0,0,0,0,0,0,0,0]}}");
++        let mut metadata = [0.0; NUM_JOINTS];
++        metadata[1] = -0.087;
++        assert!(runtime_manifest(&manifest("home", &near), None, Some(&metadata)).unwrap().is_some());
++        metadata[1] = -0.088;
++        assert!(runtime_manifest(&manifest("far", &near), None, Some(&metadata)).is_err(), "more than the rounding");
++    }
++
+     /// The threshold decides walking versus standing every tick, so it must match what the
+     /// prototype uses or the robot changes gait at a different speed than it was tuned for.
+     #[test]
+diff --git a/duck-control/src/safety.rs b/duck-control/src/safety.rs
+index 9aeeaf0..640eaeb 100644
+--- a/duck-control/src/safety.rs
++++ b/duck-control/src/safety.rs
+@@ -456,6 +456,14 @@ impl<T: RobotIo> Safety<T> {
+         self.io.adapts_voltage()
+     }
+ 
++    /// See [`RobotIo::set_servo_runtime`].
++    pub fn set_servo_runtime(
++        &mut self,
++        runtime: Option<crate::io::ServoRuntime>,
++    ) -> Result<(), IoError> {
++        self.io.set_servo_runtime(runtime)
++    }
++
+     /// See [`RobotIo::journal`].
+     pub fn journal(&self) -> Option<serde_json::Value> {
+         self.io.journal()
+diff --git a/duck-ipc-proto/src/lib.rs b/duck-ipc-proto/src/lib.rs
+index 5cee01c..6c6d201 100644
+--- a/duck-ipc-proto/src/lib.rs
++++ b/duck-ipc-proto/src/lib.rs
+@@ -3801,6 +3801,12 @@ pub struct ServoHealth {
+     /// Rewrites of 41 = 0 it needed at the last torque-on (duck-brain P16); 0 is none.
+     #[serde(default)]
+     pub accel_rewrites: u32,
++    /// P (register 50) and D (51) as last written and read back (duck-brain P17). Absent before
++    /// the first torque-on.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub p: Option<u8>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub d: Option<u8>,
+ }
+ 
+ /// The control loop's rate and timing.
+diff --git a/robotd/src/control.rs b/robotd/src/control.rs
+index 0219357..280798b 100644
+--- a/robotd/src/control.rs
++++ b/robotd/src/control.rs
+@@ -36,7 +36,7 @@
+ //! prototype let a pick preempt a kick's tail and a chaining skill roll out of a kick or the seat;
+ //! here each is refused, and a seated robot accepts only standing up.
+ 
+-use duck_control::model::{DEFAULT_POSITION, NUM_JOINTS};
++use duck_control::model::{DEFAULT_POSITION, MOUTH_INDEX, NUM_JOINTS};
+ use duck_control::obs::{ACTION_LEN, Command, Observation};
+ use duck_control::policy::{Net, Policy, PolicyError};
+ 
+@@ -133,6 +133,41 @@ pub struct Step {
+     /// A scripted move is mid-flight — the robot is moving regardless of the twist, so
+     /// restarting the daemon now would put it on the floor.
+     pub busy: bool,
++    /// The servo settings the network that drove was trained at (duck-brain P17), `None` for
++    /// one without a runtime manifest.
++    pub servo: Option<duck_control::io::ServoRuntime>,
++}
++
++/// What a runtime manifest asks of the servos (duck-brain P17).
++pub fn servo_runtime(rt: &duck_control::policy::Runtime) -> duck_control::io::ServoRuntime {
++    duck_control::io::ServoRuntime {
++        p: rt.servo_p,
++        d: rt.servo_d,
++        voltage_adapt: rt.voltage_adapt,
++    }
++}
++
++/// Action to target for a network with a runtime manifest (duck-brain P17), as its training did:
++/// `raw = clip(home + scale · a, clip_lo, clip_hi)`, then `target = previous + α · (raw − previous)`
++/// on every joint the network drives, the head included. With no previous target the raw one goes
++/// out. The mouth, which no network drives, stays at home.
++pub fn runtime_targets(
++    home: &[f64; NUM_JOINTS],
++    action: &[f32; ACTION_LEN],
++    scale: f64,
++    runtime: &duck_control::policy::Runtime,
++    previous: Option<&[f64; NUM_JOINTS]>,
++) -> [f64; NUM_JOINTS] {
++    let mut targets = *home;
++    for (slot, &a) in action.iter().enumerate() {
++        let joint = if slot < MOUTH_INDEX { slot } else { slot + 1 };
++        let raw = (home[joint] + scale * f64::from(a)).clamp(runtime.clip_lo[slot], runtime.clip_hi[slot]);
++        targets[joint] = match previous {
++            Some(previous) => previous[joint] + runtime.target_alpha * (raw - previous[joint]),
++            None => raw,
++        };
++    }
++    targets
+ }
+ 
+ /// Where the robot is in the sit↔stand cycle.
+@@ -220,6 +255,10 @@ pub struct Controller {
+     /// Previous filtered targets, kept only for the low-pass. `None` until the first tick,
+     /// so the filter starts from reality rather than dragging up from zero.
+     previous: Option<[f64; NUM_JOINTS]>,
++    /// The goal the servos held when the policy started ([`Self::anchor_to`]): where a network
++    /// with a runtime manifest starts its target filter, instead of from its first raw target
++    /// (duck-brain P17). Networks without one keep starting unfiltered, as before.
++    anchor: Option<[f64; NUM_JOINTS]>,
+     /// Ground-pick phase, 0..`skills.ground_pick_end_phase`. `None` when inactive.
+     ground_pick: Option<f64>,
+     /// **A running skill switches the fall reflex off**, because `busy()` is what gates the
+@@ -254,6 +293,7 @@ impl Controller {
+             skills,
+             last_action: [0.0; ACTION_LEN],
+             previous: None,
++            anchor: None,
+             ground_pick: None,
+             active: None,
+             sit: Sit::Up,
+@@ -264,6 +304,12 @@ impl Controller {
+         }
+     }
+ 
++    /// The walking network's servo settings, if it carries a runtime manifest (duck-brain P17):
++    /// what the servos run at while no network drives, bring-up's torque-on included.
++    pub fn walk_servo_runtime(&self) -> Option<duck_control::io::ServoRuntime> {
++        self.policy.runtime(Net::Walk).map(servo_runtime)
++    }
++
+     /// The client's raw twist this tick, for a `live` skill (duck-brain P4).
+     pub fn set_live_twist(&mut self, twist: [f64; 3]) {
+         self.live_twist = twist;
+@@ -347,6 +393,13 @@ impl Controller {
+         self.policy.reset();
+         self.last_action = [0.0; ACTION_LEN];
+         self.previous = None;
++        self.anchor = None;
++    }
++
++    /// The goal the servos are holding as the policy starts — called after [`Self::reset`]. A
++    /// network with a runtime manifest filters its first target from here (duck-brain P17).
++    pub fn anchor_to(&mut self, goal: &[f64; NUM_JOINTS]) {
++        self.anchor = Some(*goal);
+     }
+ 
+     /// The policy was stopped on purpose: end whatever move is in flight, and keep the seat.
+@@ -758,13 +811,22 @@ impl Controller {
+         };
+         let scale = scale * scale_mult;
+ 
+-        let offsets = Observation::scatter_action(&action);
++        // A network that carries its runtime (P17) is run the way it was trained, whole: its own
++        // scale, limits and filter, and supply compensation only if it says so.
++        let runtime = self.policy.runtime(net).cloned();
+         let mut targets = [0.0; NUM_JOINTS];
+-        for joint in 0..NUM_JOINTS {
+-            targets[joint] = home[joint] + scale * offsets[joint];
++        if let Some(rt) = &runtime {
++            let scale = rt.action_scale * if rt.voltage_adapt { scale_mult } else { 1.0 };
++            let previous = self.previous.or(self.anchor);
++            targets = runtime_targets(&home, &action, scale, rt, previous.as_ref());
++        } else {
++            let offsets = Observation::scatter_action(&action);
++            for joint in 0..NUM_JOINTS {
++                targets[joint] = home[joint] + scale * offsets[joint];
++            }
+         }
+ 
+-        if let Some(previous) = self.previous {
++        if runtime.is_none() && let Some(previous) = self.previous {
+             if let Some(alpha) = self.tuning.head_lowpass {
+                 for joint in HEAD_JOINTS {
+                     targets[joint] = alpha * targets[joint] + (1.0 - alpha) * previous[joint];
+@@ -803,6 +865,7 @@ impl Controller {
+             label,
+             gain,
+             busy: self.busy(),
++            servo: runtime.as_ref().map(servo_runtime),
+         })
+     }
+ }
+@@ -818,6 +881,93 @@ mod tests {
+     }
+ 
+     const RIDE: &str = "rollers_hd1910_v2_iter3498_home5.onnx";
++    const P5_WALK: &str = "walk_hd1910_p5_v1_iter5495_home5.onnx";
++
++    fn p5_runtime() -> duck_control::policy::Runtime {
++        duck_control::policy::Runtime {
++            servo_p: 5,
++            servo_d: 0,
++            action_scale: 1.0,
++            target_alpha: 0.5,
++            voltage_adapt: false,
++            clip_lo: [-0.2; ACTION_LEN],
++            clip_hi: [0.2; ACTION_LEN],
++            home: None,
++            source: None,
++        }
++    }
++
++    /// P17: clip first, then the filter, on every joint the network drives — the head too — and
++    /// the mouth left at home.
++    #[test]
++    fn runtime_targets_clip_then_filter() {
++        let home = [0.0; NUM_JOINTS];
++        let mut action = [0.1f32; ACTION_LEN];
++        action[0] = 1.0; // clipped to 0.2
++        let rt = p5_runtime();
++        let raw = runtime_targets(&home, &action, 1.0, &rt, None);
++        assert!((raw[0] - 0.2).abs() < 1e-12);
++        assert!((raw[6] - 0.1).abs() < 1e-7, "a head joint");
++        assert_eq!(raw[MOUTH_INDEX], 0.0);
++        let previous = [0.0; NUM_JOINTS];
++        let filtered = runtime_targets(&home, &action, 1.0, &rt, Some(&previous));
++        assert!((filtered[0] - 0.1).abs() < 1e-12, "0 + 0.5 · (0.2 − 0)");
++        assert!((filtered[6] - 0.05).abs() < 1e-7);
++        assert!((filtered[10] - 0.05).abs() < 1e-7, "right hip yaw, after the mouth slot");
++    }
++
++    /// The P5 walk against its reference trace from the simulator (duck-brain P17): our ONNX run
++    /// and our action → target on every tick, from the trace's first target. Prints the largest
++    /// differences; the bound is the task's 1e-5. Needs ONNX Runtime and the trace as JSON:
++    /// `P5_TRACE=<json> DUCK_BRAIN_POLICIES=<duck-brain>/policies cargo test -p robotd --
++    /// --ignored duck_brain_p5`.
++    #[test]
++    #[ignore = "needs ONNX Runtime, DUCK_BRAIN_POLICIES and P5_TRACE"]
++    fn duck_brain_p5_reference_trace() {
++        let mut policy = Policy::load(
++            &duck_control::policy::PolicyPaths {
++                walk: duck_brain(P5_WALK),
++                ..Default::default()
++            },
++            duck_control::policy::DEFAULT_STANDING_THRESHOLD,
++        )
++        .unwrap();
++        let rt = policy.runtime(Net::Walk).cloned().expect("the P5 walk carries a runtime manifest");
++        let home = policy.home(Net::Walk).unwrap();
++        let text = std::fs::read_to_string(std::env::var("P5_TRACE").expect("P5_TRACE")).unwrap();
++        let trace: serde_json::Value = serde_json::from_str(&text).unwrap();
++        let rows = |key: &str| -> Vec<Vec<f64>> {
++            trace[key]
++                .as_array()
++                .unwrap()
++                .iter()
++                .map(|r| r.as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect())
++                .collect()
++        };
++        let (obs, a_ref, t_ref) = (rows("obs"), rows("a"), rows("target"));
++        let joint = |slot: usize| if slot < MOUTH_INDEX { slot } else { slot + 1 };
++        let mut previous = home;
++        for slot in 0..ACTION_LEN {
++            previous[joint(slot)] = t_ref[0][slot];
++        }
++        let (mut max_a, mut max_t) = (0.0f64, 0.0f64);
++        for k in 0..obs.len() {
++            let row: [f32; duck_control::obs::OBS_LEN] = std::array::from_fn(|i| obs[k][i] as f32);
++            let a = policy.infer(&Observation::from(row), Net::Walk).unwrap();
++            for slot in 0..ACTION_LEN {
++                max_a = max_a.max((f64::from(a[slot]) - a_ref[k][slot]).abs());
++            }
++            if k > 0 {
++                let t = runtime_targets(&home, &a, rt.action_scale, &rt, Some(&previous));
++                for slot in 0..ACTION_LEN {
++                    max_t = max_t.max((t[joint(slot)] - t_ref[k][slot]).abs());
++                }
++                previous = t;
++            }
++        }
++        eprintln!("P5 reference trace, {} ticks: max |a − a_ref| = {max_a:.3e}, max |target − target_ref| = {max_t:.3e}", obs.len());
++        assert!(max_a <= 1e-5 && max_t <= 1e-5, "a {max_a:e}, target {max_t:e}");
++    }
+     const FISH: &str = "fish_hd1910_v4_iter3500_home5.onnx";
+     const STRIDE: &str = "stride_hd1910_v4_iter4498_home5.onnx";
+ 
+diff --git a/robotd/src/feetech_bus.rs b/robotd/src/feetech_bus.rs
+index 9bc6fa5..96dd8b3 100644
+--- a/robotd/src/feetech_bus.rs
++++ b/robotd/src/feetech_bus.rs
+@@ -172,6 +172,8 @@ pub fn health(shared: &FeetechShared) -> proto::FeetechHealth {
+                 temp_c: s.temps_c[j],
+                 error: s.errors[j],
+                 accel_rewrites: s.torque_on_rewrites[j],
++                p: s.servo_p[j],
++                d: s.servo_d[j],
+             })
+             .collect(),
+     }
+diff --git a/robotd/src/main.rs b/robotd/src/main.rs
+index db7e7b8..59a086a 100644
+--- a/robotd/src/main.rs
++++ b/robotd/src/main.rs
+@@ -2280,6 +2280,14 @@ async fn control_loop<T: RobotIo>(
+ 
+     // Loaded once here and again on a mode switch — see `build_controller`.
+     let mut controller = build_controller(&policy_cfg, params.safety.limp_fall, &state);
++    // Before any torque-on: the walking network's servo settings, if it carries them (P17).
++    if let Err(e) = safety.set_servo_runtime(
++        controller
++            .as_ref()
++            .and_then(Controller::walk_servo_runtime),
++    ) {
++        tracing::error!(error = %e, "servo P/D of the walking network did not take");
++    }
+ 
+     // The vet book's tally for this process, and what each servo says it is. Read once, here,
+     // before the loop has a deadline to keep: a servo is not going to change model mid-run.
+@@ -3672,6 +3680,8 @@ async fn control_loop<T: RobotIo>(
+                 && let Some(controller) = controller.as_mut()
+             {
+                 controller.reset();
++                // A network with a runtime manifest filters from the goal the servos hold (P17).
++                controller.anchor_to(&last_targets);
+             }
+             // A seated robot is held in its seat, not at home: start the network from there.
+             if start_from_hold && let Some(controller) = controller.as_mut() {
+@@ -3728,6 +3738,8 @@ async fn control_loop<T: RobotIo>(
+ 
+         // What the policy was fed and gave, this tick — the journal's (P13).
+         let mut journal_policy: Option<serde_json::Value> = None;
++        // The servo settings of the network that drove this tick (P17); `None` while nothing did.
++        let mut driving_servo: Option<Option<duck_control::io::ServoRuntime>> = None;
+         let (mut targets, gain, moving, policy_label) = match (driving, sensors.as_ref()) {
+             // The limp-fall sequence, before anything else — `driving` is false throughout,
+             // so without this it would fall through to the hold branch and the robot would
+@@ -3788,6 +3800,7 @@ async fn control_loop<T: RobotIo>(
+                 controller.set_live_twist(twist_target);
+                 match controller.step(sensors, &command, snapshot.pose.active, dt, scale_mult) {
+                     Ok(step) => {
++                        driving_servo = Some(step.servo);
+                         if journal.is_some() {
+                             journal_policy = controller.journal_view().map(|(input, action, file, slot)| {
+                                 serde_json::json!({
+@@ -4014,6 +4027,17 @@ async fn control_loop<T: RobotIo>(
+             watch.commanded(&targets);
+         }
+ 
++        // The servos run at what the driving network was trained at, and at the walking network's
++        // while none drives — which is what bring-up's torque-on uses (duck-brain P17).
++        let servo = driving_servo.unwrap_or_else(|| {
++            controller
++                .as_ref()
++                .and_then(Controller::walk_servo_runtime)
++        });
++        if let Err(e) = safety.set_servo_runtime(servo) {
++            tracing::error!(error = %e, "servo P/D of the driving network did not take");
++        }
++
+         last_targets = targets;
+         match safety.apply(targets, hold, gain) {
+             Ok(applied) => limits.extend(applied.limits),
+-- 
+2.43.0
+

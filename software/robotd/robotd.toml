@@ -1,0 +1,96 @@
+# robotd.toml for the duck on Feetech HD-1910 servos with the IMU on the Zero's I2C.
+# The bundle is unpacked to /home/duck/duck-bench; the paths below point there.
+# Values marked "not measured" are starting points, not measurements.
+
+[bus]
+driver = "feetech"
+port = "/dev/ttyS2"                  # UART2, pins 8/10: overlay uart2-m0, no getty, console=display
+
+[feetech]
+baud = 1000000
+read_timeout_ms = 12.0               # observation age p99 4.3 ms, 0 misses at a steady 7.2 V; raise if `misses` climb
+echo = "auto"                        # adapters that echo are handled; auto costs nothing
+p = 5                                # RAM P/D at torque on: what robotctl writes, and the
+d = 0                                # mouth; the 14 joints take the driving network's manifest
+torque_limit = 1000
+speed = 10000                        # 0 is stop, not unlimited
+write_retries = 5
+voltage_adapt = true                 # error × 7.4 / V; [policy] voltage_adapt stands down
+adapt_nominal_v = 7.4
+adapt_min_v = 6.0
+adapt_max_v = 9.5
+voltage_tau_s = 1.0                  # not measured: smoothing of V
+cutoff_v = 4.5                       # register 62 as read
+cutoff_ticks = 5
+velocity = "position_delta"          # or "register" (58)
+speed_rad_per_count = 0.0015339807878856412  # 2π/4096, not measured: register 58's unit
+battery_offset_v = 0.1               # at rest: register 62 = multimeter on the servo connector − 0.0…0.1 V; under load not measured
+
+[feetech.sign]                       # −1 on all 14 joints, the same as directions.json of the servo console:
+left_hip_yaw = -1                    # goal = 2048 + angle·4096/2π·sign
+left_hip_roll = -1
+left_hip_pitch = -1
+left_knee = -1
+left_ankle = -1
+neck_pitch = -1
+head_pitch = -1
+head_yaw = -1
+head_roll = -1
+mouth = 1                            # not a policy joint: its target is 0 rad = 2048 either way
+right_hip_yaw = -1
+right_hip_roll = -1
+right_hip_pitch = -1
+right_knee = -1
+right_ankle = -1
+
+[body_imu]
+bus = "/dev/i2c-3"                   # pins 3/5, i2c-3 (overlay i2c3-m0)
+address = 0x6a                       # AD0/SA0 wired to GND
+poll_hz = 200
+
+[body_imu.mount]                     # checked by tilting: sensor X → left, Y → up,
+w = 0.5                              # Z → forward (sensor→trunk)
+x = 0.5
+y = 0.5
+z = 0.5
+
+# The head's sensors, "as the duck sees". tofd and mediad read this file
+# only when given it: `tofd --config robotd.toml`, `mediad --config robotd.toml`.
+[tof]
+rotate = 270                         # the raw 8×8 grid turned 270° clockwise, no mirror
+
+[media]
+rotate = 90                          # the IMX219 frame turned 90° clockwise, no mirror
+
+[policy]
+# The P5 set on legs. Every network at P 5 / D 0, scale 1.0, target filter 0.7, no 7.4/V — from the
+# .runtime.json beside it; a set with a network that lacks one is refused at load.
+enabled = true
+mode = "walk"
+walk = "/home/duck/duck-bench/policies/walk_hd1910_p5_v2_iter7992_home5.onnx"
+stand = "/home/duck/duck-bench/policies/standup_hd1910_p5_v1_iter2998_home5.onnx"
+sitstand = "none"
+ground_pick = "none"
+kick_left = "none"
+kick_right = "none"
+roulade = "none"
+head_lowpass = 1.0
+legs_lowpass = 1.0
+
+# Starts by itself on a predicted fall (tilt + 0.1 s × rate > 35°), 2 s, then the stand-up.
+[[policy.skill]]
+name = "fallsafe"
+path = "/home/duck/duck-bench/policies/fallsafe_hd1910_p5_v1_iter1999_home5.onnx"
+duration = 2.0
+
+# The low-battery power-off (6.6 V, smoothed, + battery_offset_v): sits the duck and powers the
+# board off. On by default; on a bench supply that sags it switches the board off.
+[safety]
+# battery_empty_shutdown = false     # bench supply only — never on the battery
+
+[audio]
+enabled = false
+
+# Picked up while walking → relax (Pollen's pickup detector).
+[pickup]
+model = "/home/duck/duck-bench/models/pickup_detector.onnx"

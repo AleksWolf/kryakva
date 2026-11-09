@@ -1,0 +1,13 @@
+{
+    "configuration": "default",
+    "documentId": "1d24afb7e30158ea0f2613bd",
+    "documentMicroversion": "baf25b48cb7b1ba0210c0ef9",
+    "elementId": "43bf417a1c6e28b82f14b9ee",
+    "fullConfiguration": "default",
+    "id": "MiEg+ybm8uZCxa6xL",
+    "isStandardContent": false,
+    "name": "imu_lsm6dsv16x <32>",
+    "partId": "JFD",
+    "suppressed": false,
+    "type": "Part"
+}

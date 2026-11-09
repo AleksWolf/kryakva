@@ -1,0 +1,17 @@
+# Duck page (status and control), port 8082. Install: sudo cp duckpage.service /etc/systemd/system/ && sudo systemctl enable --now duckpage
+# Files: /home/duck/duck_page (server.py, index.html, model/). Writes only to the systemd journal (in RAM).
+[Unit]
+Description=duck status/control page :8082
+After=robotd.service rkaiq.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/duck/duck_page
+ExecStart=/usr/bin/python3 /home/duck/duck_page/server.py
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

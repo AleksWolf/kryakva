@@ -1,0 +1,384 @@
+From 7dbcae53898c96aaf95e48520daf237d46ba8331 Mon Sep 17 00:00:00 2001
+From: duck-brain <duck-brain@localhost>
+Date: Sat, 7 Nov 2026 23:47:48 +0000
+Subject: [PATCH] duck-brain P24: the head's sensors as the duck sees them, in
+ the config
+
+Alex's measurement of 08.11.2026, "as the duck sees":
+- [tof] rotate (degrees clockwise, 0/90/180/270, default 0): tofd turns
+  the sensor's raw 8x8 grid before publishing it, so row 0 is the top
+  and column 0 the duck's left - the layout kinematics::tof lays its
+  beams out in. The duck's mount is 270. The real sensor only; the
+  simulator's and the fake's frames are in that view already.
+- [media] rotate (unset follows the board: 90 on the Zero 3W): the angle
+  mediad tells every frame consumer, between --rotate and the board.
+- Both validated at load; robotctl configure: [tof] restarts tofd.
+- robotd body-imu stops on SIGINT as on SIGTERM, also when started with
+  SIGINT ignored (in the background, over a non-interactive ssh).
+- mediad builds again: robot.say (P7) is refused over a datachannel.
+---
+ mediad/src/main.rs            |  2 ++
+ mediad/src/route.rs           |  3 +++
+ robotctl/src/configure.rs     |  2 ++
+ robotd-params/src/edit.rs     |  2 ++
+ robotd-params/src/lib.rs      | 29 +++++++++++++++++++++
+ robotd-params/src/registry.rs | 11 ++++++++
+ robotd/src/body_imu.rs        | 48 ++++++++++++++++++++++++++++++++---
+ tof/src/lib.rs                | 42 ++++++++++++++++++++++++++++++
+ tof/src/main.rs               | 13 +++++++---
+ 9 files changed, 145 insertions(+), 7 deletions(-)
+
+diff --git a/mediad/src/main.rs b/mediad/src/main.rs
+index 97219b6..6aff4e4 100644
+--- a/mediad/src/main.rs
++++ b/mediad/src/main.rs
+@@ -246,8 +246,10 @@ fn main() -> ExitCode {
+     // (`Board::camera_mount_degrees`). The *simulated* camera is rolled like the Zero 3W's on
+     // purpose, and a twin declares no board, so a frame from a duck in MuJoCo needs the same turn
+     // as a frame from a duck on the desk. Overridable, because a scene could mount it differently.
++    // `[media] rotate` (duck-brain P24) between the flag and the board's default.
+     let rotate = args
+         .rotate
++        .or(params.media.rotate)
+         .unwrap_or_else(|| params.board.version.camera_mount_degrees());
+     let mount = match mediad::pipeline::Rotation::from_degrees(rotate) {
+         Ok(rotation) => rotation,
+diff --git a/mediad/src/route.rs b/mediad/src/route.rs
+index 399904c..f81580f 100644
+--- a/mediad/src/route.rs
++++ b/mediad/src/route.rs
+@@ -66,6 +66,9 @@ fn permits(call: &proto::Call) -> bool {
+         RobotDo(_) | RobotSound(_) | RobotTheremin(_) => true,
+         // Somebody watching through the camera is who wants the room lit.
+         RobotFlashlight(_) => true,
++        // duck-brain P7: a phrase `duck-say` rendered on this robot, by file name in its own
++        // folder. Nothing a peer has, and the brain asks for it over the local socket.
++        RobotSay(_) => false,
+ 
+         // The chorale is between robots, over BLE — a browser is neither in the room nor a duck.
+         // Its daemon-to-daemon plumbing has even less business on a WebRTC channel.
+diff --git a/robotctl/src/configure.rs b/robotctl/src/configure.rs
+index 1cc77ed..bfa1743 100644
+--- a/robotctl/src/configure.rs
++++ b/robotctl/src/configure.rs
+@@ -98,6 +98,8 @@ fn apply_for(key: &str) -> Option<Apply> {
+     let (section, name) = key.split_once('.')?;
+     Some(match section {
+         "media" | "duck_detector" => Apply::Restart("mediad"),
++        // duck-brain P24: the ToF's mount, read once by `tofd` at startup.
++        "tof" => Apply::Restart("tofd"),
+         // `updaterd` reads the board before every check, for the hardware revision a release is
+         // checked against (`robotd_params::board::Board::declared`). Nothing else reads it yet.
+         "board" => Apply::Live("updaterd"),
+diff --git a/robotd-params/src/edit.rs b/robotd-params/src/edit.rs
+index c830e42..b128c0d 100644
+--- a/robotd-params/src/edit.rs
++++ b/robotd-params/src/edit.rs
+@@ -1189,6 +1189,8 @@ mod tests {
+                 "head_imu",
+                 "audio",
+                 "media",
++                // duck-brain P24: the ToF's mount.
++                "tof",
+                 // Last, and the editor shows sections in this order: the pad is what a robot's
+                 // buttons do, which is the thing somebody browses for rather than tunes.
+                 "pad",
+diff --git a/robotd-params/src/lib.rs b/robotd-params/src/lib.rs
+index c081a47..6abf614 100644
+--- a/robotd-params/src/lib.rs
++++ b/robotd-params/src/lib.rs
+@@ -75,6 +75,8 @@ pub struct Params {
+     pub feetech: FeetechParams,
+     /// The body IMU on the host's I²C (duck-brain P12), read on a Feetech robot.
+     pub body_imu: BodyImuParams,
++    /// The ToF's mount (duck-brain P24), read by `tofd`.
++    pub tof: TofParams,
+     pub control: Control,
+     pub update_gate: UpdateGate,
+     pub policy: PolicyParams,
+@@ -660,6 +662,10 @@ pub struct MediaParams {
+     /// Which sensor the head camera must be. `board`, the default, is the declared board's — see
+     /// [`MediaSensor`] for why anything else is the exception.
+     pub sensor: MediaSensor,
++    /// How far the head camera is mounted from upright, degrees clockwise — what every consumer
++    /// turns a frame by (duck-brain P24). Unset follows the board (`Board::camera_mount_degrees`:
++    /// 90 on the Zero 3W); `mediad --rotate` still wins over both.
++    pub rotate: Option<u32>,
+ }
+ 
+ /// A camera calibration, as OpenCV's `calibrateCamera` produces one.
+@@ -738,10 +744,22 @@ impl Default for MediaParams {
+             congestion_control: CongestionControl::default(),
+             // The board's camera: a sensor named here is a deliberate exception.
+             sensor: MediaSensor::Board,
++            rotate: None,
+         }
+     }
+ }
+ 
++/// `[tof]` — the head ToF's mount (duck-brain P24).
++#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields, default)]
++pub struct TofParams {
++    /// Degrees clockwise `tofd` turns the sensor's raw 8×8 grid by before publishing it, so the
++    /// frame is the duck's view: row 0 the top, column 0 the duck's left — the layout
++    /// `kinematics::tof` lays its beams out in. 0, 90, 180 or 270; no mirror. 0 (Pollen's mount)
++    /// by default; the duck-brain duck is 270 (Alex, 08.11.2026).
++    pub rotate: u32,
++}
++
+ /// `[duck_detector]` — finding other ducks in the camera.
+ ///
+ /// **Read by `mediad`, not by `robotd`**, which is a first for this file: the frames are on
+@@ -2861,6 +2879,17 @@ impl Params {
+                 return Err(setting("battery_offset_v", format!("{} must be 0–2 V", f.battery_offset_v)));
+             }
+         }
++        // P24: a quarter turn or none; anything else is a typo, not a mount.
++        let turn_ok = |d: u32| matches!(d, 0 | 90 | 180 | 270);
++        for (key, value) in [("tof.rotate", Some(self.tof.rotate)), ("media.rotate", self.media.rotate)] {
++            if let Some(d) = value.filter(|d| !turn_ok(*d)) {
++                return Err(ParamsError::Setting {
++                    path: path.display().to_string(),
++                    key: key.to_owned(),
++                    reason: format!("{d}: 0, 90, 180 or 270 degrees clockwise"),
++                });
++            }
++        }
+         if self.body_imu.enabled_for(self.bus.driver) {
+             let setting = |key: &str, reason: String| ParamsError::Setting {
+                 path: path.display().to_string(),
+diff --git a/robotd-params/src/registry.rs b/robotd-params/src/registry.rs
+index 882ebad..f0af53e 100644
+--- a/robotd-params/src/registry.rs
++++ b/robotd-params/src/registry.rs
+@@ -543,6 +543,17 @@ pub const REGISTRY: &[Entry] = &[
+         Kind::Choice(crate::MEDIA_SENSOR_LABELS),
+         "Head camera sensor — board follows the declared board; naming one forces it",
+     ),
++    entry(
++        "media.rotate",
++        Kind::OptionalInteger,
++        "Camera mount, degrees clockwise (0/90/180/270) — unset follows the board (duck-brain P24)",
++    ),
++    // ── [tof] (duck-brain P24) ───────────────────────────────────────────────
++    entry(
++        "tof.rotate",
++        Kind::Integer,
++        "ToF grid turn to the duck's view, degrees clockwise (0/90/180/270)",
++    ),
+     // ── [pad] ────────────────────────────────────────────────────────────────
+     //
+     // Which button runs which skill. Read by `padd`, not by `robotd` — but it lives in the same
+diff --git a/robotd/src/body_imu.rs b/robotd/src/body_imu.rs
+index d1b63bf..18ae764 100644
+--- a/robotd/src/body_imu.rs
++++ b/robotd/src/body_imu.rs
+@@ -216,7 +216,31 @@ mod reader {
+ /// second — the bench check of bus, address and mount (docs/board.md in duck-brain). With
+ /// `solve`, the mount is measured instead: hold the robot upright, then nose-down, and the
+ /// quaternion for `[body_imu.mount]` is printed.
++/// Set by SIGINT or SIGTERM while `robotd body-imu` runs (duck-brain P24).
++static STOP: AtomicBool = AtomicBool::new(false);
++
++extern "C" fn on_stop(_: libc::c_int) {
++    STOP.store(true, Ordering::Release);
++}
++
++/// Ctrl-C and SIGTERM stop the bench (P24). Installed rather than left to the default: a
++/// command started in the background, or over a non-interactive ssh, inherits SIGINT ignored,
++/// and Ctrl-C or `kill -INT` then did nothing. No SA_RESTART, so a wait at the Enter prompt
++/// ends too.
++fn stop_on_signals() {
++    for sig in [libc::SIGINT, libc::SIGTERM] {
++        // SAFETY: a zeroed sigaction with only the handler set; the handler only stores an atomic.
++        unsafe {
++            let mut action: libc::sigaction = std::mem::zeroed();
++            action.sa_sigaction = on_stop as *const () as libc::sighandler_t;
++            libc::sigemptyset(&mut action.sa_mask);
++            libc::sigaction(sig, &action, std::ptr::null_mut());
++        }
++    }
++}
++
+ pub fn bench(params: &Params, solve: bool) -> std::process::ExitCode {
++    stop_on_signals();
+     let mut cfg = Config::from(params);
+     if solve {
+         // The sensor's own axes: gravity as the chip reads it.
+@@ -231,6 +255,9 @@ pub fn bench(params: &Params, solve: bool) -> std::process::ExitCode {
+     );
+     let wait_ready = || {
+         for _ in 0..100 {
++            if STOP.load(Ordering::Acquire) {
++                return false;
++            }
+             if feed.ready() {
+                 return true;
+             }
+@@ -239,6 +266,10 @@ pub fn bench(params: &Params, solve: bool) -> std::process::ExitCode {
+         false
+     };
+     if !wait_ready() {
++        shutdown.store(true, Ordering::Release);
++        if STOP.load(Ordering::Acquire) {
++            return std::process::ExitCode::SUCCESS;
++        }
+         let s = feed.status();
+         eprintln!(
+             "no converged sample in 10 s: {}",
+@@ -251,6 +282,9 @@ pub fn bench(params: &Params, solve: bool) -> std::process::ExitCode {
+             println!("{what}, hold still, then press Enter");
+             let mut line = String::new();
+             let _ = std::io::stdin().read_line(&mut line);
++            if STOP.load(Ordering::Acquire) {
++                return None;
++            }
+             let mut sum = [0.0f64; 3];
+             let mut n = 0.0f64;
+             let mut last = None;
+@@ -272,11 +306,15 @@ pub fn bench(params: &Params, solve: bool) -> std::process::ExitCode {
+                 "  gravity in sensor axes {:+.3} {:+.3} {:+.3} ({n} samples)",
+                 g[0], g[1], g[2]
+             );
+-            g
++            Some(g)
+         };
+-        let up = mean("1/2: the robot upright, as it stands");
+-        let nose = mean("2/2: the robot pitched nose-down, 30° or more");
++        let poses = mean("1/2: the robot upright, as it stands").and_then(|up| {
++            mean("2/2: the robot pitched nose-down, 30° or more").map(|nose| (up, nose))
++        });
+         shutdown.store(true, Ordering::Release);
++        let Some((up, nose)) = poses else {
++            return std::process::ExitCode::SUCCESS;
++        };
+         return match duck_control::host_imu::mount_from_two_poses(up, nose) {
+             Some(q) => {
+                 println!(
+@@ -292,7 +330,7 @@ pub fn bench(params: &Params, solve: bool) -> std::process::ExitCode {
+         };
+     }
+     let started = Instant::now();
+-    loop {
++    while !STOP.load(Ordering::Acquire) {
+         if let Some(s) = feed.latest() {
+             let [gx, gy, gz] = s.imu.gravity;
+             let [wx, wy, wz] = s.imu.gyro;
+@@ -306,6 +344,8 @@ pub fn bench(params: &Params, solve: bool) -> std::process::ExitCode {
+         }
+         std::thread::sleep(Duration::from_millis(200));
+     }
++    shutdown.store(true, Ordering::Release);
++    std::process::ExitCode::SUCCESS
+ }
+ 
+ #[cfg(test)]
+diff --git a/tof/src/lib.rs b/tof/src/lib.rs
+index 2bae16e..85cf1f1 100644
+--- a/tof/src/lib.rs
++++ b/tof/src/lib.rs
+@@ -44,6 +44,27 @@
+ pub mod link;
+ pub mod sensor;
+ 
++/// Turn a row-major `side`×`side` grid `degrees` clockwise (0, 90, 180, 270; no mirror) — the
++/// sensor's raw frame into the duck's view (duck-brain P24, `[tof] rotate`). A grid that is not
++/// square, or an angle that is not a quarter turn, comes back as it was.
++pub fn turn_cw<T: Copy>(grid: &[T], side: usize, degrees: u32) -> Vec<T> {
++    if grid.len() != side * side || !matches!(degrees, 90 | 180 | 270) {
++        return grid.to_vec();
++    }
++    let n = side;
++    (0..n * n)
++        .map(|i| {
++            let (r, c) = (i / n, i % n);
++            let (sr, sc) = match degrees {
++                90 => (n - 1 - c, r),
++                180 => (n - 1 - r, n - 1 - c),
++                _ => (c, n - 1 - r),
++            };
++            grid[sr * n + sc]
++        })
++        .collect()
++}
++
+ pub use link::Link;
+ pub use sensor::{Generation, Sensor};
+ 
+@@ -123,6 +144,27 @@ impl Frame {
+ mod tests {
+     use super::*;
+ 
++    /// A quarter turn clockwise puts the top-left corner top-right, as a picture turned by hand;
++    /// 270 puts it bottom-left; four quarter turns are none.
++    #[test]
++    fn turn_cw_turns_like_a_picture() {
++        // 0 1 2
++        // 3 4 5
++        // 6 7 8
++        let g: Vec<u8> = (0..9).collect();
++        assert_eq!(turn_cw(&g, 3, 90), [6, 3, 0, 7, 4, 1, 8, 5, 2]);
++        assert_eq!(turn_cw(&g, 3, 180), [8, 7, 6, 5, 4, 3, 2, 1, 0]);
++        assert_eq!(turn_cw(&g, 3, 270), [2, 5, 8, 1, 4, 7, 0, 3, 6]);
++        assert_eq!(turn_cw(&g, 3, 0), g);
++        let mut h = g.clone();
++        for _ in 0..4 {
++            h = turn_cw(&h, 3, 90);
++        }
++        assert_eq!(h, g);
++        assert_eq!(turn_cw(&turn_cw(&g, 3, 270), 3, 90), g);
++        assert_eq!(turn_cw(&g, 3, 45), g, "not a quarter turn: untouched");
++    }
++
+     fn frame(status: u8, distance_mm: i16) -> Frame {
+         Frame {
+             rows: ROWS as u8,
+diff --git a/tof/src/main.rs b/tof/src/main.rs
+index 88790f7..6c22708 100644
+--- a/tof/src/main.rs
++++ b/tof/src/main.rs
+@@ -215,6 +215,12 @@ async fn main() -> std::process::ExitCode {
+         let hz = args.hz;
+         let fake = args.fake;
+         let sim = args.sim.clone();
++        // duck-brain P24: the raw grid turned to the duck's view. The real sensor only — the
++        // simulator's frames and the fake's are drawn in that view already.
++        let turn = params.tof.rotate;
++        if turn != 0 {
++            tracing::info!(degrees = turn, "[tof] rotate: frames turned clockwise to the duck's view");
++        }
+         std::thread::Builder::new()
+             .name("tof-sensor".to_owned())
+             .spawn(move || {
+@@ -223,7 +229,7 @@ async fn main() -> std::process::ExitCode {
+                 } else if fake {
+                     fake_loop(hz, &status, &frames, &shutdown);
+                 } else {
+-                    sensor_loop(&links, hz, &status, &frames, &shutdown);
++                    sensor_loop(&links, hz, turn, &status, &frames, &shutdown);
+                 }
+             })
+             .expect("spawn the sensor thread")
+@@ -314,6 +320,7 @@ fn quiet_period(hz: u8) -> Duration {
+ fn sensor_loop(
+     links: &[tof::Link],
+     hz: u8,
++    turn: u32,
+     status: &Arc<Status>,
+     frames: &tokio::sync::broadcast::Sender<proto::TofFrame>,
+     shutdown: &Arc<AtomicBool>,
+@@ -368,8 +375,8 @@ fn sensor_loop(
+                                     t_ns: proto::clock::monotonic_ns(),
+                                     rows: frame.rows,
+                                     cols: frame.cols,
+-                                    distance_mm: frame.distance_mm,
+-                                    status: frame.status,
++                                    distance_mm: tof::turn_cw(&frame.distance_mm, usize::from(frame.cols), turn),
++                                    status: tof::turn_cw(&frame.status, usize::from(frame.cols), turn),
+                                 });
+                             }
+                             Err(e) => {
+-- 
+2.43.0
+

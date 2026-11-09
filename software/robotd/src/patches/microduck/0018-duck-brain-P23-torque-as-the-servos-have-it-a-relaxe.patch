@@ -1,0 +1,637 @@
+From 4191a814c9bc77f40fe7e179e1502c979fc72204 Mon Sep 17 00:00:00 2001
+From: duck-brain <duck-brain@localhost>
+Date: Sat, 7 Nov 2026 23:34:14 +0000
+Subject: [PATCH] duck-brain P23: torque as the servos have it; a relaxed servo
+ gets no goal
+
+Alex's bench, 07.11.2026: torque left on (40 = 1 on all 15) by the servo
+tool, robotd started without enable; health said torque None, a relax
+answered "torque off", and the servos were stiff again. The relax did
+write 40 = 0 - but the loop goes on writing goals, and the STS/HD firmware
+switches torque on when it is given a goal.
+- The census reads 40 on all 15: robot.health -> feetech.torque (on if any
+  is on) and servos[].torque, read at startup and after every verified
+  write, never None for a servo that answers.
+- A goal goes only to a servo known to hold torque; a dry run journals
+  them all as before.
+- Torque off (relax, the cutoffs, stopping robotd) always writes 40 = 0 to
+  all 15, read back, whatever the driver believes; stopping does it once
+  the bus has been up, never in a dry run.
+- torque_on takes torque off again when a step after the goal fails: the
+  goal alone has switched it on.
+- The emulators (feetech::emu and duck-brain's scripts/feetech_emu.py)
+  switch torque on at a goal write, as the servos do.
+- A robotd test: the host IMU sample reaches robot.state on the Feetech
+  bus - quaternion and gyro in imu, gravity and the fall verdict in safety.
+---
+ duck-control/src/feetech.rs | 238 ++++++++++++++++++++++++++++++++----
+ duck-ipc-proto/src/lib.rs   |   8 +-
+ feetech/src/emu.rs          |   9 ++
+ feetech/src/lib.rs          |   4 +-
+ robotd/src/feetech_bus.rs   |   1 +
+ robotd/src/main.rs          |  91 ++++++++++++++
+ 6 files changed, 327 insertions(+), 24 deletions(-)
+
+diff --git a/duck-control/src/feetech.rs b/duck-control/src/feetech.rs
+index 4be25c7..2b61d39 100644
+--- a/duck-control/src/feetech.rs
++++ b/duck-control/src/feetech.rs
+@@ -180,6 +180,7 @@ struct Stats {
+     torque_on_rewrites: [u32; NUM_JOINTS],
+     servo_p: [Option<u8>; NUM_JOINTS],
+     servo_d: [Option<u8>; NUM_JOINTS],
++    servo_torque: [Option<bool>; NUM_JOINTS],
+     counters: feetech::Counters,
+     imu_stale: ImuStale,
+     imu_age_last: Option<Duration>,
+@@ -240,6 +241,8 @@ pub struct FeetechSnapshot {
+     /// P (50) and D (51) each servo last read back, per joint; `None` before the first write.
+     pub servo_p: [Option<u8>; NUM_JOINTS],
+     pub servo_d: [Option<u8>; NUM_JOINTS],
++    /// Torque (40) per joint, as read at startup and after every verified write (P23).
++    pub servo_torque: [Option<bool>; NUM_JOINTS],
+     pub echoes: u64,
+     pub bad_packets: u64,
+     pub stray: u64,
+@@ -293,6 +296,7 @@ impl FeetechShared {
+             torque_on_rewrites: s.torque_on_rewrites,
+             servo_p: s.servo_p,
+             servo_d: s.servo_d,
++            servo_torque: s.servo_torque,
+             echoes: s.counters.echoes,
+             bad_packets: s.counters.bad_packets,
+             stray: s.counters.stray,
+@@ -339,6 +343,12 @@ pub struct FeetechIo<P: Port = SerialPort> {
+     silent_ticks: u32,
+     /// Torque was cut on a silent bus, unverified: cut it again, verified, once servos answer.
+     off_pending: bool,
++    /// Torque (40) per joint as the servos last said (P23): read at the census, then set by every
++    /// verified write. A goal goes only to a joint known to be on — a goal written to a servo with
++    /// torque off switches it on.
++    torque_on: [Option<bool>; NUM_JOINTS],
++    /// The census has seen every servo: the bus is up, and a drop has something to switch off.
++    bus_up: bool,
+     kp: Option<u16>,
+     /// The driving network's servo settings (duck-brain P17), `None` for `[feetech]`'s. For the
+     /// 14 joints the policy drives; the mouth always runs at `[feetech]`'s.
+@@ -390,6 +400,8 @@ impl<P: Port> FeetechIo<P> {
+             cutoff: false,
+             silent_ticks: 0,
+             off_pending: false,
++            torque_on: [None; NUM_JOINTS],
++            bus_up: false,
+             kp: None,
+             runtime: None,
+             read_started: None,
+@@ -420,9 +432,61 @@ impl<P: Port> FeetechIo<P> {
+                 None => missing.push(JOINT_IDS[j]),
+             }
+         }
++        if missing.is_empty() {
++            self.bus_up = true;
++            // What the servos are actually doing (P23): torque left on by another tool shows as
++            // on, rather than as nothing known.
++            self.read_torque()?;
++            let on: Vec<u8> = (0..NUM_JOINTS)
++                .filter(|&j| self.torque_on[j] == Some(true))
++                .map(|j| JOINT_IDS[j])
++                .collect();
++            if !on.is_empty() {
++                tracing::warn!(
++                    ?on,
++                    "torque is already on at startup (left by another tool?)"
++                );
++            }
++            self.publish_torque(None);
++        }
+         Ok(missing)
+     }
+ 
++    /// The torque state to `robot.health` (P23): per joint as known, and over all — on if any is
++    /// on, off if all are off. `noted`: a dry run's pretend state, which the loop goes by.
++    fn publish_torque(&self, noted: Option<bool>) {
++        let any_on = self.torque_on.contains(&Some(true));
++        let all_off = self.torque_on.iter().all(|t| *t == Some(false));
++        let mut s = self.shared.0.lock().unwrap();
++        s.servo_torque = self.torque_on;
++        s.torque = if self.cfg.dry_run {
++            noted.or(s.torque)
++        } else if any_on {
++            Some(true)
++        } else if all_off {
++            Some(false)
++        } else {
++            None
++        };
++    }
++
++    /// Torque (40) as the servos say it, into the per-joint state (P23).
++    fn read_torque(&mut self) -> Result<()> {
++        let torque = self
++            .bus
++            .sync_read(&JOINT_IDS, reg::TORQUE.0, reg::TORQUE.1)
++            .map_err(|e| IoError::Bus(format!("torque read: {e}")))?;
++        for (j, a) in torque.iter().enumerate() {
++            self.torque_on[j] = a.as_ref().map(|s| s.params[0] != 0);
++        }
++        Ok(())
++    }
++
++    /// Whether any servo may have torque on: on, or not known.
++    fn maybe_on(&self) -> bool {
++        self.torque_on.iter().any(|t| *t != Some(false))
++    }
++
+     pub fn shared(&self) -> Arc<FeetechShared> {
+         Arc::clone(&self.shared)
+     }
+@@ -491,9 +555,7 @@ impl<P: Port> FeetechIo<P> {
+     /// before. Back with `robot.relax`, then `init`, as after the undervoltage cutoff.
+     fn note_silent(&mut self) {
+         self.silent_ticks += 1;
+-        if self.silent_ticks < SILENT_CUTOFF_TICKS
+-            || self.shared.0.lock().unwrap().torque != Some(true)
+-        {
++        if self.silent_ticks < SILENT_CUTOFF_TICKS || self.off_pending || !self.maybe_on() {
+             return;
+         }
+         tracing::error!(
+@@ -511,14 +573,17 @@ impl<P: Port> FeetechIo<P> {
+             }
+         }
+         self.off_pending = !self.cfg.dry_run;
+-        let mut s = self.shared.0.lock().unwrap();
+-        s.torque = Some(false);
+-        s.silent_cutoff = true;
++        // Unverified: nobody to read back from. Not known, so no goal goes out either.
++        self.torque_on = [None; NUM_JOINTS];
++        self.publish_torque(Some(false));
++        self.shared.0.lock().unwrap().silent_cutoff = true;
+     }
+ 
++    /// Torque off on all 15, every time, each read back (P23): whatever this driver believes —
++    /// robotd may not have switched it on, another tool may have.
+     fn torque_off_all(&mut self) -> Result<()> {
+         if self.cfg.dry_run {
+-            self.shared.0.lock().unwrap().torque = Some(false);
++            self.publish_torque(Some(false));
+             return Ok(());
+         }
+         let mut rewrites = 0u64;
+@@ -533,7 +598,13 @@ impl<P: Port> FeetechIo<P> {
+         )
+         .map_err(|e| IoError::Bus(format!("torque off: {e}")))?;
+         self.count_writes(&failed, rewrites);
+-        self.shared.0.lock().unwrap().torque = Some(false);
++        for (j, &id) in JOINT_IDS.iter().enumerate() {
++            self.torque_on[j] = match failed.iter().find(|m| m.id == id) {
++                None => Some(false),
++                Some(m) => m.read.map(|v| v != 0),
++            };
++        }
++        self.publish_torque(None);
+         if failed.is_empty() {
+             Ok(())
+         } else {
+@@ -777,10 +848,14 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+             let goal = present + (targets.positions[j] - present) * k;
+             let raw = rad_to_counts(goal, self.cfg.sign[j]);
+             goal_raw.push(raw);
+-            bytes.push((id, raw.to_le_bytes()));
++            // Only to a servo known to hold torque (P23): the HD/STS firmware switches torque on
++            // when it is given a goal, so a goal to a relaxed servo would stiffen it again.
++            if self.cfg.dry_run || self.torque_on[j] == Some(true) {
++                bytes.push((id, raw.to_le_bytes()));
++            }
+         }
+         let refs: Vec<(u8, &[u8])> = bytes.iter().map(|(id, b)| (*id, b.as_slice())).collect();
+-        if !self.cfg.dry_run {
++        if !self.cfg.dry_run && !refs.is_empty() {
+             self.bus
+                 .sync_write(reg::GOAL.0, reg::GOAL.1, &refs)
+                 .map_err(|e| IoError::Bus(format!("sync_write goal: {e}")))?;
+@@ -851,8 +926,8 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+             self.cutoff = false;
+             self.low_ticks = 0;
+             self.silent_ticks = 0;
++            self.publish_torque(Some(true));
+             let mut s = self.shared.0.lock().unwrap();
+-            s.torque = Some(true);
+             s.cutoff = false;
+             s.silent_cutoff = false;
+             return Ok(());
+@@ -938,13 +1013,19 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+             self.low_ticks = 0;
+             self.silent_ticks = 0;
+             self.off_pending = false;
++            self.torque_on = [Some(true); NUM_JOINTS];
++            self.publish_torque(None);
+             let mut s = self.shared.0.lock().unwrap();
+-            s.torque = Some(true);
+             s.cutoff = false;
+             s.silent_cutoff = false;
+             Ok(())
+         } else {
+-            self.shared.0.lock().unwrap().torque = Some(false);
++            // The sequence takes torque off again on failure; what the servos ended up with is
++            // read back, not assumed.
++            if self.read_torque().is_err() {
++                self.torque_on = [None; NUM_JOINTS];
++            }
++            self.publish_torque(None);
+             Err(IoError::Bus(format!(
+                 "torque on did not take: {}",
+                 join(&failed)
+@@ -1013,7 +1094,7 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+             },
+             "servo settings of the 14 joints"
+         );
+-        if self.cfg.dry_run || self.shared.0.lock().unwrap().torque != Some(true) {
++        if self.cfg.dry_run || !self.torque_on.contains(&Some(true)) {
+             return Ok(());
+         }
+         let mouth = JOINT_IDS[MOUTH_INDEX];
+@@ -1064,12 +1145,13 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+ 
+ /// robotd stopping — Ctrl+C, SIGTERM, the end of the loop, a panic unwinding through it — takes
+ /// torque off every servo (duck-brain P22, Alex 07.11.2026): a duck is not left stiff with nothing
+-/// driving it. A standing duck then falls; `robot.relax` first is still the gentle way. Only when
+-/// this run switched torque on (an IO dropped while waiting for its servos writes nothing), and
+-/// never in a dry run, which writes nothing.
++/// driving it. A standing duck then falls; `robot.relax` first is still the gentle way. Always,
++/// whatever the driver believes about torque (P23: another tool may have left it on), once the bus
++/// has been up — an IO dropped while still waiting for its servos writes nothing — and never in a
++/// dry run, which writes nothing.
+ impl<P: Port> Drop for FeetechIo<P> {
+     fn drop(&mut self) {
+-        if self.cfg.dry_run || self.shared.0.lock().unwrap().torque != Some(true) {
++        if self.cfg.dry_run || !self.bus_up {
+             return;
+         }
+         tracing::warn!("stopping: torque off on every servo");
+@@ -1128,6 +1210,9 @@ mod tests {
+                 ..quick()
+             },
+         );
++        // Goals go only to servos holding torque (P23).
++        io.set_torque(true).unwrap();
++        io.bus_mut().port_mut().log.clear();
+         let s = io.read().unwrap();
+         let j = JOINT_IDS.iter().position(|&id| id == 12).unwrap();
+         assert!((s.positions[j] - std::f64::consts::FRAC_PI_4).abs() < 1e-12);
+@@ -1197,6 +1282,7 @@ mod tests {
+         let mut emu = Emulator::new(&JOINT_IDS);
+         emu.servo_mut(JOINT_IDS[0]).unwrap().set(56, 2, 2048 + 100);
+         let mut io = io(emu, cfg);
++        io.set_torque(true).unwrap();
+         let s = io.read().unwrap();
+         assert!(s.positions[0] < 0.0);
+         let mut t = s.positions;
+@@ -1221,6 +1307,7 @@ mod tests {
+             emu.servo_mut(id).unwrap().set(62, 1, 50); // 5.0 V: below the band, above the cutoff
+         }
+         let mut io = io(emu, quick());
++        io.set_torque(true).unwrap();
+         let s = io.read().unwrap();
+         let mut t = s.positions;
+         t[0] += 0.1;
+@@ -1478,7 +1565,10 @@ mod tests {
+         assert!(io.read().is_err());
+         assert_eq!(torque_writes(&mut io), 3);
+         let snap = io.shared().snapshot();
+-        assert!(snap.silent_cutoff && snap.torque == Some(false));
++        assert!(
++            snap.silent_cutoff && snap.torque.is_none(),
++            "cut, unverified: not known"
++        );
+         assert!(io.read().is_err());
+         assert_eq!(torque_writes(&mut io), 3, "once");
+         for id in JOINT_IDS {
+@@ -1492,6 +1582,7 @@ mod tests {
+                 .all(|&id| emu.servo(id).unwrap().get(40, 1) == 0),
+             "servos that heard none of the cut get it, verified, once they answer"
+         );
++        assert_eq!(io.shared().snapshot().torque, Some(false));
+         assert!(
+             io.shared().snapshot().silent_cutoff,
+             "until torque comes on again"
+@@ -1515,8 +1606,8 @@ mod tests {
+         }
+     }
+ 
+-    /// robotd stopping (P22): the driver dropped with torque on takes it off every servo; one that
+-    /// never switched it on writes nothing.
++    /// robotd stopping (P22, P23): the driver dropped takes torque off every servo, whether or not
++    /// it switched torque on itself; one dropped before its bus was up writes nothing.
+     #[test]
+     fn dropping_the_driver_takes_torque_off() {
+         let emu = Arc::new(Mutex::new(Emulator::new(&JOINT_IDS)));
+@@ -1540,7 +1631,11 @@ mod tests {
+                 .all(|&id| emu.lock().unwrap().servo(id).unwrap().get(40, 1) == 0)
+         );
+ 
++        // Torque left on by another tool, never touched by this driver: still taken off.
+         let emu = Arc::new(Mutex::new(Emulator::new(&JOINT_IDS)));
++        for id in JOINT_IDS {
++            emu.lock().unwrap().servo_mut(id).unwrap().set(40, 1, 1);
++        }
+         let mut io = FeetechIo::with_port(
+             Kept(Arc::clone(&emu)),
+             quick(),
+@@ -1548,11 +1643,109 @@ mod tests {
+             Arc::new(ImuFeed::new()),
+         );
+         assert!(io.census().unwrap().is_empty());
++        drop(io);
++        assert!(
++            JOINT_IDS
++                .iter()
++                .all(|&id| emu.lock().unwrap().servo(id).unwrap().get(40, 1) == 0)
++        );
++
++        // Dropped while still waiting for a servo: the bus never came up, nothing is written.
++        let emu = Arc::new(Mutex::new(Emulator::new(&JOINT_IDS)));
++        emu.lock().unwrap().servo_mut(12).unwrap().silent = true;
++        let mut io = FeetechIo::with_port(
++            Kept(Arc::clone(&emu)),
++            quick(),
++            Arc::default(),
++            Arc::new(ImuFeed::new()),
++        );
++        assert_eq!(io.census().unwrap(), vec![12]);
+         emu.lock().unwrap().log.clear();
+         drop(io);
+         assert!(
+             emu.lock().unwrap().log.is_empty(),
+-            "torque was never on: nothing written"
++            "bus never up: nothing written"
++        );
++    }
++
++    /// Alex's bench, 07.11 (P23): torque left on (40 = 1 on all 15) by the servo tool, robotd
++    /// started without enable. The census reads it — health says on, per servo too; a relax writes
++    /// 40 = 0 to all 15, read back; and the loop's goals after it reach no servo, which would
++    /// otherwise switch torque straight back on (the firmware, and the emulator, do on a goal).
++    #[test]
++    fn torque_left_on_is_seen_and_a_relax_stays_relaxed() {
++        let mut emu = Emulator::new(&JOINT_IDS);
++        for id in JOINT_IDS {
++            emu.servo_mut(id).unwrap().set(40, 1, 1);
++        }
++        let mut io = io(emu, quick());
++        let snap = io.shared().snapshot();
++        assert_eq!(snap.torque, Some(true), "read at startup, not None");
++        assert!(snap.servo_torque.iter().all(|t| *t == Some(true)));
++        // The loop holds the startup pose meanwhile: goals go out, torque is on anyway.
++        let s = io.read().unwrap();
++        io.write(&JointTargets::new(s.positions)).unwrap();
++        io.set_torque(false).unwrap();
++        let emu = io.bus_mut().port_mut();
++        assert!(
++            JOINT_IDS
++                .iter()
++                .all(|&id| emu.servo(id).unwrap().get(40, 1) == 0)
++        );
++        let snap = io.shared().snapshot();
++        assert_eq!(snap.torque, Some(false));
++        assert!(snap.servo_torque.iter().all(|t| *t == Some(false)));
++        io.bus_mut().port_mut().log.clear();
++        for _ in 0..5 {
++            let s = io.read().unwrap();
++            io.write(&JointTargets::new(s.positions)).unwrap();
++        }
++        let emu = io.bus_mut().port_mut();
++        assert!(
++            !emu.log
++                .iter()
++                .any(|(_, instr, addr)| *instr == feetech::SYNC_WRITE && *addr == 42),
++            "no goal to a relaxed servo"
++        );
++        assert!(
++            JOINT_IDS
++                .iter()
++                .all(|&id| emu.servo(id).unwrap().get(40, 1) == 0),
++            "still relaxed"
++        );
++        // A torque-on as ever, and goals go out again.
++        io.set_torque(true).unwrap();
++        io.bus_mut().port_mut().log.clear();
++        let s = io.read().unwrap();
++        io.write(&JointTargets::new(s.positions)).unwrap();
++        assert!(
++            io.bus_mut()
++                .port_mut()
++                .log
++                .iter()
++                .any(|(_, instr, addr)| *instr == feetech::SYNC_WRITE && *addr == 42)
++        );
++    }
++
++    /// The emulator, like the servos, switches torque on when given a goal — what P23 guards.
++    #[test]
++    fn a_goal_switches_an_emulated_servo_on() {
++        let emu = Emulator::new(&JOINT_IDS);
++        let mut io = io(emu, quick());
++        assert_eq!(
++            io.shared().snapshot().torque,
++            Some(false),
++            "the emulator starts off"
++        );
++        let refs: Vec<(u8, &[u8])> = vec![(JOINT_IDS[0], &[0x00, 0x08])];
++        io.bus_mut().sync_write(42, 2, &refs).unwrap();
++        assert_eq!(
++            io.bus_mut()
++                .port_mut()
++                .servo(JOINT_IDS[0])
++                .unwrap()
++                .get(40, 1),
++            1
+         );
+     }
+ 
+@@ -1783,6 +1976,7 @@ mod tests {
+         }
+         let mut io = io(emu, quick());
+         io.set_servo_runtime(Some(P5)).unwrap();
++        io.set_torque(true).unwrap();
+         let s = io.read().unwrap();
+         let mut t = s.positions;
+         t[0] += 0.1;
+diff --git a/duck-ipc-proto/src/lib.rs b/duck-ipc-proto/src/lib.rs
+index a19b188..abc0f15 100644
+--- a/duck-ipc-proto/src/lib.rs
++++ b/duck-ipc-proto/src/lib.rs
+@@ -3766,7 +3766,9 @@ pub struct FeetechHealth {
+     /// `robotd --dry-run` (P22): nothing is written to the servos.
+     #[serde(default)]
+     pub dry_run: bool,
+-    /// Last torque state written, `None` before the first.
++    /// Torque over the 15 servos (duck-brain P23): `true` when any servo has it on, `false` when
++    /// all have it off — read at startup, then every verified write; `None` while one is unknown
++    /// and none is on.
+     pub torque: Option<bool>,
+     /// Register writes that read back different and were rewritten; writes that never did.
+     pub rewrites: u64,
+@@ -3814,6 +3816,10 @@ pub struct ServoHealth {
+     pub p: Option<u8>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub d: Option<u8>,
++    /// Torque (40) as last read or written with read-back (duck-brain P23); `None` before the
++    /// first read, or when a write did not read back.
++    #[serde(default)]
++    pub torque: Option<bool>,
+ }
+ 
+ /// The control loop's rate and timing.
+diff --git a/feetech/src/emu.rs b/feetech/src/emu.rs
+index 3fbf3b6..56baaf4 100644
+--- a/feetech/src/emu.rs
++++ b/feetech/src/emu.rs
+@@ -67,6 +67,15 @@ impl Servo {
+         }
+         let a = usize::from(addr);
+         self.regs[a..a + data.len()].copy_from_slice(data);
++        // A goal written with torque off switches torque on (duck-brain P23): the STS/HD firmware
++        // does, and it is how a robot that had been relaxed came back stiff on Alex's bench, 07.11.
++        if a <= 42
++            && a + data.len() > 42
++            && !(a <= 40 && a + data.len() > 40)
++            && self.refuse != Some(40)
++        {
++            self.regs[40] = 1;
++        }
+         if a <= 41 && a + data.len() > 41 {
+             self.accel_writes.push(self.regs[41]);
+             if self.regs[41] == 0 && self.stuck_accel > 0 {
+diff --git a/feetech/src/lib.rs b/feetech/src/lib.rs
+index cf49b90..a849a0d 100644
+--- a/feetech/src/lib.rs
++++ b/feetech/src/lib.rs
+@@ -561,7 +561,9 @@ pub fn torque_on<P: Port>(
+     ];
+     let mut torque_written = false;
+     for (register, values) in steps {
+-        torque_written |= register == reg::TORQUE;
++        // The goal counts as torque: the firmware switches torque on when it is given one
++        // (duck-brain P23), so a later step that fails must take it off again.
++        torque_written |= register == reg::TORQUE || register == reg::GOAL;
+         let result = write_verified(bus, ids, register, &values, cfg.retries, on_mismatch)?;
+         report.failed = result.into_iter().filter_map(Result::err).collect();
+         if !report.failed.is_empty() {
+diff --git a/robotd/src/feetech_bus.rs b/robotd/src/feetech_bus.rs
+index d6a206f..e646feb 100644
+--- a/robotd/src/feetech_bus.rs
++++ b/robotd/src/feetech_bus.rs
+@@ -187,6 +187,7 @@ pub fn health(shared: &FeetechShared) -> proto::FeetechHealth {
+                 accel_rewrites: s.torque_on_rewrites[j],
+                 p: s.servo_p[j],
+                 d: s.servo_d[j],
++                torque: s.servo_torque[j],
+             })
+             .collect(),
+     }
+diff --git a/robotd/src/main.rs b/robotd/src/main.rs
+index 9480509..de34c70 100644
+--- a/robotd/src/main.rs
++++ b/robotd/src/main.rs
+@@ -7932,6 +7932,97 @@ mod tests {
+         assert_eq!(frame.joints.len(), NUM_JOINTS);
+     }
+ 
++    /// The host IMU's sample reaches the state stream as the loop saw it (duck-brain P23, Alex
++    /// 07.11: `monitor --json` showed the identity quaternion and upright gravity while the journal
++    /// said the robot was down): quaternion and gyro in `imu`, gravity and the fall verdict in
++    /// `safety` — on the Feetech bus, with torque off, nothing enabled.
++    #[tokio::test]
++    async fn the_state_stream_carries_the_host_imu_on_the_feetech_bus() {
++        let params = Params {
++            policy: params::PolicyParams {
++                enabled: false,
++                ..params::PolicyParams::default()
++            },
++            ..Params::default()
++        };
++        let s = Arc::new(RobotState::new(
++            &params,
++            &PathBuf::from("/nonexistent/robotd.toml"),
++            false,
++            false,
++        ));
++        let mut states = s.state_tx.subscribe();
++        let feed = Arc::new(duck_control::host_imu::ImuFeed::new());
++        // On its side: gravity along −y, a quarter turn about x.
++        let h = std::f64::consts::FRAC_1_SQRT_2;
++        let lying = duck_control::imu::ImuData {
++            gyro: [0.1, -0.2, 0.3],
++            gravity: [0.0, -0.997, -0.075],
++            quat: [h, h, 0.0, 0.0],
++        };
++        let publisher = {
++            let feed = Arc::clone(&feed);
++            let stop = Arc::clone(&s);
++            std::thread::spawn(move || {
++                let mut seq = 0;
++                while !stop.shutdown.load(Ordering::Relaxed) {
++                    seq += 1;
++                    feed.publish(
++                        duck_control::host_imu::HostSample {
++                            imu: lying,
++                            at: Instant::now(),
++                            seq,
++                        },
++                        true,
++                    );
++                    std::thread::sleep(Duration::from_millis(1));
++                }
++            })
++        };
++        let emu = feetech::emu::Emulator::new(&duck_control::model::JOINT_IDS);
++        let mut io = duck_control::feetech::FeetechIo::with_port(
++            emu,
++            duck_control::feetech::FeetechConfig {
++                read_timeout: Duration::from_millis(3),
++                ..Default::default()
++            },
++            Arc::default(),
++            feed,
++        );
++        assert!(io.census().unwrap().is_empty());
++        let handle = tokio::spawn(control_loop(
++            io,
++            Arc::clone(&s),
++            Arc::new(Intents::new()),
++            params,
++            PathBuf::from("/nonexistent/robotd.toml"),
++            Duration::from_millis(2),
++            noop_poweroff(),
++        ));
++        let mut last = None;
++        let deadline = Instant::now() + Duration::from_secs(5);
++        while Instant::now() < deadline {
++            let frame = tokio::time::timeout(Duration::from_secs(1), states.recv())
++                .await
++                .expect("a frame")
++                .expect("the stream stayed open");
++            let done = frame.safety.fallen;
++            last = Some(frame);
++            if done {
++                break;
++            }
++        }
++        s.shutdown.store(true, Ordering::Relaxed);
++        handle.await.unwrap();
++        publisher.join().unwrap();
++        let frame = last.unwrap();
++        let imu = frame.imu.expect("imu block");
++        assert_eq!(imu.quat, lying.quat);
++        assert_eq!(imu.gyro, lying.gyro);
++        assert_eq!(frame.safety.gravity, lying.gravity);
++        assert!(frame.safety.fallen, "lying on its side, past the debounce");
++    }
++
+     /// Measured velocity and load must reach the state stream.
+     ///
+     /// They arrive in the same twelve-byte block as position (`bus.rs`, register 124), so the
+-- 
+2.43.0
+

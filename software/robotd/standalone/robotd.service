@@ -1,0 +1,32 @@
+# robotd for the stand-alone duck (duck-brain P25, deploy/standalone/README.md). @DIR@ is put in by
+# install.sh. Everything it writes is in RAM: /run/duck (socket, lock, vet book), the journal (volatile,
+# see journald-duck.conf). It reads @DIR@ and writes nothing there.
+[Unit]
+Description=duck robotd (Feetech HD-1910, stand-alone)
+After=local-fs.target
+
+[Service]
+Type=simple
+WorkingDirectory=@DIR@
+Environment=DUCK_RUNTIME_DIR=/run/duck
+Environment=ORT_DYLIB_PATH=@DIR@/hear/libonnxruntime.so
+Environment=RUST_LOG=info
+RuntimeDirectory=duck
+RuntimeDirectoryPreserve=yes
+# --relax-at-start: comes up limp, all 15 read back. --pad-lost-relax 2: no twist from padd for 2 s
+# with torque on → relax (README: why 2). Picked up → relax comes from [pickup] model in robotd.toml (P26).
+# `--journal /tmp/duck/run.jsonl` for a tick journal (~124 kB/s into RAM, stops at 256 MiB).
+ExecStart=@DIR@/bin/robotd --params @DIR@/robotd.toml --socket /run/duck/robot.sock --vetbook /run/duck/vetbook.json --relax-at-start --pad-lost-relax 2
+# SIGTERM: the loop stops and torque comes off every servo (P22/P23).
+KillSignal=SIGTERM
+TimeoutStopSec=5
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/run/duck
+
+[Install]
+WantedBy=multi-user.target

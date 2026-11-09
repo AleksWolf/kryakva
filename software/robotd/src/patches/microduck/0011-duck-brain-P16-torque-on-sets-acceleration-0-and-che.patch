@@ -1,0 +1,895 @@
+From c6369b93bc68f931e782ed45ad65d75dbefbfa74 Mon Sep 17 00:00:00 2001
+From: duck-brain <duck-brain@localhost>
+Date: Sat, 17 Oct 2026 16:12:57 +0000
+Subject: [PATCH 11/11] duck-brain P16: torque-on sets acceleration 0 and
+ checks it by the internal goal (67)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A correction to P11 from the stand of 17.10.2026: "41 = 1, then 41 = 0
+under torque" left some servos reading 41 = 0 while their profile kept
+an acceleration of 1 — 150 ms before they moved, 6 of 14 starting
+60-95 ms late.
+
+Now, after torque (40 = 1) and speed (46 = 10000), on every torque-on:
+41 = 0 (read back), wait 20 ms, move the goal 3 counts off the present
+position and read the internal goal (67: two bytes, low first, like 42 —
+checked on the stand's 14 servos) for 10 ms — it must equal the new goal
+at once. A servo whose 67 lags gets 41 = 0 again, up to 5 times; one that
+still lags is logged as an error and reported in robot.health
+(`feetech.accel_stuck`), torque stays on. The goal then goes back to the
+present position. 41 = 1 is never written, and `robotctl servo write`
+refuses a nonzero 41.
+
+Torque comes on for the 14 joints the policy drives first, then for the
+mouth on its own (the policy has no action for it); if the mouth fails,
+the 14 come off again, as before. Each group logs its time and the
+41 = 0 rewrites per id ("torque-on done", group="joints" / "mouth"),
+and robot.health carries them: `feetech.torque_on_ms` (the 14),
+`feetech.mouth_torque_on_ms`, `feetech.servos[].accel_rewrites`.
+`robotctl servo torque all on` does the same and prints both.
+
+The emulator models the stuck acceleration (Servo::stuck_accel).
+---
+ duck-control/src/feetech.rs | 217 ++++++++++++++++++++++++++++++-
+ duck-ipc-proto/src/lib.rs   |  18 +++
+ feetech/src/emu.rs          |  25 +++-
+ feetech/src/lib.rs          | 250 ++++++++++++++++++++++++++++++++----
+ robotctl/src/servo.rs       |  76 ++++++++++-
+ robotd/src/feetech_bus.rs   |  11 +-
+ 6 files changed, 562 insertions(+), 35 deletions(-)
+
+diff --git a/duck-control/src/feetech.rs b/duck-control/src/feetech.rs
+index bc2bf5f..3f1f0db 100644
+--- a/duck-control/src/feetech.rs
++++ b/duck-control/src/feetech.rs
+@@ -29,7 +29,7 @@ use feetech::{Bus, Echo, Mismatch, Port, SerialPort, TorqueOn, reg};
+ use crate::host_imu::{ImuFeed, age};
+ use crate::imu::ImuData;
+ use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
+-use crate::model::{JOINT_IDS, JOINT_NAMES, NUM_JOINTS};
++use crate::model::{JOINT_IDS, JOINT_NAMES, MOUTH_INDEX, NUM_JOINTS};
+ 
+ /// Where the observation's joint velocity comes from (`[feetech] velocity`).
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -160,6 +160,11 @@ struct Stats {
+     torque: Option<bool>,
+     rewrites: u64,
+     write_failures: u64,
++    accel_stuck: Vec<u8>,
++    accel_rewrites: u64,
++    torque_on_time: Option<Duration>,
++    mouth_torque_on_time: Option<Duration>,
++    torque_on_rewrites: [u32; NUM_JOINTS],
+     counters: feetech::Counters,
+     imu_stale: ImuStale,
+     imu_age_last: Option<Duration>,
+@@ -199,6 +204,19 @@ pub struct FeetechSnapshot {
+     pub torque: Option<bool>,
+     pub rewrites: u64,
+     pub write_failures: u64,
++    /// Servos whose internal goal (67) did not follow the nudge at the last torque-on, after
++    /// every rewrite of 41 = 0 (duck-brain P16): they start late. Empty when all followed.
++    pub accel_stuck: Vec<u8>,
++    /// Rewrites of 41 = 0 the torque-ons have needed, in total.
++    pub accel_rewrites: u64,
++    /// How long the last torque-on took for the 14 joints the policy drives, the acceleration
++    /// check included, ms.
++    pub torque_on_ms: Option<f64>,
++    /// The same for the mouth, switched on after them on its own; `None` when the joints failed
++    /// and it was not tried.
++    pub mouth_torque_on_ms: Option<f64>,
++    /// Rewrites of 41 = 0 at the last torque-on, per joint (indexed as `JOINT_NAMES`).
++    pub torque_on_rewrites: [u32; NUM_JOINTS],
+     pub echoes: u64,
+     pub bad_packets: u64,
+     pub stray: u64,
+@@ -243,6 +261,11 @@ impl FeetechShared {
+             torque: s.torque,
+             rewrites: s.rewrites,
+             write_failures: s.write_failures,
++            accel_stuck: s.accel_stuck.clone(),
++            accel_rewrites: s.accel_rewrites,
++            torque_on_ms: s.torque_on_time.map(|d| d.as_secs_f64() * 1000.0),
++            mouth_torque_on_ms: s.mouth_torque_on_time.map(|d| d.as_secs_f64() * 1000.0),
++            torque_on_rewrites: s.torque_on_rewrites,
+             echoes: s.counters.echoes,
+             bad_packets: s.counters.bad_packets,
+             stray: s.counters.stray,
+@@ -426,6 +449,48 @@ impl<P: Port> FeetechIo<P> {
+     }
+ }
+ 
++/// One torque-on, in the journal: the acceleration check per servo (P16), then one line with the
++/// time and the 41 = 0 rewrites by id. `group` is "joints" (the 14 the policy drives) or "mouth".
++fn log_torque_on(group: &str, servos: usize, took: Duration, report: &feetech::TorqueOnReport) {
++    // A servo still ramping starts late, which the policy feels.
++    for &(id, n) in &report.accel_rewrites {
++        tracing::warn!(
++            id,
++            joint = joint_name(id),
++            rewrites = n,
++            "internal goal (67) lagged the nudge; 41 = 0 written again"
++        );
++    }
++    for &id in &report.accel_stuck {
++        tracing::error!(
++            id,
++            joint = joint_name(id),
++            "internal goal (67) still lags after every 41 = 0: this servo's profile keeps its acceleration and it will start late"
++        );
++    }
++    let by_id: Vec<String> = report
++        .accel_rewrites
++        .iter()
++        .map(|(id, n)| format!("{id}:{n}"))
++        .collect();
++    tracing::info!(
++        group,
++        servos,
++        ms = format!("{:.1}", took.as_secs_f64() * 1000.0),
++        rewrites_41_by_id = if by_id.is_empty() { "none".to_owned() } else { by_id.join(" ") },
++        stuck = ?report.accel_stuck,
++        ok = report.failed.is_empty(),
++        "torque-on done"
++    );
++}
++
++fn joint_name(id: u8) -> &'static str {
++    JOINT_IDS
++        .iter()
++        .position(|&j| j == id)
++        .map_or("?", |i| JOINT_NAMES[i])
++}
++
+ fn join(failed: &[Mismatch]) -> String {
+     failed
+         .iter()
+@@ -664,13 +729,60 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+             p: self.mapped_p(self.kp.unwrap_or(self.cfg.gain_ref)),
+             ..self.cfg.torque
+         };
++        // The 14 joints the policy drives first, then the mouth on its own: the policy has no
++        // action for the mouth, and the time that matters to walking is the 14's.
++        let mouth = JOINT_IDS[MOUTH_INDEX];
++        let joints: Vec<u8> = JOINT_IDS
++            .iter()
++            .copied()
++            .filter(|&id| id != mouth)
++            .collect();
+         let mut rewrites = 0u64;
+-        let failed = feetech::torque_on(&mut self.bus, &JOINT_IDS, &cfg, &mut |m, a| {
++        let mut note = |m: &Mismatch, a: u32| {
+             rewrites += 1;
+             Self::log_mismatch(m, a);
+-        })
+-        .map_err(|e| IoError::Bus(format!("torque on: {e}")))?;
++        };
++        let started = Instant::now();
++        let first = feetech::torque_on(&mut self.bus, &joints, &cfg, &mut note)
++            .map_err(|e| IoError::Bus(format!("torque on: {e}")))?;
++        let joints_took = started.elapsed();
++        log_torque_on("joints", joints.len(), joints_took, &first);
++        let mut failed = first.failed.clone();
++        let mut reports = vec![first];
++        let mut mouth_took = None;
++        if failed.is_empty() {
++            let started = Instant::now();
++            let second = feetech::torque_on(&mut self.bus, &[mouth], &cfg, &mut note)
++                .map_err(|e| IoError::Bus(format!("torque on: {e}")))?;
++            let took = started.elapsed();
++            log_torque_on("mouth", 1, took, &second);
++            mouth_took = Some(took);
++            if !second.failed.is_empty() {
++                // All or nothing, as before the split: the joints come off again.
++                let _ = feetech::torque_off(&mut self.bus, &joints, cfg.retries, &mut |_, _| {});
++                failed = second.failed.clone();
++            }
++            reports.push(second);
++        }
+         self.count_writes(&failed, rewrites);
++        let mut per_joint = [0u32; NUM_JOINTS];
++        let mut stuck = Vec::new();
++        for report in &reports {
++            for &(id, n) in &report.accel_rewrites {
++                if let Some(j) = JOINT_IDS.iter().position(|&x| x == id) {
++                    per_joint[j] = n;
++                }
++            }
++            stuck.extend_from_slice(&report.accel_stuck);
++        }
++        {
++            let mut s = self.shared.0.lock().unwrap();
++            s.torque_on_time = Some(joints_took);
++            s.mouth_torque_on_time = mouth_took;
++            s.torque_on_rewrites = per_joint;
++            s.accel_stuck = stuck;
++            s.accel_rewrites += per_joint.iter().map(|&n| u64::from(n)).sum::<u64>();
++        }
+         if failed.is_empty() {
+             self.cutoff = false;
+             self.low_ticks = 0;
+@@ -1101,4 +1213,101 @@ mod tests {
+         assert!((battery - 6.6).abs() < 1e-9, "{battery}");
+         assert_eq!(io.shared().snapshot().v_min, Some(5.9));
+     }
++
++    /// A servo whose profile keeps ramping is reported in the shared numbers; torque is on.
++    #[test]
++    fn a_stuck_acceleration_reaches_the_shared_numbers() {
++        let mut emu = Emulator::new(&JOINT_IDS);
++        emu.servo_mut(23).unwrap().internal_accel = 1;
++        emu.servo_mut(23).unwrap().stuck_accel = 99;
++        emu.servo_mut(31).unwrap().internal_accel = 1;
++        emu.servo_mut(31).unwrap().stuck_accel = 1;
++        let mut io = io(emu, quick());
++        io.set_torque(true).unwrap();
++        let snap = io.shared().snapshot();
++        assert_eq!(snap.accel_stuck, vec![23]);
++        assert_eq!(snap.accel_rewrites, 5 + 1, "23: five, 31: one");
++        let j = |id: u8| JOINT_IDS.iter().position(|&x| x == id).unwrap();
++        assert_eq!(
++            (
++                snap.torque_on_rewrites[j(23)],
++                snap.torque_on_rewrites[j(31)],
++                snap.torque_on_rewrites[j(10)]
++            ),
++            (5, 1, 0)
++        );
++        assert!(snap.torque_on_ms.is_some_and(|ms| ms > 0.0));
++        assert!(snap.mouth_torque_on_ms.is_some_and(|ms| ms > 0.0));
++        assert_eq!(snap.torque, Some(true));
++    }
++
++    /// The mouth is not one of the policy's 14 joints: it comes on after them, on its own, with
++    /// its own time and its own rewrites.
++    #[test]
++    fn the_mouth_comes_on_after_the_fourteen_on_its_own() {
++        let mut emu = Emulator::new(&JOINT_IDS);
++        emu.servo_mut(34).unwrap().internal_accel = 1;
++        emu.servo_mut(34).unwrap().stuck_accel = 2;
++        let mut io = io(emu, quick());
++        io.set_torque(true).unwrap();
++        let snap = io.shared().snapshot();
++        let j = |id: u8| JOINT_IDS.iter().position(|&x| x == id).unwrap();
++        assert_eq!(snap.torque_on_rewrites[j(34)], 2);
++        assert_eq!(snap.accel_rewrites, 2);
++        assert!(snap.accel_stuck.is_empty());
++        assert!(snap.torque_on_ms.is_some() && snap.mouth_torque_on_ms.is_some());
++        // Torque (40) = 1: one sync_write for the 14, then one for the mouth alone.
++        let log = &io.bus_mut().port_mut().log;
++        let torque_writes: Vec<usize> = log
++            .iter()
++            .enumerate()
++            .filter(|(_, e)| **e == (0xFE, 0x83, 40))
++            .map(|(k, _)| k)
++            .collect();
++        assert_eq!(torque_writes.len(), 2);
++        let emu = io.bus_mut().port_mut();
++        assert!(
++            JOINT_IDS
++                .iter()
++                .all(|&id| emu.servo(id).unwrap().get(40, 1) == 1)
++        );
++        assert!(
++            JOINT_IDS
++                .iter()
++                .all(|&id| !emu.servo(id).unwrap().accel_writes.contains(&1))
++        );
++    }
++
++    /// A mouth that will not take torque fails the whole torque-on: the 14 come off again.
++    #[test]
++    fn a_mouth_that_refuses_torque_takes_the_joints_off_again() {
++        let mut emu = Emulator::new(&JOINT_IDS);
++        emu.servo_mut(34).unwrap().refuse = Some(40);
++        let mut io = io(emu, quick());
++        assert!(io.set_torque(true).is_err());
++        let snap = io.shared().snapshot();
++        assert_eq!(snap.torque, Some(false));
++        assert!(snap.torque_on_ms.is_some() && snap.mouth_torque_on_ms.is_some());
++        let emu = io.bus_mut().port_mut();
++        assert!(
++            JOINT_IDS
++                .iter()
++                .all(|&id| emu.servo(id).unwrap().get(40, 1) == 0)
++        );
++    }
++
++    /// Joints that fail leave the mouth untouched, and untimed.
++    #[test]
++    fn failing_joints_never_try_the_mouth() {
++        let mut emu = Emulator::new(&JOINT_IDS);
++        emu.servo_mut(12).unwrap().refuse = Some(40);
++        let mut io = io(emu, quick());
++        assert!(io.set_torque(true).is_err());
++        let snap = io.shared().snapshot();
++        assert_eq!(snap.mouth_torque_on_ms, None);
++        // The mouth's torque limit (48) is never written, nor its acceleration (41).
++        let mouth = io.bus_mut().port_mut().servo(34).unwrap();
++        assert_eq!(mouth.get(48, 2), 0);
++        assert!(mouth.accel_writes.is_empty());
++    }
+ }
+diff --git a/duck-ipc-proto/src/lib.rs b/duck-ipc-proto/src/lib.rs
+index 88c8ea4..5cee01c 100644
+--- a/duck-ipc-proto/src/lib.rs
++++ b/duck-ipc-proto/src/lib.rs
+@@ -3764,6 +3764,21 @@ pub struct FeetechHealth {
+     /// Register writes that read back different and were rewritten; writes that never did.
+     pub rewrites: u64,
+     pub write_failures: u64,
++    /// Servos whose internal goal (67) did not follow the nudge at the last torque-on, after every
++    /// rewrite of 41 = 0 (duck-brain P16): their profile keeps an acceleration, they start late.
++    #[serde(default)]
++    pub accel_stuck: Vec<u8>,
++    /// Rewrites of 41 = 0 the torque-ons have needed, in total.
++    #[serde(default)]
++    pub accel_rewrites: u64,
++    /// How long the last torque-on took for the 14 joints the policy drives, the acceleration
++    /// check included, ms. Absent before the first.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub torque_on_ms: Option<f64>,
++    /// The same for the mouth, which is switched on after the 14, on its own (the policy has no
++    /// action for it). Absent when it was not tried because the joints failed.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub mouth_torque_on_ms: Option<f64>,
+     /// Our own bytes heard back, packets dropped for a bad checksum, answers nobody asked for.
+     pub echoes: u64,
+     pub bad_packets: u64,
+@@ -3783,6 +3798,9 @@ pub struct ServoHealth {
+     pub temp_c: Option<f64>,
+     /// The error byte of its last answer; 0 is none.
+     pub error: u8,
++    /// Rewrites of 41 = 0 it needed at the last torque-on (duck-brain P16); 0 is none.
++    #[serde(default)]
++    pub accel_rewrites: u32,
+ }
+ 
+ /// The control loop's rate and timing.
+diff --git a/feetech/src/emu.rs b/feetech/src/emu.rs
+index 07c4700..3fbf3b6 100644
+--- a/feetech/src/emu.rs
++++ b/feetech/src/emu.rs
+@@ -18,6 +18,13 @@ pub struct Servo {
+     pub ignore_writes: u32,
+     /// Never take a write to this register — a servo that will not, say, switch torque on.
+     pub refuse: Option<u8>,
++    /// The acceleration the motion profile actually uses, which is not always register 41: the
++    /// stand of 17.10.2026 found servos that read 41 = 0 and still ramp at 1 (duck-brain P16).
++    pub internal_accel: u8,
++    /// How many writes of 41 = 0 leave `internal_accel` where it was — that servo, modelled.
++    pub stuck_accel: u32,
++    /// Every value written to 41, in order — so a test can say 41 = 1 was never written.
++    pub accel_writes: Vec<u8>,
+ }
+ 
+ impl Servo {
+@@ -28,6 +35,9 @@ impl Servo {
+             silent: false,
+             ignore_writes: 0,
+             refuse: None,
++            internal_accel: 0,
++            stuck_accel: 0,
++            accel_writes: Vec::new(),
+         };
+         s.set(56, 2, 2048);
+         s.set(42, 2, 2048);
+@@ -57,10 +67,21 @@ impl Servo {
+         }
+         let a = usize::from(addr);
+         self.regs[a..a + data.len()].copy_from_slice(data);
+-        // Torque on: the servo is where it was told to be.
+-        if self.regs[40] == 1 {
++        if a <= 41 && a + data.len() > 41 {
++            self.accel_writes.push(self.regs[41]);
++            if self.regs[41] == 0 && self.stuck_accel > 0 {
++                self.stuck_accel -= 1;
++            } else {
++                self.internal_accel = self.regs[41];
++            }
++        }
++        // Torque on: the servo is where it was told to be — at once with no acceleration, so its
++        // internal goal (67) is the goal; with one, the profile has not moved yet.
++        if self.regs[40] == 1 && self.internal_accel == 0 {
+             self.regs[56] = self.regs[42];
+             self.regs[57] = self.regs[43];
++            self.regs[67] = self.regs[42];
++            self.regs[68] = self.regs[43];
+         }
+     }
+ }
+diff --git a/feetech/src/lib.rs b/feetech/src/lib.rs
+index 3367e29..cf49b90 100644
+--- a/feetech/src/lib.rs
++++ b/feetech/src/lib.rs
+@@ -50,6 +50,10 @@ pub mod reg {
+     pub const VOLTAGE: (u8, u8) = (62, 1);
+     pub const TEMPERATURE: (u8, u8) = (63, 1);
+     pub const CURRENT: (u8, u8) = (69, 2);
++    /// The internal goal — where the motion profile has the target now (duck-brain P16, stand of
++    /// 17.10.2026). Two bytes, low first, like the goal 42: read as 16 bits on all 14 servos of the
++    /// stand, it equals a just-written goal within 1–2 ms once no acceleration is left.
++    pub const INTERNAL_GOAL: (u8, u8) = (67, 2);
+ }
+ 
+ /// Position counts per turn; 2048 is the joint's zero.
+@@ -482,26 +486,53 @@ pub struct TorqueOn {
+     pub retries: u32,
+ }
+ 
+-/// Torque on, the duck-brain way (measurements of 13–14.10.2026), on every servo in `ids`:
++/// What a torque-on did, beyond "it failed".
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct TorqueOnReport {
++    /// Registers that never read back right; the sequence stopped at the first such step, and
++    /// torque is off again if it had been switched on. Empty is success.
++    pub failed: Vec<Mismatch>,
++    /// Servos whose internal goal (67) still did not follow a nudge after every rewrite of 41 = 0:
++    /// their profile is still accelerating, so they start late. Torque is on; this is a report.
++    pub accel_stuck: Vec<u8>,
++    /// Rewrites of 41 = 0 it took, per servo that needed any.
++    pub accel_rewrites: Vec<(u8, u32)>,
++}
++
++/// After 41 = 0, the profile has to settle before the nudge says anything (duck-brain P16).
++pub const ACCEL_SETTLE: Duration = Duration::from_millis(20);
++/// How long the internal goal has to follow the nudge.
++pub const ACCEL_WINDOW: Duration = Duration::from_millis(10);
++/// The nudge, in position counts (≈ 0.26°).
++pub const NUDGE: u16 = 3;
++
++/// Torque on, the duck-brain way, on every servo in `ids`:
+ ///
+ /// 0. goal (42) = present position (56), so torque coming on moves nothing;
+ /// 1. P (50) and D (51), RAM;
+ /// 2. torque limit (48), then speed (46);
+ /// 3. torque (40) = 1;
+-/// 4. acceleration (41) = 1, then 0 — *under* torque: written with torque off, some servos keep
+-///    the old profile and travel on it for 0.3 s.
++/// 4. acceleration (41) = 0 and its check (duck-brain P16, stand of 17.10.2026): wait
++///    [`ACCEL_SETTLE`], move the goal [`NUDGE`] counts off the present position, and read the
++///    internal goal (67) for [`ACCEL_WINDOW`] — with no acceleration it equals the new goal at
++///    once. A servo whose 67 lags gets 41 = 0 again, up to `retries` times, then is reported in
++///    [`TorqueOnReport::accel_stuck`]; the goal goes back to the present position either way.
+ ///
+-/// Every write is read back and rewritten up to `retries` times. A step that still disagrees
+-/// stops the sequence; if torque was already on by then it is taken off again, so the caller's
+-/// "it failed" and the servos agree. Returns what never read back right — empty is success.
++/// 41 = 1 is never written: the old "41 = 1, then 0" left some servos reading 41 = 0 while still
++/// ramping at 1 — 150 ms before they moved, 6 of 14 starting 60–95 ms late.
++///
++/// Every register write is read back and rewritten up to `retries` times. A step that still
++/// disagrees stops the sequence; if torque was already on by then it is taken off again, so the
++/// caller's "it failed" and the servos agree.
+ pub fn torque_on<P: Port>(
+     bus: &mut Bus<P>,
+     ids: &[u8],
+     cfg: &TorqueOn,
+     on_mismatch: &mut dyn FnMut(&Mismatch, u32),
+-) -> io::Result<Vec<Mismatch>> {
++) -> io::Result<TorqueOnReport> {
++    let mut report = TorqueOnReport::default();
+     let present = bus.sync_read(ids, reg::POSITION.0, reg::POSITION.1)?;
+-    let mut failed: Vec<Mismatch> = ids
++    report.failed = ids
+         .iter()
+         .zip(&present)
+         .filter(|(_, s)| s.is_none())
+@@ -512,38 +543,154 @@ pub fn torque_on<P: Port>(
+             read: None,
+         })
+         .collect();
+-    if !failed.is_empty() {
+-        return Ok(failed);
++    if !report.failed.is_empty() {
++        return Ok(report);
+     }
+     let goals: Vec<u16> = present
+         .iter()
+         .map(|s| from_le(&s.as_ref().expect("checked above").params))
+         .collect();
+     let all = |v: u16| vec![v; ids.len()];
+-    let steps: [((u8, u8), Vec<u16>); 8] = [
+-        (reg::GOAL, goals),
++    let steps: [((u8, u8), Vec<u16>); 6] = [
++        (reg::GOAL, goals.clone()),
+         (reg::P, all(u16::from(cfg.p))),
+         (reg::D, all(u16::from(cfg.d))),
+         (reg::TORQUE_LIMIT, all(cfg.torque_limit)),
+         (reg::SPEED, all(cfg.speed)),
+         (reg::TORQUE, all(1)),
+-        (reg::ACCELERATION, all(1)),
+-        (reg::ACCELERATION, all(0)),
+     ];
+     let mut torque_written = false;
+     for (register, values) in steps {
+         torque_written |= register == reg::TORQUE;
+         let result = write_verified(bus, ids, register, &values, cfg.retries, on_mismatch)?;
+-        failed = result.into_iter().filter_map(Result::err).collect();
+-        if !failed.is_empty() {
++        report.failed = result.into_iter().filter_map(Result::err).collect();
++        if !report.failed.is_empty() {
+             if torque_written {
+                 // Some servos may have torque by now; leave every one of them off.
+                 let _ = write_verified(bus, ids, reg::TORQUE, &all(0), cfg.retries, &mut |_, _| {});
+             }
+-            return Ok(failed);
++            return Ok(report);
++        }
++    }
++    match accel_zero(bus, ids, &goals, cfg.retries, on_mismatch)? {
++        Ok((stuck, rewrites)) => {
++            report.accel_stuck = stuck;
++            report.accel_rewrites = rewrites;
++        }
++        Err(failed) => {
++            report.failed = failed;
++            let _ = write_verified(bus, ids, reg::TORQUE, &all(0), cfg.retries, &mut |_, _| {});
++        }
++    }
++    Ok(report)
++}
++
++/// Step 4 of [`torque_on`]: 41 = 0, settle, nudge, watch 67, put the goal back. `Err` when a
++/// register write itself never read back (41 or the goal), as for every other step.
++#[allow(clippy::type_complexity)]
++fn accel_zero<P: Port>(
++    bus: &mut Bus<P>,
++    ids: &[u8],
++    present: &[u16],
++    retries: u32,
++    on_mismatch: &mut dyn FnMut(&Mismatch, u32),
++) -> io::Result<Result<(Vec<u8>, Vec<(u8, u32)>), Vec<Mismatch>>> {
++    // Toward the middle of the range, so the nudge never runs off its end.
++    let nudged: Vec<u16> = present
++        .iter()
++        .map(|&p| {
++            if p + NUDGE <= 4095 {
++                p + NUDGE
++            } else {
++                p - NUDGE
++            }
++        })
++        .collect();
++    let mut pending: Vec<usize> = (0..ids.len()).collect();
++    let mut tries: Vec<u32> = vec![0; ids.len()];
++    for attempt in 0..=retries {
++        let sub_ids: Vec<u8> = pending.iter().map(|&k| ids[k]).collect();
++        let pick = |v: &[u16]| pending.iter().map(|&k| v[k]).collect::<Vec<_>>();
++        let failed: Vec<Mismatch> = write_verified(
++            bus,
++            &sub_ids,
++            reg::ACCELERATION,
++            &vec![0; sub_ids.len()],
++            retries,
++            on_mismatch,
++        )?
++        .into_iter()
++        .filter_map(Result::err)
++        .collect();
++        if !failed.is_empty() {
++            return Ok(Err(failed));
++        }
++        std::thread::sleep(ACCEL_SETTLE);
++        let target = pick(&nudged);
++        let bytes: Vec<(u8, Vec<u8>)> = sub_ids
++            .iter()
++            .zip(&target)
++            .map(|(&id, &g)| (id, le(g, 2)))
++            .collect();
++        let refs: Vec<(u8, &[u8])> = bytes.iter().map(|(id, b)| (*id, b.as_slice())).collect();
++        bus.sync_write(reg::GOAL.0, reg::GOAL.1, &refs)?;
++        let deadline = Instant::now() + ACCEL_WINDOW;
++        let mut followed = vec![false; sub_ids.len()];
++        loop {
++            let ask: Vec<usize> = (0..sub_ids.len()).filter(|&i| !followed[i]).collect();
++            let ask_ids: Vec<u8> = ask.iter().map(|&i| sub_ids[i]).collect();
++            let back = bus.sync_read(&ask_ids, reg::INTERNAL_GOAL.0, reg::INTERNAL_GOAL.1)?;
++            for (slot, &i) in ask.iter().enumerate() {
++                if back[slot]
++                    .as_ref()
++                    .is_some_and(|s| from_le(&s.params) == target[i])
++                {
++                    followed[i] = true;
++                }
++            }
++            if followed.iter().all(|&f| f) || Instant::now() >= deadline {
++                break;
++            }
++        }
++        // The goal back where the servo was, checked like every write.
++        let failed: Vec<Mismatch> = write_verified(
++            bus,
++            &sub_ids,
++            reg::GOAL,
++            &pick(present),
++            retries,
++            on_mismatch,
++        )?
++        .into_iter()
++        .filter_map(Result::err)
++        .collect();
++        if !failed.is_empty() {
++            return Ok(Err(failed));
++        }
++        let still: Vec<usize> = pending
++            .iter()
++            .zip(&followed)
++            .filter(|(_, f)| !**f)
++            .map(|(&k, _)| k)
++            .collect();
++        pending = still;
++        if pending.is_empty() {
++            break;
++        }
++        if attempt < retries {
++            for &k in &pending {
++                tries[k] += 1;
++            }
+         }
+     }
+-    Ok(failed)
++    let stuck = pending.iter().map(|&k| ids[k]).collect();
++    let rewrites = ids
++        .iter()
++        .zip(&tries)
++        .filter(|(_, n)| **n > 0)
++        .map(|(&id, &n)| (id, n))
++        .collect();
++    Ok(Ok((stuck, rewrites)))
+ }
+ 
+ /// Torque off (40 = 0) on every servo in `ids`, read back like any other write. Nothing else is
+@@ -694,8 +841,8 @@ mod tests {
+         emu.servo_mut(12).unwrap().set(56, 2, 2500);
+         emu.servo_mut(12).unwrap().set(42, 2, 1000); // a stale goal from before
+         let mut b = bus(emu);
+-        let failed = torque_on(&mut b, &[12, 13], &TORQUE, &mut |_, _| {}).unwrap();
+-        assert!(failed.is_empty(), "{failed:?}");
++        let report = torque_on(&mut b, &[12, 13], &TORQUE, &mut |_, _| {}).unwrap();
++        assert_eq!(report, TorqueOnReport::default(), "clean, no rewrites");
+         let emu = b.port_mut();
+         let s = emu.servo(12).unwrap();
+         assert_eq!(s.get(42, 2), 2500, "goal = present before torque");
+@@ -705,14 +852,20 @@ mod tests {
+             (32, 40, 1000, 10000)
+         );
+         assert_eq!((s.get(40, 1), s.get(41, 1)), (1, 0));
+-        // The sync writes, by register, in order, none repeated.
++        assert_eq!(s.accel_writes, vec![0], "41 = 0 once, 41 = 1 never");
++        assert_eq!(
++            s.get(67, 2),
++            2500,
++            "the internal goal back at the present position"
++        );
++        // The sync writes, by register, in order: … torque, 41 = 0, the nudge, the goal back.
+         let order: Vec<u8> = emu
+             .log
+             .iter()
+             .filter(|(_, i, _)| *i == SYNC_WRITE)
+             .map(|(_, _, addr)| *addr)
+             .collect();
+-        assert_eq!(order, vec![42, 50, 51, 48, 46, 40, 41, 41]);
++        assert_eq!(order, vec![42, 50, 51, 48, 46, 40, 41, 42, 42]);
+     }
+ 
+     /// A servo that will not take torque leaves the whole set off.
+@@ -727,7 +880,8 @@ mod tests {
+                 retries += 1;
+             }
+         })
+-        .unwrap();
++        .unwrap()
++        .failed;
+         assert_eq!(failed.len(), 1);
+         assert_eq!((failed[0].id, failed[0].addr), (13, 40));
+         assert_eq!(retries, 6, "the first write and five rewrites");
+@@ -744,8 +898,56 @@ mod tests {
+         let mut emu = Emulator::new(&[12, 13]);
+         emu.servo_mut(13).unwrap().silent = true;
+         let mut b = bus(emu);
+-        let failed = torque_on(&mut b, &[12, 13], &TORQUE, &mut |_, _| {}).unwrap();
++        let failed = torque_on(&mut b, &[12, 13], &TORQUE, &mut |_, _| {})
++            .unwrap()
++            .failed;
+         assert_eq!(failed.iter().map(|m| m.id).collect::<Vec<_>>(), vec![13]);
+         assert_eq!(b.port_mut().servo(12).unwrap().get(40, 1), 0);
+     }
++
++    /// A servo that reads 41 = 0 but keeps ramping (the stand's 17.10 servos): its internal goal
++    /// lags the nudge, so 41 = 0 goes again until 67 follows; the goal ends where it started.
++    #[test]
++    fn a_servo_whose_profile_still_ramps_gets_41_0_again_until_67_follows() {
++        let mut emu = Emulator::new(&[12, 13]);
++        emu.servo_mut(13).unwrap().set(56, 2, 3000);
++        emu.servo_mut(13).unwrap().internal_accel = 1;
++        emu.servo_mut(13).unwrap().stuck_accel = 2; // the first two 41 = 0 do not take
++        let mut b = bus(emu);
++        let report = torque_on(&mut b, &[12, 13], &TORQUE, &mut |_, _| {}).unwrap();
++        assert!(
++            report.failed.is_empty() && report.accel_stuck.is_empty(),
++            "{report:?}"
++        );
++        assert_eq!(report.accel_rewrites, vec![(13, 2)]);
++        let s = b.port_mut().servo(13).unwrap();
++        assert_eq!(s.accel_writes, vec![0, 0, 0]);
++        assert_eq!((s.get(42, 2), s.internal_accel), (3000, 0));
++        assert_eq!(
++            b.port_mut().servo(12).unwrap().accel_writes,
++            vec![0],
++            "12 was fine the first time"
++        );
++    }
++
++    /// One that never lets go is reported after 1 + 5 tries, with torque on and the goal back.
++    #[test]
++    fn a_servo_that_never_follows_is_reported_with_torque_on() {
++        let mut emu = Emulator::new(&[12, 13]);
++        emu.servo_mut(13).unwrap().set(56, 2, 4095);
++        emu.servo_mut(13).unwrap().internal_accel = 1;
++        emu.servo_mut(13).unwrap().stuck_accel = 99;
++        let mut b = bus(emu);
++        let report = torque_on(&mut b, &[12, 13], &TORQUE, &mut |_, _| {}).unwrap();
++        assert!(report.failed.is_empty());
++        assert_eq!(report.accel_stuck, vec![13]);
++        let s = b.port_mut().servo(13).unwrap();
++        assert_eq!(s.accel_writes.len(), 6, "the first write and five more");
++        assert!(s.accel_writes.iter().all(|&v| v == 0));
++        assert_eq!(
++            (s.get(40, 1), s.get(42, 2)),
++            (1, 4095),
++            "torque on, goal back (nudged down at the end of the range)"
++        );
++    }
+ }
+diff --git a/robotctl/src/servo.rs b/robotctl/src/servo.rs
+index ab40492..b7aa5e2 100644
+--- a/robotctl/src/servo.rs
++++ b/robotctl/src/servo.rs
+@@ -52,7 +52,8 @@ pub(super) enum ServoCommand {
+         eeprom: bool,
+     },
+     /// Torque on or off, for one id or `all`. On is robotd's verified sequence: goal = present,
+-    /// P/D, torque limit, speed, torque, acceleration 1 then 0.
++    /// P/D, torque limit, speed, torque, acceleration 0 checked by the internal goal (67); `all`
++    /// does the 14 joints the policy drives, then the mouth on its own, timed apart.
+     Torque {
+         /// A joint id, or `all`.
+         target: String,
+@@ -87,6 +88,7 @@ fn width(addr: u8) -> u8 {
+         reg::VOLTAGE,
+         reg::TEMPERATURE,
+         reg::CURRENT,
++        reg::INTERNAL_GOAL,
+     ]
+     .iter()
+     .find(|(a, _)| *a == addr)
+@@ -198,6 +200,14 @@ pub(super) fn run(args: &BusArgs, command: ServoCommand) -> Result<()> {
+             len,
+             eeprom,
+         } => {
++            // 41 = 1 is never written (duck-brain P16): some servos then keep ramping at 1 with 41
++            // reading 0.
++            if addr == reg::ACCELERATION.0 && value != 0 {
++                return Err(Failure::new(
++                    exit::USAGE,
++                    "reg 41 (acceleration) is only ever 0 on this robot — nonzero leaves some servos ramping".into(),
++                ));
++            }
+             if addr < 40 && !eeprom {
+                 return Err(Failure::new(
+                     exit::USAGE,
+@@ -251,11 +261,69 @@ pub(super) fn run(args: &BusArgs, command: ServoCommand) -> Result<()> {
+                     speed: p.feetech.speed,
+                     retries: p.feetech.write_retries,
+                 };
+-                feetech::torque_on(&mut bus, &ids, &cfg, &mut report)
++                // As robotd does it: the 14 joints the policy drives, then the mouth on its own.
++                let groups: Vec<(&str, Vec<u8>)> = if target == "all" {
++                    let (mouth, legs_head): (Vec<_>, Vec<_>) =
++                        joints().partition(|(_, name)| *name == "mouth");
++                    vec![
++                        ("joints", legs_head.into_iter().map(|(id, _)| id).collect()),
++                        ("mouth", mouth.into_iter().map(|(id, _)| id).collect()),
++                    ]
++                } else {
++                    vec![("servo", ids.clone())]
++                };
++                let mut failed = Vec::new();
++                let mut done: Vec<u8> = Vec::new();
++                for (group, group_ids) in &groups {
++                    let started = std::time::Instant::now();
++                    let r = feetech::torque_on(&mut bus, group_ids, &cfg, &mut report)
++                        .map_err(io_err)?;
++                    println!(
++                        "torque-on {group}: {:.1} ms for {} servo(s); 41 = 0 rewrites: {}",
++                        started.elapsed().as_secs_f64() * 1000.0,
++                        group_ids.len(),
++                        if r.accel_rewrites.is_empty() {
++                            "none".to_owned()
++                        } else {
++                            r.accel_rewrites
++                                .iter()
++                                .map(|(id, n)| format!("{id}:{n}"))
++                                .collect::<Vec<_>>()
++                                .join(" ")
++                        }
++                    );
++                    // The acceleration check (P16): 41 = 0, nudge 3 counts, 67 must follow.
++                    for (id, n) in &r.accel_rewrites {
++                        eprintln!(
++                            "id {id}: internal goal (67) lagged; 41 = 0 written {n} more time(s)"
++                        );
++                    }
++                    if !r.accel_stuck.is_empty() {
++                        eprintln!(
++                            "!! {:?}: internal goal (67) still lags after every 41 = 0 — these servos keep an acceleration and start late",
++                            r.accel_stuck
++                        );
++                    }
++                    if !r.failed.is_empty() {
++                        failed = r.failed;
++                        // All or nothing: what came on before this group goes off again.
++                        if !done.is_empty() {
++                            let _ = feetech::torque_off(
++                                &mut bus,
++                                &done,
++                                p.feetech.write_retries,
++                                &mut |_, _| {},
++                            );
++                        }
++                        break;
++                    }
++                    done.extend(group_ids);
++                }
++                failed
+             } else {
+                 feetech::torque_off(&mut bus, &ids, p.feetech.write_retries, &mut report)
+-            }
+-            .map_err(io_err)?;
++                    .map_err(io_err)?
++            };
+             if failed.is_empty() {
+                 println!("torque {}: {ids:?}", if on { "on" } else { "off" });
+             } else {
+diff --git a/robotd/src/feetech_bus.rs b/robotd/src/feetech_bus.rs
+index ea3b65e..9bc6fa5 100644
+--- a/robotd/src/feetech_bus.rs
++++ b/robotd/src/feetech_bus.rs
+@@ -155,6 +155,10 @@ pub fn health(shared: &FeetechShared) -> proto::FeetechHealth {
+         torque: s.torque,
+         rewrites: s.rewrites,
+         write_failures: s.write_failures,
++        accel_stuck: s.accel_stuck.clone(),
++        accel_rewrites: s.accel_rewrites,
++        torque_on_ms: s.torque_on_ms,
++        mouth_torque_on_ms: s.mouth_torque_on_ms,
+         echoes: s.echoes,
+         bad_packets: s.bad_packets,
+         stray: s.stray,
+@@ -167,6 +171,7 @@ pub fn health(shared: &FeetechShared) -> proto::FeetechHealth {
+                 volts: s.volts[j],
+                 temp_c: s.temps_c[j],
+                 error: s.errors[j],
++                accel_rewrites: s.torque_on_rewrites[j],
+             })
+             .collect(),
+     }
+@@ -176,7 +181,11 @@ pub fn health(shared: &FeetechShared) -> proto::FeetechHealth {
+ pub fn host_imu_health(feed: &ImuFeed) -> proto::HostImuHealth {
+     let s = feed.status();
+     proto::HostImuHealth {
+-        device: if feed.is_static() { Some("--static-imu".into()) } else { s.device },
++        device: if feed.is_static() {
++            Some("--static-imu".into())
++        } else {
++            s.device
++        },
+         error: s.error,
+         ready: feed.ready(),
+         poll_hz: feed.poll_hz(),
+-- 
+2.43.0
+

@@ -1,0 +1,239 @@
+From 1a5f6fdb205ee23f2baea8ddc4189c0303ef8758 Mon Sep 17 00:00:00 2001
+From: duck-brain <duck-brain@localhost>
+Date: Sat, 17 Oct 2026 09:15:07 +0000
+Subject: [PATCH 09/10] duck-brain P14: the tick journal and the vet book reach
+ the SD card in batches
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The duck-brain board keeps its card for years and writes it as little as
+it can (journald volatile, noatime, a read-only root; docs/board.md §16
+in duck-brain). robotd's own regular writes:
+
+- the tick journal (P13) collected in memory (up to 16 MiB) and written
+  and fdatasync'd once per `--journal-flush-s` (180 s by default), or
+  when the buffer fills, and at the end — not a flush every second;
+- the vet book saved every 5 minutes instead of every minute; it is
+  still written when robotd stops (shutdown, low-battery power-off).
+---
+ robotd/src/journal.rs | 82 ++++++++++++++++++++++++++++++++++++-------
+ robotd/src/main.rs    | 19 ++++++----
+ robotd/src/vetbook.rs |  7 ++--
+ 3 files changed, 88 insertions(+), 20 deletions(-)
+
+diff --git a/robotd/src/journal.rs b/robotd/src/journal.rs
+index ceceef5..4241e86 100644
+--- a/robotd/src/journal.rs
++++ b/robotd/src/journal.rs
+@@ -10,6 +10,11 @@
+ //! Written from a thread of its own through a bounded queue: the control thread formats a line
+ //! and hands it over, and never waits on a disk. A full queue drops the line and counts it; the
+ //! count is written at the end, so a journal with holes says so.
++//!
++//! **To the card in batches** (duck-brain P14): lines collect in memory and go to the file, and
++//! through `fdatasync` to the card, every `--journal-flush-s` seconds (180 by default) or when
++//! [`BUFFER`] fills, whichever is first — and at the end. A power cut loses at most that batch;
++//! the SD card sees a few large writes instead of one every second.
+ 
+ use std::io::Write;
+ use std::path::Path;
+@@ -18,6 +23,13 @@ use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+ /// About ten seconds of ticks at 50 Hz.
+ const QUEUE: usize = 512;
+ 
++/// What a batch may hold before it goes out early: ~2 minutes of journal at the ~124 kB/s an
++/// emulator run measured.
++pub const BUFFER: usize = 16 << 20;
++
++/// The default batch period.
++pub const FLUSH_EVERY: std::time::Duration = std::time::Duration::from_secs(180);
++
+ pub struct Journal {
+     tx: Option<SyncSender<String>>,
+     thread: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+@@ -26,26 +38,42 @@ pub struct Journal {
+ }
+ 
+ impl Journal {
+-    /// Create `path` (truncating) and write `header` as its first line.
+-    pub fn open(path: &Path, header: &serde_json::Value) -> std::io::Result<Self> {
++    /// Create `path` (truncating) and write `header` as its first line; then a batch to the card
++    /// every `flush_every`.
++    pub fn open(
++        path: &Path,
++        header: &serde_json::Value,
++        flush_every: std::time::Duration,
++    ) -> std::io::Result<Self> {
+         let file = std::fs::File::create(path)?;
+-        let mut out = std::io::BufWriter::with_capacity(1 << 16, file);
++        let mut out = std::io::BufWriter::with_capacity(BUFFER, file);
+         serde_json::to_writer(&mut out, header)?;
+         out.write_all(b"\n")?;
+-        out.flush()?;
++        batch(&mut out)?;
+         let (tx, rx) = sync_channel::<String>(QUEUE);
+         let thread = std::thread::Builder::new()
+             .name("journal".into())
+             .spawn(move || {
+-                for (n, line) in rx.iter().enumerate() {
+-                    out.write_all(line.as_bytes())?;
+-                    out.write_all(b"\n")?;
+-                    // Once a second, so a crash loses little and a reader can follow along.
+-                    if n % 50 == 49 {
+-                        out.flush()?;
++                use std::sync::mpsc::RecvTimeoutError;
++                let mut due = std::time::Instant::now() + flush_every;
++                loop {
++                    let wait = due.saturating_duration_since(std::time::Instant::now());
++                    match rx.recv_timeout(wait) {
++                        Ok(line) => {
++                            // A full buffer goes to the file by itself (BufWriter); the
++                            // fdatasync waits for the batch's time.
++                            out.write_all(line.as_bytes())?;
++                            out.write_all(b"\n")?;
++                        }
++                        Err(RecvTimeoutError::Timeout) => {}
++                        Err(RecvTimeoutError::Disconnected) => break,
++                    }
++                    if std::time::Instant::now() >= due {
++                        batch(&mut out)?;
++                        due = std::time::Instant::now() + flush_every;
+                     }
+                 }
+-                out.flush()
++                batch(&mut out)
+             })?;
+         Ok(Self {
+             tx: Some(tx),
+@@ -69,6 +97,12 @@ impl Journal {
+     }
+ }
+ 
++/// Everything collected so far to the file, and the file to the card.
++fn batch(out: &mut std::io::BufWriter<std::fs::File>) -> std::io::Result<()> {
++    out.flush()?;
++    out.get_ref().sync_data()
++}
++
+ impl Drop for Journal {
+     fn drop(&mut self) {
+         if let Some(tx) = self.tx.take() {
+@@ -102,7 +136,8 @@ mod tests {
+         let path = dir.path().join("j.jsonl");
+         let x: f32 = 0.1;
+         {
+-            let mut j = Journal::open(&path, &serde_json::json!({ "journal": 1 })).unwrap();
++            let mut j =
++                Journal::open(&path, &serde_json::json!({ "journal": 1 }), FLUSH_EVERY).unwrap();
+             j.write(&serde_json::json!({ "obs": [x, -1.0e-7f32, f32::MIN_POSITIVE] }));
+         }
+         let text = std::fs::read_to_string(&path).unwrap();
+@@ -118,4 +153,27 @@ mod tests {
+         assert_eq!(lines[2]["end"]["written"], 1);
+         assert_eq!(lines[2]["end"]["dropped"], 0);
+     }
++
++    /// Lines reach the file in batches: not before the period, all of them once it has passed.
++    #[test]
++    fn lines_go_to_the_file_in_batches() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("j.jsonl");
++        let lines = |p: &Path| std::fs::read_to_string(p).unwrap().lines().count();
++        let mut j = Journal::open(
++            &path,
++            &serde_json::json!({ "journal": 1 }),
++            std::time::Duration::from_millis(400),
++        )
++        .unwrap();
++        for i in 0..10 {
++            j.write(&serde_json::json!({ "tick": i }));
++        }
++        std::thread::sleep(std::time::Duration::from_millis(100));
++        assert_eq!(lines(&path), 1, "only the header before the first batch");
++        std::thread::sleep(std::time::Duration::from_millis(500));
++        assert_eq!(lines(&path), 11, "the batch went out on time");
++        drop(j);
++        assert_eq!(lines(&path), 12, "and the end line at the end");
++    }
+ }
+diff --git a/robotd/src/main.rs b/robotd/src/main.rs
+index a2c341e..db7e7b8 100644
+--- a/robotd/src/main.rs
++++ b/robotd/src/main.rs
+@@ -310,6 +310,11 @@ struct Args {
+     #[arg(long)]
+     journal: Option<PathBuf>,
+ 
++    /// How often the tick journal goes to the card, seconds (duck-brain P14): lines collect in
++    /// memory and are written and synced in one batch, not one line at a time.
++    #[arg(long, default_value_t = journal::FLUSH_EVERY.as_secs())]
++    journal_flush_s: u64,
++
+     #[command(subcommand)]
+     command: Option<Command>,
+ }
+@@ -648,8 +653,9 @@ struct RobotState {
+     feetech: std::sync::OnceLock<Arc<duck_control::feetech::FeetechShared>>,
+     /// The host-read body IMU's hand-off, on a Feetech robot (duck-brain P11/P12).
+     host_imu: std::sync::OnceLock<Arc<duck_control::host_imu::ImuFeed>>,
+-    /// Where the control loop writes its tick journal, when asked (`--journal`, duck-brain P13).
+-    journal_path: std::sync::OnceLock<PathBuf>,
++    /// Where the control loop writes its tick journal, when asked (`--journal`, duck-brain P13), and
++    /// how often it goes to the card (P14).
++    journal_path: std::sync::OnceLock<(PathBuf, Duration)>,
+     /// Why the policy is not loaded, if it is not. Set once at startup; the loop keeps
+     /// running and holds the pose, so a broken bundle is a rollback rather than a crash.
+     policy_error: ArcSwapOption<String>,
+@@ -1133,7 +1139,8 @@ async fn main() -> ExitCode {
+     });
+     state.vetbook = vetbook::Book::open(vetbook_path, env!("CARGO_PKG_VERSION"));
+     if let Some(path) = args.journal.clone() {
+-        let _ = state.journal_path.set(path);
++        let every = Duration::from_secs(args.journal_flush_s.max(1));
++        let _ = state.journal_path.set((path, every));
+     }
+     let state = Arc::new(state);
+ 
+@@ -2294,7 +2301,7 @@ async fn control_loop<T: RobotIo>(
+     // The tick journal (duck-brain P13), when `--journal` asked for one.
+     let journal_started = Instant::now();
+     let mut journal_tick = 0u64;
+-    let mut journal = state.journal_path.get().and_then(|path| {
++    let mut journal = state.journal_path.get().and_then(|(path, every)| {
+         let header = serde_json::json!({
+             "journal": 1,
+             "robotd": env!("CARGO_PKG_VERSION"),
+@@ -2309,9 +2316,9 @@ async fn control_loop<T: RobotIo>(
+             "body_imu": params.body_imu,
+             "policy": params.policy,
+         });
+-        match journal::Journal::open(path, &header) {
++        match journal::Journal::open(path, &header, *every) {
+             Ok(j) => {
+-                tracing::warn!(path = %path.display(), "writing the tick journal");
++                tracing::warn!(path = %path.display(), every_s = every.as_secs(), "writing the tick journal, in batches");
+                 Some(j)
+             }
+             Err(e) => {
+diff --git a/robotd/src/vetbook.rs b/robotd/src/vetbook.rs
+index 28af192..7fc3f7b 100644
+--- a/robotd/src/vetbook.rs
++++ b/robotd/src/vetbook.rs
+@@ -30,8 +30,11 @@ pub const DEFAULT_PATH: &str = "/var/lib/robot/vetbook.json";
+ /// How often the loop reads the servos' latched alerts — see [`Tracker::alerts`].
+ pub const ALERT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+ 
+-/// How often the book is written to disk.
+-pub const SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
++/// How often the book is written to disk. Five minutes in the duck-brain build (P14), not one: the
++/// book is also written when robotd stops — a shutdown, a low-battery power-off — so only a power
++/// cut loses anything, and then at most five minutes of counting, against an SD card written once
++/// a minute for the life of the robot.
++pub const SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+ 
+ /// A first reading this far above the last saved one means the pack was charged in between. The
+ /// smoothed voltage of a resting pack recovers by a few tenths after a walk; a charge moves it by
+-- 
+2.43.0
+

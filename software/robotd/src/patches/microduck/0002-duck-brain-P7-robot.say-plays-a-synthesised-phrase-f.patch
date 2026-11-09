@@ -1,0 +1,372 @@
+From 0374e367b7e235f90c08724907de22ec25585900 Mon Sep 17 00:00:00 2001
+From: duck-brain <duck-brain@localhost>
+Date: Sun, 4 Oct 2026 08:55:45 +0000
+Subject: [PATCH 2/4] duck-brain P7: robot.say plays a synthesised phrase from
+ [audio] say_dir
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The duck speaks (duck-brain design §21): its duck-say writes a wav into
+/run/duck-say and asks robotd to play it, through the same single-client
+PCM as the bank sounds (sound.rs: one playing child, a new sound cuts it).
+Only a .wav inside say_dir, resolved, is played; audio off refuses. btd
+refuses it over the radio; updater routes it with the other robot.* calls.
+---
+ btd/src/route.rs              |  3 ++
+ duck-ipc-proto/src/lib.rs     | 24 +++++++++++-
+ robotd-params/src/lib.rs      |  4 ++
+ robotd-params/src/registry.rs |  5 +++
+ robotd/src/intents.rs         | 16 ++++++++
+ robotd/src/main.rs            | 71 +++++++++++++++++++++++++++++++++++
+ robotd/src/sound.rs           | 18 ++++++++-
+ updater/src/ipc.rs            |  1 +
+ 8 files changed, 140 insertions(+), 2 deletions(-)
+
+diff --git a/btd/src/route.rs b/btd/src/route.rs
+index 9802c39..6bcc8eb 100644
+--- a/btd/src/route.rs
++++ b/btd/src/route.rs
+@@ -286,6 +286,9 @@ fn permits(call: &proto::Call) -> bool {
+         RobotTheremin(_) | RobotChorale(_) => false,
+         // The flashlight waits for the same app: an LED is no more urgent from a phone than a quack.
+         RobotFlashlight(_) => false,
++        // duck-brain patch P7: a phrase is a file on the robot, named by a process on the robot.
++        // Nothing for a phone to ask for.
++        RobotSay(_) => false,
+ 
+         // The chorale's own namespace is between `btd` and `robotd` — it is how this daemon is told
+         // what to advertise and how it reports what it heard. Not a client surface at all, so a
+diff --git a/duck-ipc-proto/src/lib.rs b/duck-ipc-proto/src/lib.rs
+index 7dcf09e..2c4aa17 100644
+--- a/duck-ipc-proto/src/lib.rs
++++ b/duck-ipc-proto/src/lib.rs
+@@ -736,6 +736,11 @@ pub mod method {
+     /// Switch the flashlight — the face's RGB LED — on, off, or over, in a colour. Discrete; send
+     /// as a request. Refused, with a reason, by a board without one (the Zero 3W, the simulator).
+     pub const ROBOT_FLASHLIGHT: &str = "robot.flashlight";
++    /// Speak: play a wav someone else synthesised (duck-brain patch P7, its `duck-say`) through
++    /// the same single-client PCM as the bank sounds — a new sound cuts it, it cuts a playing
++    /// one. Only a `.wav` inside `[audio] say_dir` is played; anything else, or a robot with
++    /// audio off, is refused with the reason.
++    pub const ROBOT_SAY: &str = "robot.say";
+     /// Pick the ToF theremin up, or put it down: the head's depth sensor becomes an
+     /// instrument, and the distance of a hand in front of the beak is the pitch — and the
+     /// mouth opening, which rises with it, so the note is visible as well as audible.
+@@ -1096,6 +1101,8 @@ pub enum Call {
+     RobotSound(SoundParams),
+     /// Switch the flashlight. See [`method::ROBOT_FLASHLIGHT`].
+     RobotFlashlight(FlashlightParams),
++    /// Play a synthesised phrase (patch P7). See [`method::ROBOT_SAY`].
++    RobotSay(SayParams),
+     /// Pick the ToF theremin up or put it down. Discrete; the answer is [`ThereminResult`].
+     RobotTheremin(ThereminParams),
+     /// Start or stop looking for other ducks to sing with. Discrete; the answer is
+@@ -1283,6 +1290,7 @@ impl Call {
+             Call::RobotMouth(_) => method::ROBOT_MOUTH,
+             Call::RobotSound(_) => method::ROBOT_SOUND,
+             Call::RobotFlashlight(_) => method::ROBOT_FLASHLIGHT,
++            Call::RobotSay(_) => method::ROBOT_SAY,
+             Call::RobotTheremin(_) => method::ROBOT_THEREMIN,
+             Call::RobotChorale(_) => method::ROBOT_CHORALE,
+             Call::ChoraleSubscribe => method::CHORALE_SUBSCRIBE,
+@@ -1480,6 +1488,7 @@ impl Call {
+             | Call::RobotMouth(_)
+             | Call::RobotSound(_)
+             | Call::RobotFlashlight(_)
++            | Call::RobotSay(_)
+             | Call::RobotTheremin(_)
+             | Call::RobotChorale(_)
+             | Call::RobotSetMode(_)
+@@ -1598,6 +1607,7 @@ impl Call {
+             Call::RobotSound(p) => encode(p),
+             Call::RobotFlashlight(p) => encode(p),
+             Call::RobotVetbookNote(p) => encode(p),
++            Call::RobotSay(p) => encode(p),
+             Call::RobotTheremin(p) => encode(p),
+             Call::RobotChorale(p) => encode(p),
+             Call::ChoraleBeaconSet(p) => encode(p),
+@@ -1693,6 +1703,7 @@ impl Call {
+             method::ROBOT_MOUTH => Call::RobotMouth(decode(params)?),
+             method::ROBOT_SOUND => Call::RobotSound(decode(params)?),
+             method::ROBOT_FLASHLIGHT => Call::RobotFlashlight(decode(params)?),
++            method::ROBOT_SAY => Call::RobotSay(decode(params)?),
+             method::ROBOT_THEREMIN => Call::RobotTheremin(decode(params)?),
+             method::ROBOT_CHORALE => Call::RobotChorale(decode(params)?),
+             method::CHORALE_SUBSCRIBE => Call::ChoraleSubscribe,
+@@ -1865,6 +1876,9 @@ pub mod test_support {
+                 toggle: false,
+                 color: FlashlightColor::Cyan,
+             }),
++            Call::RobotSay(SayParams {
++                path: "/run/duck-say/say-0.wav".into(),
++            }),
+             Call::RobotShutdown,
+             Call::RobotMode,
+             Call::RobotPolicies,
+@@ -2377,6 +2391,14 @@ pub struct FlashlightParams {
+     pub color: FlashlightColor,
+ }
+ 
++/// See [`method::ROBOT_SAY`].
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct SayParams {
++    /// The wav to play; must lie inside the robot's `[audio] say_dir`.
++    pub path: String,
++}
++
+ /// See [`method::ROBOT_THEREMIN`].
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+@@ -5805,7 +5827,7 @@ mod tests {
+     fn every_call_covers_every_variant() {
+         assert_eq!(
+             every_call().len(),
+-            72,
++            73, // 72 + robot.say (duck-brain patch P7)
+             "a Call variant was added or removed — update every_call() and this count"
+         );
+     }
+diff --git a/robotd-params/src/lib.rs b/robotd-params/src/lib.rs
+index bdb0ac4..ee9608d 100644
+--- a/robotd-params/src/lib.rs
++++ b/robotd-params/src/lib.rs
+@@ -1057,6 +1057,9 @@ pub struct AudioParams {
+     /// Probability above which petting starts, and below which it ends (hysteresis).
+     pub pet_enter_threshold: f32,
+     pub pet_exit_threshold: f32,
++    /// The only folder `robot.say` plays from (duck-brain patch P7): its `duck-say` writes the
++    /// phrases there. A client may name a file, never a place.
++    pub say_dir: PathBuf,
+ }
+ 
+ impl Default for AudioParams {
+@@ -1070,6 +1073,7 @@ impl Default for AudioParams {
+             pet_model: None,
+             pet_enter_threshold: 0.95,
+             pet_exit_threshold: 0.85,
++            say_dir: PathBuf::from("/run/duck-say"),
+         }
+     }
+ }
+diff --git a/robotd-params/src/registry.rs b/robotd-params/src/registry.rs
+index 5054001..e82f813 100644
+--- a/robotd-params/src/registry.rs
++++ b/robotd-params/src/registry.rs
+@@ -414,6 +414,11 @@ pub const REGISTRY: &[Entry] = &[
+     ),
+     entry("audio.device", Kind::Text, "ALSA playback device"),
+     entry("audio.bank", Kind::Text, "Voice bank directory"),
++    entry(
++        "audio.say_dir",
++        Kind::Text,
++        "The only folder robot.say plays from (duck-brain P7)",
++    ),
+     feature(
+         "audio.greet",
+         Kind::Bool,
+diff --git a/robotd/src/intents.rs b/robotd/src/intents.rs
+index 577fdf8..d4ae2ad 100644
+--- a/robotd/src/intents.rs
++++ b/robotd/src/intents.rs
+@@ -203,6 +203,9 @@ pub struct Intents {
+     /// `robot.rebootMotors`, pending: the ids to reboot (empty = all). A mutex rather than an
+     /// atomic because it carries a list; the loop takes it with `try_lock`, so it can never wait.
+     reboot_motors: Mutex<Option<Vec<u8>>>,
++    /// `robot.say`, pending: the wav to play (patch P7). The latest wins — a phrase that has
++    /// not started yet when the next arrives is stale.
++    say: Mutex<Option<std::path::PathBuf>>,
+ }
+ 
+ /// A pending policy change, as [`Intents::request_policy_change`] took it.
+@@ -292,6 +295,7 @@ impl Intents {
+             policy_change: ArcSwapOption::empty(),
+             sounds: std::sync::atomic::AtomicU32::new(0),
+             reboot_motors: Mutex::new(None),
++            say: Mutex::new(None),
+             wheee: ArcSwap::from_pointee(Stamped {
+                 value: false,
+                 at_us: 0,
+@@ -494,6 +498,18 @@ impl Intents {
+         }
+     }
+ 
++    /// Queue a phrase for the loop to play (`robot.say`, already checked by `dispatch`).
++    pub fn request_say(&self, wav: std::path::PathBuf) {
++        if let Ok(mut slot) = self.say.lock() {
++            *slot = Some(wav);
++        }
++    }
++
++    /// Take the pending phrase, if any. Never blocks, like [`Self::take_reboot_motors`].
++    pub fn take_say(&self) -> Option<std::path::PathBuf> {
++        self.say.try_lock().ok().and_then(|mut slot| slot.take())
++    }
++
+     /// Take the pending reboot request, if any. Never blocks: a contended lock reads as "nothing
+     /// yet" and the request is picked up on the next tick.
+     pub fn take_reboot_motors(&self) -> Option<Vec<u8>> {
+diff --git a/robotd/src/main.rs b/robotd/src/main.rs
+index 3c979b8..75eaaae 100644
+--- a/robotd/src/main.rs
++++ b/robotd/src/main.rs
+@@ -668,6 +668,8 @@ struct RobotState {
+     /// accepting it into silence. Read once at startup, like the policies: the postinstall
+     /// renders the bank and restarts robotd, so a bank cannot appear under a running one.
+     has_voice: bool,
++    /// Where `robot.say` may play from (patch P7); `None` with audio off.
++    say_dir: Option<PathBuf>,
+     /// Whether a theremin can be picked up: the params allow one, and the depth stream is
+     /// actually delivering frames. Published by the loop rather than read once at startup,
+     /// because unlike a voice bank the sensor comes and goes — `tofd` restarts, the ToF
+@@ -770,6 +772,7 @@ impl RobotState {
+             policy_enabled: params.policy.enabled,
+             config_path: config_path.to_owned(),
+             has_voice: params.audio.enabled && has_any_wav(&params.audio.bank),
++            say_dir: params.audio.enabled.then(|| params.audio.say_dir.clone()),
+             theremin_ready: AtomicBool::new(false),
+             theremin_allowed: params.theremin.enabled && params.audio.enabled,
+             chorale_accepted: params.chorale.accept,
+@@ -2629,6 +2632,9 @@ async fn control_loop<T: RobotIo>(
+             for tag in intents.take_sounds() {
+                 voice.play(tag.as_str(), false);
+             }
++            if let Some(wav) = intents.take_say() {
++                voice.play_file(&wav);
++            }
+ 
+             // Petting: coo, exactly when the prototype coos — not fallen, no scripted move
+             // in flight. The verdict is used bare here (not the armed fall gate): this is a
+@@ -4551,6 +4557,24 @@ fn apply_intent(state: &RobotState, intents: &Intents, call: &proto::Call) -> bo
+     }
+ }
+ 
++/// The wav `robot.say` may play: inside `dir` once both are resolved, a `.wav`, a file.
++fn say_file(dir: Option<&std::path::Path>, path: &str) -> Result<PathBuf, String> {
++    let dir = dir.ok_or("this robot has no voice: audio is disabled")?;
++    let dir = dir
++        .canonicalize()
++        .map_err(|e| format!("say_dir {}: {e}", dir.display()))?;
++    let wav = std::path::Path::new(path)
++        .canonicalize()
++        .map_err(|e| format!("{path}: {e}"))?;
++    if !wav.starts_with(&dir) {
++        return Err(format!("{path} is outside {}", dir.display()));
++    }
++    if wav.extension().is_none_or(|x| x != "wav") || !wav.is_file() {
++        return Err(format!("{path} is not a .wav file"));
++    }
++    Ok(wav)
++}
++
+ /// One phrase for the journal: which of the three things a pending change is.
+ fn describe_change(change: &intents::PolicyChange) -> String {
+     match change {
+@@ -5271,6 +5295,19 @@ fn dispatch(
+             proto::Response::ok(Some(id), &result)
+         }
+ 
++        // A phrase from duck-brain's duck-say (patch P7): only a wav inside `say_dir`, resolved —
++        // a client names a file, never a place, so `..` and links out of the folder are refused.
++        proto::Call::RobotSay(p) => {
++            let result = match say_file(state.say_dir.as_deref(), &p.path) {
++                Ok(wav) => {
++                    intents.request_say(wav);
++                    proto::IntentResult::accepted()
++                }
++                Err(why) => proto::IntentResult::refused(why),
++            };
++            proto::Response::ok(Some(id), &result)
++        }
++
+         // Sit, then power the machine off. Never refused for being inconvenient — a robot
+         // that cannot sit (no sitstand policy, not driving) cuts torque and powers off
+         // directly, which is still what was asked for.
+@@ -6735,6 +6772,40 @@ mod tests {
+         std::fs::remove_dir_all(&empty).ok();
+     }
+ 
++    /// duck-brain patch P7: `robot.say` plays only a .wav inside `[audio] say_dir`, resolved —
++    /// a path that walks out with `..` is outside — and nothing on a robot with audio off.
++    #[test]
++    fn robot_say_plays_only_a_wav_inside_say_dir() {
++        let intents = Intents::default();
++        let id = || proto::Id::Number(7);
++        let say = |path: &std::path::Path| proto::Call::RobotSay(proto::SayParams { path: path.to_string_lossy().into() });
++        let root = std::env::temp_dir().join(format!("robot-say-{}", std::process::id()));
++        let dir = root.join("duck-say");
++        std::fs::create_dir_all(&dir).unwrap();
++        let wav = dir.join("say-0.wav");
++        std::fs::write(&wav, b"RIFF").unwrap();
++        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
++        std::fs::write(root.join("secret.wav"), b"RIFF").unwrap();
++        let mut params = Params::default();
++        params.audio.say_dir = dir.clone();
++        let state = RobotState::new(&params, std::path::Path::new("/test/robotd.toml"), false, false);
++        let ask = |path: &std::path::Path| -> proto::IntentResult { dispatch(&state, &intents, id(), &say(path)).result_as().unwrap() };
++
++        for bad in [root.join("secret.wav"), dir.join("../secret.wav"), dir.join("notes.txt"), dir.join("none.wav")] {
++            let r = ask(&bad);
++            assert!(!r.accepted && r.reason.is_some(), "{}", bad.display());
++        }
++        assert!(intents.take_say().is_none(), "a refusal must not queue");
++        assert!(ask(&wav).accepted);
++        assert_eq!(intents.take_say(), Some(wav.canonicalize().unwrap()));
++
++        params.audio.enabled = false;
++        let mute = RobotState::new(&params, std::path::Path::new("/test/robotd.toml"), false, false);
++        let r: proto::IntentResult = dispatch(&mute, &intents, id(), &say(&wav)).result_as().unwrap();
++        assert!(!r.accepted, "audio off: no voice");
++        std::fs::remove_dir_all(&root).ok();
++    }
++
+     /// A skill whose network was never configured is refused at the door with a reason —
+     /// not queued for a loop that would silently drop it. And a configured one is queued:
+     /// the request must reach the intents for the loop to take.
+diff --git a/robotd/src/sound.rs b/robotd/src/sound.rs
+index 106b151..413dd97 100644
+--- a/robotd/src/sound.rs
++++ b/robotd/src/sound.rs
+@@ -302,9 +302,25 @@ impl Sound {
+             }
+             return;
+         };
++        self.spawn_wav(&wav, blocking, tag);
++    }
++
++    /// Play a synthesised phrase (`robot.say`, duck-brain patch P7): the same single child as
++    /// a bank sound — it cuts what is playing and the next sound cuts it — and, like one, it
++    /// waits for no ride to end.
++    pub fn play_file(&mut self, wav: &Path) {
++        if self.ride != Ride::Off {
++            tracing::debug!(wav = %wav.display(), "phrase skipped: the wheee ride has the PCM");
++            return;
++        }
++        self.stop_child();
++        self.spawn_wav(wav, false, "say");
++    }
++
++    fn spawn_wav(&mut self, wav: &Path, blocking: bool, tag: &str) {
+         let child = Command::new("aplay")
+             .args(["-q", "-D", &self.device])
+-            .arg(&wav)
++            .arg(wav)
+             .stdin(Stdio::null())
+             .stdout(Stdio::null())
+             .stderr(Stdio::null())
+diff --git a/updater/src/ipc.rs b/updater/src/ipc.rs
+index 5f80a1b..7f8013e 100644
+--- a/updater/src/ipc.rs
++++ b/updater/src/ipc.rs
+@@ -808,6 +808,7 @@ impl Server {
+             | Call::RobotDo(_)
+             | Call::RobotSound(_)
+             | Call::RobotFlashlight(_)
++            | Call::RobotSay(_)
+             | Call::RobotPose(_)
+             | Call::RobotMouth(_)
+             | Call::RobotTheremin(_)
+-- 
+2.43.0
+

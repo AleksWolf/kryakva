@@ -1,0 +1,184 @@
+From f75e2f1fc45a173743a0f9331af7aa71b50b1587 Mon Sep 17 00:00:00 2001
+From: duck-brain <duck-brain@localhost>
+Date: Sat, 17 Oct 2026 09:17:58 +0000
+Subject: [PATCH 10/11] duck-brain P15: battery reading corrected on the
+ Feetech bus (`[feetech] battery_offset_v`)
+
+Pollen's low-battery power-off (`[safety] battery_empty_shutdown`: sit,
+then torque off and `systemctl poweroff` at 6.6 V) compares the servo
+voltage (register 62 on this bus) with the pack's empty point. Register
+62 may read below the pack, and by how much is a measurement, not a
+constant.
+
+`[feetech] battery_offset_v` is added where the servo voltage stands for
+the battery: FeetechIo::slow_sensors, so robot.health's battery and the
+power-off. The error factor (7.4 / V) and the 4.5 V torque cutoff stay
+on the register as read.
+
+Default 0.1 V: on the stand of 17.10.2026, at rest, register 62 read
+0.0-0.1 V below a multimeter on the servo connector. The 0.7 V of
+13-14.10 was a scope peak against the register while walking; as a
+constant it overstated the battery by ~0.6 V.
+---
+ duck-control/src/feetech.rs   | 31 +++++++++++++++++++++++++++++--
+ robotctl/src/servo.rs         |  2 +-
+ robotd-params/src/lib.rs      | 12 +++++++++++-
+ robotd-params/src/registry.rs |  5 +++++
+ robotd/src/feetech_bus.rs     |  1 +
+ 5 files changed, 47 insertions(+), 4 deletions(-)
+
+diff --git a/duck-control/src/feetech.rs b/duck-control/src/feetech.rs
+index 167bda0..bc2bf5f 100644
+--- a/duck-control/src/feetech.rs
++++ b/duck-control/src/feetech.rs
+@@ -68,6 +68,10 @@ pub struct FeetechConfig {
+     pub speed_rad_per_count: f64,
+     /// Ticks between the reads that also bring the temperature.
+     pub temperature_every: u32,
++    /// Added to the servo voltage where it stands for the battery (`slow_sensors`: `robot.health`'s
++    /// battery and the low-battery power-off), because register 62 reads low (duck-brain P15). The
++    /// voltage adaptation and the torque cutoff stay on the register as read.
++    pub battery_offset_v: f64,
+ }
+ 
+ impl Default for FeetechConfig {
+@@ -94,6 +98,7 @@ impl Default for FeetechConfig {
+             velocity: VelocitySource::PositionDelta,
+             speed_rad_per_count: TAU / feetech::COUNTS_PER_TURN,
+             temperature_every: 50,
++            battery_offset_v: 0.0,
+         }
+     }
+ }
+@@ -689,7 +694,8 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+     }
+ 
+     /// The voltage and temperature the tick reads already brought — no bus traffic. Voltage is
+-    /// the mean over the servos, as on the Dynamixel bus; a servo not read yet is left out.
++    /// the mean over the servos, as on the Dynamixel bus, plus `battery_offset_v` (P15); a servo
++    /// not read yet is left out.
+     fn slow_sensors(&mut self) -> Result<SlowSensors> {
+         let known: Vec<f64> = self
+             .volts
+@@ -706,7 +712,7 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+             });
+         }
+         Ok(SlowSensors {
+-            volts: known.iter().sum::<f64>() / known.len() as f64,
++            volts: known.iter().sum::<f64>() / known.len() as f64 + self.cfg.battery_offset_v,
+             temps_c: self.temps.map(|t| t.unwrap_or(0.0)),
+         })
+     }
+@@ -1074,4 +1080,25 @@ mod tests {
+         assert_eq!(j["adapt"], 1.0);
+         assert!(j["imu_seq"].is_null(), "no IMU sample yet");
+     }
++
++    /// The battery reading carries the offset (register 62 reads low); the voltage the error
++    /// factor and the cutoff use does not.
++    #[test]
++    fn the_battery_reading_is_corrected_and_the_cutoff_is_not() {
++        let mut emu = Emulator::new(&JOINT_IDS);
++        for id in JOINT_IDS {
++            emu.servo_mut(id).unwrap().set(62, 1, 59);
++        }
++        let mut io = io(
++            emu,
++            FeetechConfig {
++                battery_offset_v: 0.7,
++                ..quick()
++            },
++        );
++        io.read().unwrap();
++        let battery = io.slow_sensors().unwrap().volts;
++        assert!((battery - 6.6).abs() < 1e-9, "{battery}");
++        assert_eq!(io.shared().snapshot().v_min, Some(5.9));
++    }
+ }
+diff --git a/robotctl/src/servo.rs b/robotctl/src/servo.rs
+index 49fb22c..ab40492 100644
+--- a/robotctl/src/servo.rs
++++ b/robotctl/src/servo.rs
+@@ -162,7 +162,7 @@ pub(super) fn run(args: &BusArgs, command: ServoCommand) -> Result<()> {
+             }
+             let c = bus.counters();
+             println!(
+-                "voltage is register 62 as read (the servos read ~0.7 V low); current in servo units\n\
++                "voltage is register 62 as read (at rest ~0.1 V below the connector); current in servo units\n\
+                  echoes {}  bad packets {}  stray {}",
+                 c.echoes, c.bad_packets, c.stray
+             );
+diff --git a/robotd-params/src/lib.rs b/robotd-params/src/lib.rs
+index a244dae..2e00c71 100644
+--- a/robotd-params/src/lib.rs
++++ b/robotd-params/src/lib.rs
+@@ -2272,13 +2272,19 @@ pub struct FeetechParams {
+     /// Time constant of the exponential smoothing of V, seconds.
+     pub voltage_tau_s: f64,
+     /// Torque off when the lowest servo reads below `cutoff_v` for `cutoff_ticks` ticks running.
+-    /// Register 62 as read — the servos read about 0.7 V low.
++    /// Register 62 as read.
+     pub cutoff_v: f64,
+     pub cutoff_ticks: u32,
+     /// Joint velocity in the observation: the position difference per tick, or register 58.
+     pub velocity: FeetechVelocity,
+     /// Register 58's unit, rad/s per count.
+     pub speed_rad_per_count: f64,
++    /// Added to the servo voltage where it stands for the battery — `robot.health`'s battery and
++    /// `[safety] battery_empty_shutdown`'s 6.6 V (duck-brain P15). On the stand of 17.10.2026, at
++    /// rest, register 62 read 0.0–0.1 V below a multimeter on the servo connector; the 0.7 V seen
++    /// earlier was a scope peak against the register while walking, not a constant. The voltage
++    /// adaptation and the cutoff above stay on the register as read.
++    pub battery_offset_v: f64,
+     /// Direction per joint, +1 or −1.
+     pub sign: JointSigns,
+ }
+@@ -2395,6 +2401,7 @@ impl Default for FeetechParams {
+             cutoff_ticks: 5,
+             velocity: FeetechVelocity::PositionDelta,
+             speed_rad_per_count: std::f64::consts::TAU / 4096.0,
++            battery_offset_v: 0.1,
+             sign: JointSigns::default(),
+         }
+     }
+@@ -2840,6 +2847,9 @@ impl Params {
+             if f.speed == 0 {
+                 return Err(setting("speed", "0 means stop, not unlimited".into()));
+             }
++            if !(0.0..=2.0).contains(&f.battery_offset_v) {
++                return Err(setting("battery_offset_v", format!("{} must be 0–2 V", f.battery_offset_v)));
++            }
+         }
+         if self.body_imu.enabled_for(self.bus.driver) {
+             let setting = |key: &str, reason: String| ParamsError::Setting {
+diff --git a/robotd-params/src/registry.rs b/robotd-params/src/registry.rs
+index d96547a..1fdd6f0 100644
+--- a/robotd-params/src/registry.rs
++++ b/robotd-params/src/registry.rs
+@@ -151,6 +151,11 @@ pub const REGISTRY: &[Entry] = &[
+         "Joint velocity source: position difference per tick, or register 58",
+     ),
+     entry("feetech.speed_rad_per_count", Kind::Float, "Register 58 unit, rad/s per count"),
++    entry(
++        "feetech.battery_offset_v",
++        Kind::Float,
++        "Added to register 62 for the battery reading and the low-battery power-off, V",
++    ),
+     entry(
+         "feetech.sign",
+         Kind::Record(
+diff --git a/robotd/src/feetech_bus.rs b/robotd/src/feetech_bus.rs
+index bea7e9a..ea3b65e 100644
+--- a/robotd/src/feetech_bus.rs
++++ b/robotd/src/feetech_bus.rs
+@@ -50,6 +50,7 @@ pub fn config(params: &Params) -> FeetechConfig {
+         speed_rad_per_count: f.speed_rad_per_count,
+         // About once a second.
+         temperature_every: params.control.hz.max(1),
++        battery_offset_v: f.battery_offset_v,
+     }
+ }
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,1779 @@
+diff --git a/src/mjlab_microduck/__init__.py b/src/mjlab_microduck/__init__.py
+index e69de29..74efe50 100644
+--- a/src/mjlab_microduck/__init__.py
++++ b/src/mjlab_microduck/__init__.py
+@@ -0,0 +1,20 @@
++"""Microduck package. On import: check that MuJoCo Warp has the plane-convex contact patch (patch_mujoco_warp.py).
++
++mujoco_warp's plane_convex picks extra contact points among hull vertices within 1 mm of the deepest one; on the rounded
++roller tyre that is a +-5 mm flat patch along the rolling direction. patch_mujoco_warp.py sets the tolerance to 0.01 mm
++for condim-4 contacts only (the roller tyres); all other contacts keep 1 mm. MICRODUCK_WARP_STOCK=1 skips this check
++only and does not revert the engine (revert: patch_mujoco_warp.py --revert).
++"""
++import os as _os
++from pathlib import Path as _Path
++
++if _os.environ.get("MICRODUCK_WARP_STOCK") != "1":
++    try:
++        import mujoco_warp as _mjw
++        _src = (_Path(_mjw.__file__).parent / "_src" / "collision_primitive.py").read_text(encoding="utf-8")
++    except Exception:                                                     # no mujoco_warp in this interpreter: nothing to check
++        _src = None
++    if _src is not None and "condim == 4, 1e-5, 1e-3" not in _src:
++        raise RuntimeError("mujoco_warp without the plane-convex contact fix: run "
++                           "`python training/patches/patch_mujoco_warp.py` with this interpreter "
++                           "(or MICRODUCK_WARP_STOCK=1 to skip this check for a stock-engine A/B)")
+diff --git a/src/mjlab_microduck/actuator/__init__.py b/src/mjlab_microduck/actuator/__init__.py
+index 170f7c0..25d6d12 100644
+--- a/src/mjlab_microduck/actuator/__init__.py
++++ b/src/mjlab_microduck/actuator/__init__.py
+@@ -1,6 +1,8 @@
+ from mjlab_microduck.actuator.friction_dr_bam import (
+     BacklashEncoderBamActuator,
+     BacklashEncoderBamActuatorCfg,
++    BacklashGapBamActuator,
++    BacklashGapBamActuatorCfg,
+     FrictionDRBamActuator,
+     FrictionDRBamActuatorCfg,
+ )
+@@ -8,6 +10,8 @@ from mjlab_microduck.actuator.friction_dr_bam import (
+ __all__ = [
+     "BacklashEncoderBamActuator",
+     "BacklashEncoderBamActuatorCfg",
++    "BacklashGapBamActuator",
++    "BacklashGapBamActuatorCfg",
+     "FrictionDRBamActuator",
+     "FrictionDRBamActuatorCfg",
+ ]
+diff --git a/src/mjlab_microduck/actuator/friction_dr_bam.py b/src/mjlab_microduck/actuator/friction_dr_bam.py
+index 1f5b665..bc3a90f 100644
+--- a/src/mjlab_microduck/actuator/friction_dr_bam.py
++++ b/src/mjlab_microduck/actuator/friction_dr_bam.py
+@@ -18,6 +18,7 @@ each episode by the ``randomize_bam_friction`` event (see tasks/mdp.py).
+ from __future__ import annotations
+ 
+ import dataclasses
++import math
+ from dataclasses import dataclass
+ 
+ import torch
+@@ -28,6 +29,22 @@ from mjlab.actuator.actuator import ActuatorCmd
+ class FrictionDRBamActuator(BamActuator):
+     """BamActuator + per-env friction_scale on the BAM friction budget."""
+ 
++    def _init_delay_buffer(self, num_envs: int, device: str) -> None:
++        """Optional weighted lag: cfg.delay_weights = {lag in physics steps: probability}."""
++        super()._init_delay_buffer(num_envs, device)
++        w = getattr(self.cfg, "delay_weights", None)
++        if not w or self._delay_buffer is None:
++            return
++        lags = torch.tensor(sorted(w), dtype=torch.long, device=device)
++        probs = torch.tensor([w[k] for k in sorted(w)], dtype=torch.float32, device=device)
++        buf = self._delay_buffer
++
++        def _sample_lags(mask: torch.Tensor) -> torch.Tensor:
++            idx = torch.multinomial(probs, buf.batch_size, replacement=True, generator=buf.generator)
++            return torch.where(mask, lags[idx], buf._current_lags)
++
++        buf._sample_lags = _sample_lags
++
+     def initialize(self, mj_model, model, data, device) -> None:
+         super().initialize(mj_model, model, data, device)
+         # kp_scale is (num_envs, 1); mirror it for a per-env friction multiplier.
+@@ -46,6 +63,29 @@ class FrictionDRBamActuator(BamActuator):
+         fs = getattr(self, "friction_scale", None)
+         return base if fs is None else base * fs  # (N, J) * (N, 1)
+ 
++    # Accumulator for the servo torque-rate penalty (rewards_hd1910.servo_torque_rate): sum over the physics steps of one
++    # policy step of (dtau_j / stall)^2 per joint; the reward term reads and clears it. Off until a term enables it.
++    tau_rate_stall: float = 0.0
++
++    def compute(self, cmd: ActuatorCmd) -> torch.Tensor:
++        tau = super().compute(cmd)
++        if self.tau_rate_stall > 0.0:
++            prev = getattr(self, "_tau_prev", None)
++            if prev is None:
++                self._tau_prev = tau.detach().clone(); self.tau_rate_acc = torch.zeros(tau.shape, device=tau.device)
++                self._tau_fresh = torch.zeros(tau.shape[0], dtype=torch.bool, device=tau.device)
++            else:
++                d = ((tau.detach() - prev) / self.tau_rate_stall) ** 2
++                self.tau_rate_acc += torch.where(self._tau_fresh[:, None], torch.zeros_like(self.tau_rate_acc), d)
++                self._tau_fresh[:] = False
++                self._tau_prev = tau.detach().clone()
++        return tau
++
++    def reset(self, env_ids=None) -> None:
++        super().reset(env_ids)
++        if getattr(self, "_tau_fresh", None) is not None:                # no torque jump counted across an episode reset
++            self._tau_fresh[slice(None) if env_ids is None else env_ids] = True
++
+     def set_friction_scale(self, env_ids, friction_scale: torch.Tensor) -> None:
+         self.friction_scale[env_ids] = friction_scale
+ 
+@@ -57,6 +97,9 @@ class FrictionDRBamActuator(BamActuator):
+ class FrictionDRBamActuatorCfg(BamActuatorCfg):
+     """Drop-in for BamActuatorCfg that builds a friction-DR-capable actuator."""
+ 
++    delay_weights: dict | None = None
++    """{lag in physics steps: probability}; None = uniform delay_min_lag..delay_max_lag (mjlab default)."""
++
+     def build(self, entity, target_ids, target_names) -> FrictionDRBamActuator:
+         return FrictionDRBamActuator(self, entity, target_ids, target_names)
+ 
+@@ -110,3 +153,57 @@ class BacklashEncoderBamActuatorCfg(FrictionDRBamActuatorCfg):
+ 
+     def build(self, entity, target_ids, target_names) -> BacklashEncoderBamActuator:
+         return BacklashEncoderBamActuator(self, entity, target_ids, target_names)
++
++
++class BacklashGapBamActuator(FrictionDRBamActuator):
++    """FrictionDRBamActuator with gear backlash as a torque gap on one joint.
++
++    Gear play is a hidden motor-side state: rotor angle m and speed md per joint. The link (MuJoCo joint q) receives
++    the motor torque only while the rotor presses on it from the side the torque points to (m - q = +gap/2 for
++    tau > 0, -gap/2 for tau < 0). On a torque reversal the rotor crosses the gap on its own inertia (BAM armature)
++    and the link gets no torque meanwhile: t = sqrt(2 * gap * J / |tau|). The encoder is on the output side, so the
++    firmware PD reads q. Approximation: the rotor inertia also stays lumped in the MuJoCo joint armature.
++    """
++
++    def initialize(self, mj_model, model, data, device) -> None:
++        super().initialize(mj_model, model, data, device)
++        n, j = self.kp_scale.shape[0], len(self._target_names)
++        self._half_gap = math.radians(self.cfg.gap_deg) / 2.0
++        self._j_rotor = float(self._bam_model.armature.value)
++        self._m = torch.zeros(n, j, device=device)
++        self._md = torch.zeros(n, j, device=device)
++        self._need_init = torch.ones(n, dtype=torch.bool, device=device)
++        print(f"[BacklashGapBamActuator] gear play {self.cfg.gap_deg:g} deg total (+/-{math.degrees(self._half_gap):.3g}), "
++              f"rotor J {self._j_rotor:.5f}")
++
++    def reset(self, env_ids=None) -> None:
++        super().reset(env_ids)
++        if getattr(self, "_need_init", None) is not None:
++            self._need_init[slice(None) if env_ids is None else env_ids] = True
++
++    def compute(self, cmd: ActuatorCmd) -> torch.Tensor:
++        tau = super().compute(cmd)
++        qd = cmd.vel
++        ini = self._need_init
++        if bool(ini.any()):
++            self._m[ini] = 0.0; self._md[ini] = qd[ini]; ini[:] = False
++        # self._m holds the rotor OFFSET from the link (rotor - link), so an engaged rotor moves with the link
++        h, dt = self._half_gap, self._dt
++        side = torch.sign(tau)
++        engaged = (side != 0) & (self._m * side >= h - 1e-9)      # rotor already on the wall the torque pushes to
++        md_free = self._md + tau / self._j_rotor * dt               # free rotor on its own inertia, link gets nothing
++        off_free = self._m + (md_free - qd) * dt
++        hit = off_free.abs() >= h                                   # reached a wall: locks to the link, transmits next step
++        self._m = torch.where(engaged, side * h, torch.clamp(off_free, -h, h))
++        self._md = torch.where(engaged | hit, qd, md_free)
++        return torch.where(engaged, tau, torch.zeros_like(tau))
++
++
++@dataclass(kw_only=True)
++class BacklashGapBamActuatorCfg(FrictionDRBamActuatorCfg):
++    """FrictionDRBamActuatorCfg + gear play as a torque gap (total degrees, peak to peak)."""
++
++    gap_deg: float = 0.5
++
++    def build(self, entity, target_ids, target_names) -> BacklashGapBamActuator:
++        return BacklashGapBamActuator(self, entity, target_ids, target_names)
+diff --git a/src/mjlab_microduck/robot/microduck/config_mjcf_groundcontact_backlash.json b/src/mjlab_microduck/robot/microduck/config_mjcf_groundcontact_backlash.json
+index 572037e..4390c0d 100644
+--- a/src/mjlab_microduck/robot/microduck/config_mjcf_groundcontact_backlash.json
++++ b/src/mjlab_microduck/robot/microduck/config_mjcf_groundcontact_backlash.json
+@@ -35,7 +35,7 @@
+         "sed -i '/<!-- Part power_support -->/{n; n; s/class=\"collision\"/class=\"self_collision_only\"/}' robot_groundcontact_backlash.xml",
+         "sed -i 's/ inheritrange=\"1\"//g' robot_groundcontact_backlash.xml",
+         "sed -i 's|<site[^>]*name=\"head_camera\"[^>]*pos=\"\\([^\"]*\\)\"[^>]*/>|&\\n              <camera name=\"head_camera\" pos=\"\\1\" quat=\"0 0 -1 0\"/>|' robot_groundcontact_backlash.xml",
+-        "python3 add_backlash.py robot_groundcontact_backlash.xml --backlash-deg 2.0"
++        "python3 add_backlash.py robot_groundcontact_backlash.xml --backlash-deg 0.5"
+     ],
+     "joint_properties": {
+         "default": {
+diff --git a/src/mjlab_microduck/robot/microduck/config_mjcf_groundcontact_rollers_backlash.json b/src/mjlab_microduck/robot/microduck/config_mjcf_groundcontact_rollers_backlash.json
+index 14785ad..c2cdad2 100644
+--- a/src/mjlab_microduck/robot/microduck/config_mjcf_groundcontact_rollers_backlash.json
++++ b/src/mjlab_microduck/robot/microduck/config_mjcf_groundcontact_rollers_backlash.json
+@@ -36,7 +36,7 @@
+         "sed -i '/<!-- Part power_support -->/{n; n; s/class=\"collision\"/class=\"self_collision_only\"/}' robot_groundcontact_rollers_backlash.xml",
+         "sed -i 's/ inheritrange=\"1\"//g' robot_groundcontact_rollers_backlash.xml",
+         "sed -i 's|<site[^>]*name=\"head_camera\"[^>]*pos=\"\\([^\"]*\\)\"[^>]*/>|&\\n              <camera name=\"head_camera\" pos=\"\\1\" quat=\"0 0 -1 0\"/>|' robot_groundcontact_rollers_backlash.xml",
+-        "python3 add_backlash.py robot_groundcontact_rollers_backlash.xml --backlash-deg 2.0"
++        "python3 add_backlash.py robot_groundcontact_rollers_backlash.xml --backlash-deg 0.5"
+     ],
+     "joint_properties": {
+         "default": {
+diff --git a/src/mjlab_microduck/robot/microduck/config_mjcf_walk_backlash.json b/src/mjlab_microduck/robot/microduck/config_mjcf_walk_backlash.json
+index fc1a83d..05c239b 100644
+--- a/src/mjlab_microduck/robot/microduck/config_mjcf_walk_backlash.json
++++ b/src/mjlab_microduck/robot/microduck/config_mjcf_walk_backlash.json
+@@ -26,7 +26,7 @@
+         "sed -i '/<!-- Part power_support -->/{n; n; s/class=\"collision\"/class=\"self_collision_only\"/}' robot_walk_backlash.xml",
+         "sed -i 's/ inheritrange=\"1\"//g' robot_walk_backlash.xml",
+         "sed -i 's|<site[^>]*name=\"head_camera\"[^>]*pos=\"\\([^\"]*\\)\"[^>]*/>|&\\n              <camera name=\"head_camera\" pos=\"\\1\" quat=\"0 0 -1 0\"/>|' robot_walk_backlash.xml",
+-        "python3 add_backlash.py robot_walk_backlash.xml --backlash-deg 2.0"
++        "python3 add_backlash.py robot_walk_backlash.xml --backlash-deg 0.5"
+     ],
+     "joint_properties": {
+         "default": {
+diff --git a/src/mjlab_microduck/robot/microduck_constants.py b/src/mjlab_microduck/robot/microduck_constants.py
+index d241cf3..75c4bb7 100644
+--- a/src/mjlab_microduck/robot/microduck_constants.py
++++ b/src/mjlab_microduck/robot/microduck_constants.py
+@@ -5,6 +5,7 @@ import mujoco
+ from mjlab.actuator import XmlActuatorCfg
+ from mjlab_microduck.actuator import (
+     BacklashEncoderBamActuatorCfg,
++    BacklashGapBamActuatorCfg,
+     FrictionDRBamActuatorCfg,
+ )
+ from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
+@@ -28,11 +29,14 @@ MICRODUCK_BALL_XML: Path = _ROBOT_DIR / "ball.xml"
+ # Roller-skate model: 14 actuated joints + passive wheel hinges (passive_*wheel).
+ MICRODUCK_GROUNDCONTACT_ROLLERS_XML: Path = _ROBOT_DIR / "robot_groundcontact_rollers.xml"
+ # Backlash models: every servo joint gets an unactuated passive_<joint>_backlash
+-# hinge in series (±1° play, 2° total). Exported via
++# hinge in series (±0.25° play, 0.5° total; HD-1910 datasheet ≤ 0.5°). Exported via
+ # config_mjcf_{groundcontact,walk}_backlash.json (add_backlash.py post-processor).
+ MICRODUCK_GROUNDCONTACT_BACKLASH_XML: Path = _ROBOT_DIR / "robot_groundcontact_backlash.xml"
+ MICRODUCK_WALK_BACKLASH_XML: Path = _ROBOT_DIR / "robot_walk_backlash.xml"
+ MICRODUCK_GROUNDCONTACT_ROLLERS_BACKLASH_XML: Path = _ROBOT_DIR / "robot_groundcontact_rollers_backlash.xml"
++# Upstream has no full-collision roller model; the roller StandUp task (registered unconditionally) resolves to this
++# file only when MICRODUCK_ROBOT is not hd1910 and is not meant to be trained that way.
++MICRODUCK_ALLCOLLISIONS_ROLLERS_XML: Path = MICRODUCK_GROUNDCONTACT_ROLLERS_XML
+ MICRODUCK_ALLCOLLISIONS_BACKLASH_XML: Path = _ROBOT_DIR / "robot_allcollisions_backlash.xml"
+ 
+ assert MICRODUCK_WALK_XML.exists(), f"XML not found: {MICRODUCK_WALK_XML}"
+@@ -45,6 +49,32 @@ assert MICRODUCK_WALK_BACKLASH_XML.exists(), f"XML not found: {MICRODUCK_WALK_BA
+ assert MICRODUCK_GROUNDCONTACT_ROLLERS_BACKLASH_XML.exists(), f"XML not found: {MICRODUCK_GROUNDCONTACT_ROLLERS_BACKLASH_XML}"
+ assert MICRODUCK_ALLCOLLISIONS_BACKLASH_XML.exists(), f"XML not found: {MICRODUCK_ALLCOLLISIONS_BACKLASH_XML}"
+ 
++# MICRODUCK_ROBOT=hd1910: models from MICRODUCK_EXPORT_DIR and the HD-1910 actuator below.
++# A missing model file fails on load; there is no fallback to Pollen's model.
++_OUR_ROBOT = os.environ.get("MICRODUCK_ROBOT", "") == "hd1910"
++_PROJECT_DIR: Path = Path(__file__).resolve().parents[5]
++if _OUR_ROBOT:
++    # MICRODUCK_EXPORT_DIR=<dir>: folder with the exported models (default training/export).
++    _ROBOT_DIR = Path(os.environ.get("MICRODUCK_EXPORT_DIR", _PROJECT_DIR / "training/export"))
++    MICRODUCK_WALK_XML = _ROBOT_DIR / "robot_walk.xml"
++    MICRODUCK_GROUNDCONTACT_XML = _ROBOT_DIR / "robot_groundcontact.xml"
++    MICRODUCK_ALLCOLLISIONS_XML = _ROBOT_DIR / "robot_allcollisions.xml"
++    # MICRODUCK_ALLCOLL_MODEL=ext: the "all collisions" model becomes robot_extcollisions.xml, which keeps only the
++    # external collision geoms (32 of 73); parts enclosed by shells (electronics, bearings, servos) cannot touch the
++    # outside.
++    if os.environ.get("MICRODUCK_ALLCOLL_MODEL") == "ext":
++        MICRODUCK_ALLCOLLISIONS_XML = _ROBOT_DIR / "robot_extcollisions.xml"
++        print(f"[microduck_constants] MICRODUCK_ALLCOLL_MODEL=ext: {MICRODUCK_ALLCOLLISIONS_XML}")
++    MICRODUCK_GROUNDCONTACT_ROLLERS_XML = _ROBOT_DIR / "rollers/robot_groundcontact_rollers.xml"   # own export folder
++    # Full-collision roller model (every part incl. wheels and blade frames) for roller StandUp / FallSafe.
++    MICRODUCK_ALLCOLLISIONS_ROLLERS_XML = _ROBOT_DIR / "rollers/robot_allcollisions_rollers.xml"
++    MICRODUCK_GROUNDCONTACT_BACKLASH_XML = _ROBOT_DIR / "robot_groundcontact_backlash.xml"
++    MICRODUCK_WALK_BACKLASH_XML = _ROBOT_DIR / "robot_walk_backlash.xml"
++    MICRODUCK_GROUNDCONTACT_ROLLERS_BACKLASH_XML = _ROBOT_DIR / "rollers/robot_groundcontact_rollers_backlash.xml"
++    MICRODUCK_ALLCOLLISIONS_BACKLASH_XML = _ROBOT_DIR / "robot_allcollisions_backlash.xml"
++    assert MICRODUCK_WALK_XML.exists(), f"XML not found: {MICRODUCK_WALK_XML}"
++    print(f"[microduck_constants] MICRODUCK_ROBOT=hd1910: {MICRODUCK_WALK_XML}")
++
+ 
+ def get_walk_spec() -> mujoco.MjSpec:
+     return mujoco.MjSpec.from_file(str(MICRODUCK_WALK_XML))
+@@ -64,7 +94,7 @@ def get_walk_rollers_spec() -> mujoco.MjSpec:
+     return mujoco.MjSpec.from_file(str(MICRODUCK_GROUNDCONTACT_ROLLERS_XML))
+ 
+ 
+-SERVO_MESH_NAME = "xl330"
++SERVO_MESH_NAMES = ("hd1910", "hd1910_servo_simplified") if _OUR_ROBOT else ("xl330",)   # HD-1910 servo mesh names
+ SERVO_GEOM_SUFFIX = "_servo_collision"
+ 
+ 
+@@ -80,7 +110,7 @@ def name_servo_collision_geoms(spec: mujoco.MjSpec) -> mujoco.MjSpec:
+     """
+     counts: dict[str, int] = {}
+     for geom in spec.geoms:
+-        if geom.meshname != SERVO_MESH_NAME or (geom.contype == 0 and geom.conaffinity == 0):
++        if geom.meshname not in SERVO_MESH_NAMES or (geom.contype == 0 and geom.conaffinity == 0):
+             continue
+         body = geom.parent.name
+         k = counts.get(body, 0)
+@@ -93,6 +123,11 @@ def get_allcollisions_spec() -> mujoco.MjSpec:
+     return name_servo_collision_geoms(mujoco.MjSpec.from_file(str(MICRODUCK_ALLCOLLISIONS_XML)))
+ 
+ 
++def get_allcollisions_rollers_spec() -> mujoco.MjSpec:
++    # servo housings named as in get_allcollisions_spec for the servo-impact sensor
++    return name_servo_collision_geoms(mujoco.MjSpec.from_file(str(MICRODUCK_ALLCOLLISIONS_ROLLERS_XML)))
++
++
+ def get_allcollisions_backlash_spec() -> mujoco.MjSpec:
+     return name_servo_collision_geoms(mujoco.MjSpec.from_file(str(MICRODUCK_ALLCOLLISIONS_BACKLASH_XML)))
+ 
+@@ -139,6 +174,19 @@ HOME_FRAME = EntityCfg.InitialStateCfg(
+     joint_vel={".*": 0.0},
+ )
+ 
++# MICRODUCK_HOME_LEAN_DEG=<deg> (only with MICRODUCK_ROBOT=hd1910): lean the legs of HOME forward by <deg> as Pollen's
++# STAND2 does (|hip_pitch| and |ankle| smaller by the same angle, sole stays flat). Policies trained on another HOME
++# see shifted joint positions and targets.
++_HOME_LEAN = float(os.environ.get("MICRODUCK_HOME_LEAN_DEG", "0")) if _OUR_ROBOT else 0.0
++if _HOME_LEAN:
++    import math as _math
++    _d = _math.radians(_HOME_LEAN)
++    HOME_FRAME.joint_pos[r".*left_hip_pitch.*"] += _d
++    HOME_FRAME.joint_pos[r".*right_hip_pitch.*"] -= _d
++    HOME_FRAME.joint_pos[r".*left_ankle.*"] -= _d
++    HOME_FRAME.joint_pos[r".*right_ankle.*"] += _d
++    print(f"[microduck_constants] MICRODUCK_HOME_LEAN_DEG={_HOME_LEAN}: HOME legs leaned forward")
++
+ FULL_COLLISION = CollisionCfg(
+     geom_names_expr=[".*_collision"],
+     condim={r"^(left|right)_foot_collision$": 3, ".*_collision": 1},
+@@ -173,7 +221,35 @@ _BAM_ACTUATOR_KWARGS = dict(
+     delay_min_lag=3,
+     delay_max_lag=6,
+ )
+-actuators = FrictionDRBamActuatorCfg(**_BAM_ACTUATOR_KWARGS)
++# MICRODUCK_ACTUATOR=hd1910 without MICRODUCK_ROBOT: Pollen's model with the HD-1910 servo (A/B test).
++if (_OUR_ROBOT and os.environ.get("MICRODUCK_ACTUATOR", "") != "xl330") or os.environ.get("MICRODUCK_ACTUATOR", "") == "hd1910":
++    # MICRODUCK_ACTUATOR=xl330 keeps the HD-1910 model with Pollen's servo (A/B test, not for training a real policy).
++    # HD-1910: JoyandAI's pendulum-identified m5 profile and HD-1910 control law instead of XL330 m6.
++    # kp_fw 32 = servo register 21. vin_range: Pollen's.
++    import mjlab_microduck.actuator.feetech_bam  # noqa: F401  registers "hd1910" in BAM
++    del _BAM_ACTUATOR_KWARGS["motor_name"], _BAM_ACTUATOR_KWARGS["model"]
++    _BAM_ACTUATOR_KWARGS.update(json_path=str(_PROJECT_DIR / "training/actuators/hd1910_bam_m5.json"),
++                                # delay 2..3 physics steps (5 ms each), P(2) = 0.75, P(3) = 0.25, one lag per policy tick (update_period 4);
++                                # measured command delay ~11 ms.
++                                kp_fw=32.0, delay_min_lag=2, delay_max_lag=3, delay_weights={2: 0.75, 3: 0.25},
++                                delay_update_period=4,
++                                # vin_min: minimum servo supply voltage, V (2S battery under load; Pollen 6.0).
++                                vin_min=5.0)
++# MICRODUCK_ACT_DELAY="<min>,<max>": override the actuator delay range (physics steps); diagnostic only.
++# MICRODUCK_ACT_KP=<P>: servo register P. MICRODUCK_ACT_JSON=<path>: BAM parameter file
++# (e.g. training/actuators/hd1910_bam_bench1019_D0.json, bench-fitted law for register D = 0).
++if os.environ.get("MICRODUCK_ACT_KP"):          # firmware stiffness = servo register P (RAM 50)
++    _BAM_ACTUATOR_KWARGS["kp_fw"] = float(os.environ["MICRODUCK_ACT_KP"])
++if os.environ.get("MICRODUCK_ACT_JSON"):        # BAM parameter file for the HD-1910 law
++    _BAM_ACTUATOR_KWARGS["json_path"] = os.environ["MICRODUCK_ACT_JSON"]
++if os.environ.get("MICRODUCK_ACT_DELAY"):
++    _BAM_ACTUATOR_KWARGS["delay_min_lag"], _BAM_ACTUATOR_KWARGS["delay_max_lag"] = (int(x) for x in os.environ["MICRODUCK_ACT_DELAY"].split(","))
++# MICRODUCK_BACKLASH_GAP_DEG=<deg>: gear play (total, deg) as a torque gap inside the servo model on the one-joint
++# robot (BacklashGapBamActuator); HD-1910 datasheet <= 0.5 deg.
++if os.environ.get("MICRODUCK_BACKLASH_GAP_DEG"):
++    actuators = BacklashGapBamActuatorCfg(**_BAM_ACTUATOR_KWARGS, gap_deg=float(os.environ["MICRODUCK_BACKLASH_GAP_DEG"]))
++else:
++    actuators = FrictionDRBamActuatorCfg(**_BAM_ACTUATOR_KWARGS)
+ 
+ # Same BAM actuator, but the firmware position loop reads the encoder THROUGH
+ # the passive_<joint>_backlash hinges (the real encoder is on the output side
+@@ -232,6 +308,18 @@ MICRODUCK_ALLCOLLISIONS_ROBOT_CFG = EntityCfg(
+     ),
+ )
+ 
++# Roller duck with every part colliding (roller StandUp / FallSafe). Wheel joints are passive (excluded by the
++# BAM target regex); tires and blade frames collide like every other part.
++MICRODUCK_ALLCOLLISIONS_ROLLERS_ROBOT_CFG = EntityCfg(
++    spec_fn=get_allcollisions_rollers_spec,
++    init_state=HOME_FRAME,
++    collisions=(FULL_COLLISION,),
++    articulation=EntityArticulationInfoCfg(
++        actuators=(actuators,),
++        soft_joint_pos_limit_factor=0.9,
++    ),
++)
++
+ MICRODUCK_GROUND_PICK_ROBOT_CFG = EntityCfg(
+     spec_fn=get_ground_pick_spec,
+     init_state=HOME_FRAME,
+diff --git a/src/mjlab_microduck/tasks/__init__.py b/src/mjlab_microduck/tasks/__init__.py
+index faa7366..2e95c72 100644
+--- a/src/mjlab_microduck/tasks/__init__.py
++++ b/src/mjlab_microduck/tasks/__init__.py
+@@ -278,3 +278,25 @@ for _task_id, _make_cfg, _kw, _rl_cfg, _robot_cfg in _BACKLASH_TASKS:
+         rl_cfg=_rl_cfg,
+         runner_cls=MicroduckOnPolicyRunner,
+     )
++
++# --- HD-1910 duck: protective fall and getting up on rollers
++import dataclasses
++from .microduck_fallsafe_hd1910_env_cfg import (
++    make_microduck_fallsafe_hd1910_env_cfg,
++    MicroduckFallSafeHd1910RlCfg,
++)
++
++register_mjlab_task(
++    task_id="Mjlab-RollerStandUpHD-Flat-MicroDuck",
++    env_cfg=make_microduck_standup_env_cfg(rollers=True),
++    play_env_cfg=make_microduck_standup_env_cfg(play=True, rollers=True),
++    rl_cfg=dataclasses.replace(MicroduckStandUpRlCfg, experiment_name="microduck_roller_standup_hd1910"),
++    runner_cls=MicroduckOnPolicyRunner,
++)
++register_mjlab_task(
++    task_id="Mjlab-FallSafeHD-Flat-MicroDuck",
++    env_cfg=make_microduck_fallsafe_hd1910_env_cfg(),
++    play_env_cfg=make_microduck_fallsafe_hd1910_env_cfg(play=True),
++    rl_cfg=MicroduckFallSafeHd1910RlCfg,
++    runner_cls=MicroduckOnPolicyRunner,
++)
+diff --git a/src/mjlab_microduck/tasks/backlash.py b/src/mjlab_microduck/tasks/backlash.py
+index e77219a..211ed0d 100644
+--- a/src/mjlab_microduck/tasks/backlash.py
++++ b/src/mjlab_microduck/tasks/backlash.py
+@@ -5,7 +5,7 @@ counterpart (task ids ``Mjlab-<Task>-<Flat|Rough>-Backlash-MicroDuck``):
+ 
+ 1. Robot → the matching backlash robot cfg (an unactuated
+    ``passive_<joint>_backlash`` hinge in series with each of the 14 servo
+-   joints, ±1° play) driven by BacklashEncoderBamActuator, whose firmware PD
++   joints, ±0.25° play — HD-1910 datasheet) driven by BacklashEncoderBamActuator, whose firmware PD
+    closes on the encoder READING THROUGH the backlash — like the real servo,
+    whose encoder sits on the output side of the gear play. Pass the robot cfg
+    that mirrors the base task's model: MICRODUCK_WALK_BACKLASH_ROBOT_CFG for
+diff --git a/src/mjlab_microduck/tasks/mdp.py b/src/mjlab_microduck/tasks/mdp.py
+index d50c97a..aca2214 100644
+--- a/src/mjlab_microduck/tasks/mdp.py
++++ b/src/mjlab_microduck/tasks/mdp.py
+@@ -30,6 +30,11 @@ from rsl_rl.algorithms.ppo import PPO as _PPO
+ # ---------------------------------------------------------------------------
+ _orig_reward_compute = _RewardManager.compute
+ 
++
++# Roller wheel radius: the tyre in the roller models is Ø30 x 7.6 mm -> r = 0.015 m (measured on the mesh at the
++# wheel axis). Upstream used 0.0175 in 4 places (rolling-entry wheel spin, wheel_glide / wheel_speed rewards).
++ROLLER_WHEEL_RADIUS = 0.015
++
+ def _nan_safe_reward_compute(self, dt: float) -> torch.Tensor:
+     result = _orig_reward_compute(self, dt)
+     # _episode_sums is updated inside compute() before nan_to_num can act.
+@@ -258,9 +263,9 @@ def reset_with_forward_velocity(
+     asset.write_root_link_velocity_to_sim(velocities, env_ids=warmstart_ids)
+ 
+     # Spin wheels to match forward velocity — prevents instantaneous no-slip braking.
+-    # Wheel radius = 0.0175 m (measured).
++    # Wheel radius: ROLLER_WHEEL_RADIUS.
+     # All 4 wheels spin at +ω for forward motion (verified by test_wheel_direction.py).
+-    _WHEEL_RADIUS = 0.0175
++    _WHEEL_RADIUS = ROLLER_WHEEL_RADIUS
+     all_wheel_ids, _ = asset.find_joints(r"^passive_.*")
+ 
+     if all_wheel_ids:
+@@ -1198,7 +1203,7 @@ def reset_rolling_entry(
+     env: ManagerBasedRlEnv,
+     env_ids: torch.Tensor | None,
+     speed_range: tuple = (0.25, 0.45),
+-    wheel_radius: float = 0.0175,
++    wheel_radius: float = ROLLER_WHEEL_RADIUS,
+     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+ ) -> None:
+     """Départ en ROULEMENT sans glissement (élan aux roues).
+@@ -1235,7 +1240,7 @@ def reset_rolling_entry(
+ def wheel_glide_reward(
+     env: ManagerBasedRlEnv,
+     cap_speed: float = 0.35,
+-    wheel_radius: float = 0.0175,
++    wheel_radius: float = ROLLER_WHEEL_RADIUS,
+ ) -> torch.Tensor:
+     """Récompense le ROULEMENT des roues vers l'avant (glisse), plafonné.
+ 
+@@ -1816,7 +1821,7 @@ def body_impact_cost(
+ def wheel_speed_reward(
+     env: ManagerBasedRlEnv,
+     command_name: str,
+-    wheel_radius: float = 0.0175,
++    wheel_radius: float = ROLLER_WHEEL_RADIUS,
+     vel_scale: float = 0.5,
+     bidirectional: bool = False,
+ ) -> torch.Tensor:
+@@ -6234,7 +6239,8 @@ def spin_stay_in_place(
+ # À la nouvelle cible 3.0 rad/s : 2*3.0*0.0499/0.0175 = 17.1 rad/s. Laisser 34.0
+ # ici plafonnerait le terme à tanh(17.1/34) = 0.47 de son propre maximum, ce qui
+ # affaiblirait exactement le shaping qu'on veut renforcer (cf. spin_stay_in_place).
+-SPIN_WHEEL_OMEGA_SCALE = 17.0  # rad/s ; recalibré sur la demi-voie mesurée et SPIN_RATE_MAX = 3.0
++# 2 * 3.0 * half_track / r: half-track 0.040 m measured at the wheels, r = ROLLER_WHEEL_RADIUS (0.015 m).
++SPIN_WHEEL_OMEGA_SCALE = 16.0  # rad/s
+ 
+ 
+ def spin_wheel_differential_from_values(
+@@ -6865,6 +6871,11 @@ _HEAD_LATCH_HI = math.radians(170.0)
+ # the head on the floor", not the face or the side of the shell (run-5 fix:
+ # the run-4 policy rolled over the shoulder, which still touched jaw_soft).
+ _HEAD_TOP_AXIS = (0.882, 0.0, 0.471)
++# In this Onshape export jaw_soft's frame is rotated 180 deg about its z axis relative to upstream (relative
++# rotation diag(-1,-1,1)), so the head-top axis is (-0.882, 0, 0.471). Used by the Roulade head-top latch
++# and roulade_head_pivot.
++if os.environ.get("MICRODUCK_ROBOT", "").lower() == "hd1910":
++    _HEAD_TOP_AXIS = (-0.882, 0.0, 0.471)
+ # dot(top_axis_world, -z) threshold. Measured landmarks (trunk pitched 110°):
+ # passive face-plant (neck at HOME) reads +0.6, full chin-tuck (neck_pitch −1,
+ # head_pitch +1) reads −0.99 — 0.3 accepts partial tucks while staying far
+diff --git a/src/mjlab_microduck/tasks/microduck_standup_env_cfg.py b/src/mjlab_microduck/tasks/microduck_standup_env_cfg.py
+index 358b567..6ee3c2c 100644
+--- a/src/mjlab_microduck/tasks/microduck_standup_env_cfg.py
++++ b/src/mjlab_microduck/tasks/microduck_standup_env_cfg.py
+@@ -19,6 +19,7 @@ the ground_state_mix recovery curriculum has finished ramping.
+ """
+ 
+ import math
++import os
+ from copy import deepcopy
+ 
+ # Symmetry
+@@ -152,6 +153,7 @@ from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
+ def make_microduck_standup_env_cfg(
+     play: bool = False,
+     rough: bool = False,
++    rollers: bool = False,
+ ) -> ManagerBasedRlEnvCfg:
+     """Create Microduck stand environment configuration (sit-keyframe start)."""
+ 
+@@ -883,7 +885,7 @@ def make_microduck_standup_env_cfg(
+                 {"step": 500 * 24,  "ranges": ((-0.17, 0.17),  (-0.17, 0.17),  (-0.21, 0.21),  (-0.047, 0.047))},
+                 {"step": 1000 * 24, "ranges": ((-0.39, 0.39),  (-0.39, 0.39),  (-0.49, 0.49),  (-0.11, 0.11))},
+                 {"step": 1500 * 24, "ranges": ((-0.72, 0.72),  (-0.72, 0.72),  (-0.91, 0.91),  (-0.20, 0.20))},
+-                {"step": 2000 * 24, "ranges": ((-1.10, 1.10),  (-1.10, 1.10),  (-1.40, 1.40),  (-0.31, 0.31))},
++                {"step": 2000 * 24, "ranges": ((-1.10, 1.10),  (-1.10, 1.10),  (-1.40, 1.40),  (-0.26, 0.26))},
+             ],
+         },
+     )
+@@ -1006,6 +1008,260 @@ def make_microduck_standup_env_cfg(
+         },
+     )
+ 
++    # HD-1910 switches, same meaning as in the velocity cfg.
++    # Without the env vars the recipe is Pollen's, unchanged.
++    _scale = os.environ.get("MICRODUCK_ACTION_SCALE")
++    if _scale:
++        joint_pos_action.scale = float(_scale)
++        print(f"[microduck_standup_env_cfg] MICRODUCK_ACTION_SCALE={_scale}")
++    if os.environ.get("MICRODUCK_ACTION_CLIP", "").lower() == "limits":
++        spec = cfg.scene.entities["robot"].spec_fn()
++        lim = {j.name: (float(j.range[0]), float(j.range[1])) for j in spec.joints
++               if j.name and not j.name.startswith("passive_") and j.range[1] > j.range[0]}
++        joint_pos_action.clip = lim
++        print(f"[microduck_standup_env_cfg] MICRODUCK_ACTION_CLIP=limits: target clamped to joint range on {len(lim)} joints")
++    # MICRODUCK_ACTION_FILTER_TAU=<s>: target low-pass time constant, same filter as the walk and the runtime
++    _tau = os.environ.get("MICRODUCK_ACTION_FILTER_TAU")
++    if _tau:
++        import dataclasses as _dc
++        from mjlab_microduck.actuator.filtered_action import FilteredJointPositionActionCfg
++        _old = cfg.actions["joint_pos"]
++        cfg.actions["joint_pos"] = FilteredJointPositionActionCfg(
++            **{f.name: getattr(_old, f.name) for f in _dc.fields(_old) if f.init}, tau_s=float(_tau))
++        print(f"[microduck_standup_env_cfg] MICRODUCK_ACTION_FILTER_TAU={_tau}")
++    _arm = os.environ.get("MICRODUCK_ACTION_RATE_MULT")
++    if _arm:
++        m = float(_arm)
++        cfg.rewards["action_rate_l2"].weight *= m
++        for st in cfg.curriculum["action_rate_weight"].params["weight_stages"]:
++            st["weight"] *= m
++        print(f"[microduck_standup_env_cfg] MICRODUCK_ACTION_RATE_MULT={m}: action_rate weights x{m}")
++    # MICRODUCK_STANDUP_SMOOTH_MULT=<m>: scale the smoothing terms (gentle_rise |a_z|, arrival_damping,
++    # joint_torque_rate_l2) by m from iter MICRODUCK_STANDUP_SMOOTH_FROM (default 4000); gentle_rise keeps
++    # its recipe weight before that.
++    _sm = os.environ.get("MICRODUCK_STANDUP_SMOOTH_MULT")
++    if _sm:
++        m = float(_sm)
++        _from = int(os.environ.get("MICRODUCK_STANDUP_SMOOTH_FROM", "4000"))
++        w0 = cfg.rewards["gentle_rise"].weight
++        cfg.curriculum["gentle_rise_weight"] = CurriculumTermCfg(
++            func=microduck_mdp.reward_weight,
++            params={"reward_name": "gentle_rise",
++                    "weight_stages": [{"step": 0, "weight": w0}, {"step": _from * 24, "weight": w0 * m}]},
++        )
++        for name in ("arrival_damping_weight", "torque_rate_weight"):
++            stages = cfg.curriculum[name].params["weight_stages"]
++            if not any(st["step"] == _from * 24 for st in stages):
++                before = [st for st in stages if st["step"] < _from * 24]
++                stages.append({"step": _from * 24, "weight": before[-1]["weight"]})
++                stages.sort(key=lambda st: st["step"])
++            for st in stages:
++                if st["step"] >= _from * 24:
++                    st["weight"] *= m
++        print(f"[microduck_standup_env_cfg] MICRODUCK_STANDUP_SMOOTH_MULT={m}: gentle_rise/arrival_damping/torque_rate x{m} from iter {_from}")
++    # MICRODUCK_STANDUP_HEAD_V6="<w head/neck action rate>,<w head/neck torque rate>": no random head commands
++    # (target HOME), head tracked only while standing (actuator/rewards_hd1910.py::head_pose_tracking_standing), the
++    # SMOOTH_MULT factor removed from the all-servo torque rate and applied to the 4 head/neck servos only
++    # (head_neck_*_rate_l2).
++    _hv = os.environ.get("MICRODUCK_STANDUP_HEAD_V6")
++    if _hv:
++        from mjlab_microduck.actuator.rewards_hd1910 import (head_neck_action_rate_l2, head_neck_torque_rate_l2,
++                                                             head_pose_tracking_standing)
++        w_ar, w_tr = (float(x) for x in _hv.split(","))
++        cfg.commands["head_pose"].ranges = tuple((0.0, 0.0) for _ in cfg.commands["head_pose"].ranges)
++        cfg.curriculum.pop("head_pose_range", None)
++        _hp = cfg.rewards["head_pose_tracking"]
++        cfg.rewards["head_pose_tracking"] = RewardTermCfg(func=head_pose_tracking_standing, weight=_hp.weight,
++                                                          params={"command_name": "head_pose", "std": _hp.params.get("std", 0.5)})
++        cfg.rewards["head_neck_action_rate"] = RewardTermCfg(func=head_neck_action_rate_l2, weight=-w_ar)
++        cfg.rewards["head_neck_torque_rate"] = RewardTermCfg(func=head_neck_torque_rate_l2, weight=-w_tr)
++        _m = float(os.environ.get("MICRODUCK_STANDUP_SMOOTH_MULT", "1"))
++        _from = int(os.environ.get("MICRODUCK_STANDUP_SMOOTH_FROM", "4000"))
++        if _m != 1.0:
++            for st in cfg.curriculum["torque_rate_weight"].params["weight_stages"]:
++                if st["step"] >= _from * 24:
++                    st["weight"] /= _m
++        print(f"[microduck_standup_env_cfg] MICRODUCK_STANDUP_HEAD_V6: head commands 0, head tracking only standing, "
++              f"head/neck action rate -{w_ar}, torque rate -{w_tr}; all-servo torque rate back to the recipe (/{_m})")
++    # MICRODUCK_STANDUP_RISE_CAP="<max_up_vel m/s>,<weight>": the sitstand env's rise-speed cap
++    # (trunk_upward_velocity_penalty, self-negating -> positive weight), from iter MICRODUCK_STANDUP_RISE_FROM
++    # (default 6000).
++    _rc = os.environ.get("MICRODUCK_STANDUP_RISE_CAP")
++    if _rc:
++        vmax, wr = (float(x) for x in _rc.split(","))
++        _rfrom = int(os.environ.get("MICRODUCK_STANDUP_RISE_FROM", "6000"))
++        cfg.rewards["rise_speed"] = RewardTermCfg(
++            func=microduck_mdp.trunk_upward_velocity_penalty,
++            weight=0.0,
++            params={"max_up_vel": vmax, "asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",))},
++        )
++        cfg.curriculum["rise_speed_weight"] = CurriculumTermCfg(
++            func=microduck_mdp.reward_weight,
++            params={"reward_name": "rise_speed",
++                    "weight_stages": [{"step": 0, "weight": 0.0}, {"step": _rfrom * 24, "weight": wr}]},
++        )
++        print(f"[microduck_standup_env_cfg] MICRODUCK_STANDUP_RISE_CAP: upward trunk speed > {vmax} m/s penalised, weight {wr} from iter {_rfrom}")
++    # MICRODUCK_STANDUP_TORQUE_LIMIT="<frac of stall>,<weight>[,<skip s>]": servo-load penalty sum relu(|tau|/1.37 - frac)^2
++    # (actuator/rewards_hd1910.py::servo_torque_over_limit), from iter 6000.
++    _tl = os.environ.get("MICRODUCK_STANDUP_TORQUE_LIMIT")
++    if _tl:
++        from mjlab_microduck.actuator.rewards_hd1910 import servo_torque_over_limit
++        _p = [float(x) for x in _tl.split(",")]
++        frac, wt = _p[0], _p[1]
++        skip = _p[2] if len(_p) > 2 else 0.0   # seconds from episode start not penalised (spawn-drop landing)
++        cfg.rewards["servo_torque_limit"] = RewardTermCfg(func=servo_torque_over_limit, weight=0.0, params={"frac": frac, "skip_s": skip})
++        cfg.curriculum["servo_torque_limit_weight"] = CurriculumTermCfg(
++            func=microduck_mdp.reward_weight,
++            params={"reward_name": "servo_torque_limit",
++                    "weight_stages": [{"step": 0, "weight": 0.0}, {"step": 6000 * 24, "weight": -wt}]},
++        )
++        print(f"[microduck_standup_env_cfg] MICRODUCK_STANDUP_TORQUE_LIMIT: servo torque above {frac:.0%} of stall penalised, weight {wt} from iter 6000, not in the first {skip} s of an episode")
++    # MICRODUCK_STANDUP_FALL_BANK="<path.npz>,<prob>": a share <prob> of resets start from a recorded fall state
++    # (actuator/events_hd1910.py::reset_from_fall_bank).
++    _fb = os.environ.get("MICRODUCK_STANDUP_FALL_BANK")
++    if _fb:
++        from mjlab_microduck.actuator.events_hd1910 import reset_from_fall_bank
++        _fbp, _fbq = _fb.rsplit(",", 1)
++        cfg.events["reset_from_fall_bank"] = EventTermCfg(
++            func=reset_from_fall_bank, mode="reset", params={"path": _fbp, "prob": float(_fbq)},
++        )
++        print(f"[microduck_standup_env_cfg] MICRODUCK_STANDUP_FALL_BANK: {_fbp}, share {float(_fbq):.0%}")
++    # MICRODUCK_STANDUP_MOTOR_LINE="<frac>,<weight>,<from iter>,<ramp iters>": servo load against the HD-1910 motor line at
++    # the joint's current speed (actuator/rewards_hd1910.py::servo_motor_line_excess), weight ramped quadratically in 8 steps.
++    # MICRODUCK_STANDUP_LIMIT_MARGIN="<margin rad>,<weight>": legs within <margin> of their hard stops penalised
++    # (mdp.joint_pos_limit_proximity), from iter 0.
++    _sml = os.environ.get("MICRODUCK_STANDUP_MOTOR_LINE")
++    if _sml:
++        from mjlab_microduck.actuator.rewards_hd1910 import servo_motor_line_excess
++        fr, wt, it0, ramp = (float(x) for x in _sml.split(","))
++        cfg.rewards["servo_motor_line"] = RewardTermCfg(func=servo_motor_line_excess, weight=0.0, params={"frac": fr})
++        _st = [{"step": 0, "weight": 0.0}]
++        _st += [{"step": (int(it0) + int(ramp) * k // 8) * 24, "weight": -wt * (k / 8) ** 2} for k in range(1, 9)]
++        cfg.curriculum["servo_motor_line_weight"] = CurriculumTermCfg(
++            func=microduck_mdp.reward_weight, params={"reward_name": "servo_motor_line", "weight_stages": _st})
++        print(f"[microduck_standup_env_cfg] MICRODUCK_STANDUP_MOTOR_LINE: above {fr:.0%} of the motor line, weight {wt}, from iter {int(it0)}, ramp {int(ramp)}")
++    # MICRODUCK_STANDUP_STANCE_CURRENT="<i0 A>,<weight>,<from iter>,<ramp iters>[,<tilt_max deg>,<v_max>,<w_max>]": sustained
++    # servo current in the quiet upright stance (actuator/rewards_hd1910.py::servo_current_hold), weight ramped quadratically
++    # in 8 steps; optional stance-gate thresholds.
++    _sc = os.environ.get("MICRODUCK_STANDUP_STANCE_CURRENT")
++    if _sc:
++        from mjlab_microduck.actuator.rewards_hd1910 import servo_current_hold
++        _p = [float(x) for x in _sc.split(",")]
++        i0, wt, it0, ramp = _p[:4]
++        _gate = {"tilt_max_deg": _p[4], "v_max": _p[5], "w_max": _p[6]} if len(_p) >= 7 else {}   # stance-gate thresholds
++        cfg.rewards["servo_current_hold"] = RewardTermCfg(func=servo_current_hold, weight=0.0, params={"i0_a": i0, **_gate})
++        _st = [{"step": 0, "weight": 0.0}]
++        _st += [{"step": (int(it0) + int(ramp) * k // 8) * 24, "weight": -wt * (k / 8) ** 2} for k in range(1, 9)]
++        cfg.curriculum["servo_current_hold_weight"] = CurriculumTermCfg(
++            func=microduck_mdp.reward_weight, params={"reward_name": "servo_current_hold", "weight_stages": _st})
++        print(f"[microduck_standup_env_cfg] MICRODUCK_STANDUP_STANCE_CURRENT: stance current above {i0} A penalised, weight {wt}, from iter {int(it0)}, ramp {int(ramp)}, gate {_gate or 'default 15°/0.1/1.0'}")
++    # MICRODUCK_STANDUP_NECK_PEN="<n0 rad>,<scale rad>,<weight>,<from iter>,<ramp iters>": neck pitch above HOME + n0 penalised
++    # ((d/scale)^2, actuator/rewards_hd1910.py::neck_strike_approach), weight ramped quadratically from 0 in 8 steps.
++    _np = os.environ.get("MICRODUCK_STANDUP_NECK_PEN")
++    if _np:
++        from mjlab_microduck.actuator.rewards_hd1910 import neck_strike_approach
++        n0, sc, wt, it0, ramp = (float(x) for x in _np.split(","))
++        cfg.rewards["neck_strike_approach"] = RewardTermCfg(func=neck_strike_approach, weight=0.0, params={"n0": n0, "scale": sc})
++        _st = [{"step": 0, "weight": 0.0}]
++        _st += [{"step": (int(it0) + int(ramp) * k // 8) * 24, "weight": -wt * (k / 8) ** 2} for k in range(1, 9)]
++        cfg.curriculum["neck_strike_approach_weight"] = CurriculumTermCfg(
++            func=microduck_mdp.reward_weight, params={"reward_name": "neck_strike_approach", "weight_stages": _st})
++        print(f"[microduck_standup_env_cfg] MICRODUCK_STANDUP_NECK_PEN: neck above HOME+{n0} penalised ((d/{sc})^2), weight {wt}, from iter {int(it0)}, ramp {int(ramp)}")
++    _slm = os.environ.get("MICRODUCK_STANDUP_LIMIT_MARGIN")
++    if _slm:
++        mg, wt = (float(x) for x in _slm.split(","))
++        cfg.rewards["joint_limit_margin"] = RewardTermCfg(
++            func=microduck_mdp.joint_pos_limit_proximity, weight=-wt,
++            params={"margin": mg, "asset_cfg": SceneEntityCfg("robot", joint_names=(r"^(left|right)_(hip_yaw|hip_roll|hip_pitch|knee|ankle)$",))})
++        print(f"[microduck_standup_env_cfg] MICRODUCK_STANDUP_LIMIT_MARGIN: legs within {mg} rad of their stops penalised, weight {wt}")
++    # MICRODUCK_STANDUP_HEAD_BIAS_LAST="<weight>,<from iter>,<ramp iters>": raise the last stage of head_pose_bias (recipe 1.5)
++    # to <weight>, linearly in 4 steps from <from iter>, as the recipe comment at the head_pose_bias curriculum suggests.
++    _hb = os.environ.get("MICRODUCK_STANDUP_HEAD_BIAS_LAST")
++    if _hb:
++        wt, it0, ramp = (float(x) for x in _hb.split(","))
++        st = cfg.curriculum["head_pose_bias_weight"].params["weight_stages"]
++        w_prev = st[-1]["weight"]
++        st += [{"step": (int(it0) + int(ramp) * k // 4) * 24, "weight": w_prev + (wt - w_prev) * k / 4} for k in range(1, 5)]
++        print(f"[microduck_standup_env_cfg] MICRODUCK_STANDUP_HEAD_BIAS_LAST: head_pose_bias last stage {w_prev} -> {wt} from iter {int(it0)} over {int(ramp)}")
++    # MICRODUCK_STANDUP_ALLCOLL=1: train on the full-collision model (robot_allcollisions: 73 collision geoms incl. the
++    # servo housings, as VelStand uses) instead of robot_groundcontact (11 geoms). Timestep/solver unchanged.
++    if os.environ.get("MICRODUCK_STANDUP_ALLCOLL"):
++        from mjlab_microduck.robot.microduck_constants import MICRODUCK_ALLCOLLISIONS_ROBOT_CFG
++        cfg.scene.entities = {"robot": MICRODUCK_ALLCOLLISIONS_ROBOT_CFG}
++        cfg.sim.nconmax = max(cfg.sim.nconmax or 0, 200)
++        print("[microduck_standup_env_cfg] MICRODUCK_STANDUP_ALLCOLL: full-collision model")
++
++    # ── Roller StandUp ──────────────────────────────────────────────────────────────────────────────────────────────
++    # The getting-up recipe on the full-collision roller model: standing height on wheels 139 mm (walk 115 mm), lying
++    # heights 57 / 45 / 42 mm (belly / back / side). No stable seated pose on wheels, so the starts are belly / back
++    # (with ±90° roll = side) / standing. Wheels: no sole friction event (friction from the XML); bearing drag as an
++    # inverse curriculum 0.02 → 0 N·m. Head contact with the floor: small impact penalty; servo housings: larger.
++    if rollers:
++        from mjlab_microduck.robot.microduck_constants import MICRODUCK_ALLCOLLISIONS_ROLLERS_ROBOT_CFG, SERVO_GEOM_SUFFIX
++        ROLLER_STAND_Z = 0.139
++        dz = ROLLER_STAND_Z - STAND_Z
++        cfg.scene.entities = {"robot": MICRODUCK_ALLCOLLISIONS_ROLLERS_ROBOT_CFG}
++        cfg.sim.nconmax = max(cfg.sim.nconmax or 0, 200)
++        feet_rollers = ContactSensorCfg(
++            name="feet_ground_contact",
++            primary=ContactMatch(mode="subtree", pattern=r"^(ankle_l_v1|ankle_r_v1)$", entity="robot"),   # tires + blade frame, left first
++            secondary=ContactMatch(mode="body", pattern="terrain"),
++            fields=("found", "force"), reduce="netforce", num_slots=1, track_air_time=True)
++        impact = lambda name, mode, pattern: ContactSensorCfg(
++            name=name, primary=ContactMatch(mode=mode, pattern=pattern, entity="robot"),
++            secondary=ContactMatch(mode="body", pattern="terrain"), fields=("force",), reduce="netforce", num_slots=1)
++        cfg.scene.sensors = (feet_rollers, self_collision_cfg,
++                             impact("servo_ground_contact", "geom", rf"^.*{SERVO_GEOM_SUFFIX}$"),
++                             impact("head_ground_contact", "body", rf"^({'|'.join(HEAD_BODY_NAMES)})$"),
++                             impact("trunk_ground_contact", "body", "^trunk_base$"))
++        cfg.rewards["head_impact"] = RewardTermCfg(func=microduck_mdp.body_impact_cost, weight=-0.5,
++                                                   params={"sensor_name": "head_ground_contact", "threshold": 16.0})
++        cfg.rewards["servo_impact"] = RewardTermCfg(func=microduck_mdp.body_impact_cost, weight=-2.0,
++                                                    params={"sensor_name": "servo_ground_contact", "threshold": 2.0})
++        cfg.events.pop("foot_friction", None)
++        cfg.events["randomize_wheel_friction"] = EventTermCfg(
++            func=dr.dof_frictionloss, mode="reset",
++            params={"asset_cfg": SceneEntityCfg("robot", joint_names=(r"^passive_.*wheel",)), "operation": "abs", "ranges": (0.02, 0.02)})
++        cfg.curriculum["wheel_friction"] = CurriculumTermCfg(
++            func=microduck_mdp.wheel_friction_curriculum,
++            params={"event_name": "randomize_wheel_friction", "ranges_stages": [
++                {"step": 0, "ranges": (0.02, 0.02)}, {"step": 500 * 24, "ranges": (0.01, 0.01)},
++                {"step": 1000 * 24, "ranges": (0.003, 0.003)}, {"step": 1500 * 24, "ranges": (0.0, 0.0)}]})
++        # MICRODUCK_ROLLSTAND_DRAG="<Nm>": fixed bearing drag, no curriculum (evaluation and fine-tuning)
++        _rd = os.environ.get("MICRODUCK_ROLLSTAND_DRAG")
++        if _rd:
++            cfg.curriculum.pop("wheel_friction")
++            cfg.events["randomize_wheel_friction"].params["ranges"] = (float(_rd), float(_rd))
++        # heights: every height-like reward parameter shifts up by dz (target, gates, caps)
++        for term in cfg.rewards.values():
++            for k, v in list(term.params.items()):
++                if "height" in k and isinstance(v, float) and v > 0.08:
++                    term.params[k] = v + dz
++        gs = cfg.events["set_ground_state"].params
++        gs.update({"sitting_prob": 0.0, "face_down_prob": 0.45, "face_up_prob": 0.10, "standing_prob": 0.45,
++                   "prone_z_min": 0.06, "prone_z_max": 0.10, "standing_z_min": 0.135, "standing_z_max": 0.145})
++        # sitting overrides are qpos indices of the walk model (wheel joints interleave on the roller model); unused: no sitting starts
++        gs["sitting_joint_overrides"] = {}
++        for c in cfg.curriculum.values():
++            if c.params.get("event_name") == "set_ground_state":
++                c.params["param_stages"] = [
++                    {"step": 0,          "params": {"standing_prob": 0.45, "sitting_prob": 0.0, "face_down_prob": 0.45, "face_up_prob": 0.10}},
++                    {"step": 600 * 24,   "params": {"standing_prob": 0.30, "sitting_prob": 0.0, "face_down_prob": 0.45, "face_up_prob": 0.25}},
++                    {"step": 1500 * 24,  "params": {"standing_prob": 0.20, "sitting_prob": 0.0, "face_down_prob": 0.40, "face_up_prob": 0.40}},
++                    {"step": 2500 * 24,  "params": {"standing_prob": 0.15, "sitting_prob": 0.0, "face_down_prob": 0.40, "face_up_prob": 0.45}}]
++        # MICRODUCK_ROLLSTAND_MIX_FINAL=1: the hardest start mix from step 0 (fine-tune of a policy that already gets up)
++        if os.environ.get("MICRODUCK_ROLLSTAND_MIX_FINAL") == "1":
++            for c in cfg.curriculum.values():
++                if c.params.get("event_name") == "set_ground_state":
++                    last = dict(c.params["param_stages"][-1]); last["step"] = 0
++                    c.params["param_stages"] = [last]
++            gs.update(last["params"])
++        _sb = os.environ.get("MICRODUCK_SIM_BUFFERS")
++        if _sb:
++            cfg.sim.nconmax, cfg.sim.njmax = (int(x) for x in _sb.split(","))
++        print(f"[microduck_standup_env_cfg] rollers: full-collision roller model, STAND_Z {ROLLER_STAND_Z}, starts belly/back/standing, "
++              f"wheel drag 0.02 -> 0 by 1500, head impact -0.5 @16 N, servo impact -2 @2 N, buffers {cfg.sim.nconmax}/{cfg.sim.njmax}")
++
+     # ── Body-control curricula ────────────────────────────────────────────────
+     # Everything below is body-control only — NOTE the early return; add any
+     # unrelated cfg above this line.
+diff --git a/src/mjlab_microduck/tasks/microduck_velocity_env_cfg.py b/src/mjlab_microduck/tasks/microduck_velocity_env_cfg.py
+index 45a1f6d..97b65ef 100644
+--- a/src/mjlab_microduck/tasks/microduck_velocity_env_cfg.py
++++ b/src/mjlab_microduck/tasks/microduck_velocity_env_cfg.py
+@@ -17,6 +17,7 @@ gait/feet terms, curriculum-ramped action-rate smoothing), with:
+ """
+ 
+ import math
++import os
+ from copy import deepcopy
+ 
+ NUM_STEPS_PER_ENV = 24
+@@ -652,6 +653,14 @@ def make_microduck_velocity_env_cfg(
+     cfg.commands["twist"] = microduck_mdp.VelocityCommandCommandOnlyCfg(**vars(command))
+     # Explicit turn-in-place bucket (see TURN_IN_PLACE_FRACTION above).
+     cfg.commands["twist"].rel_turn_in_place_envs = TURN_IN_PLACE_FRACTION
++    # MICRODUCK_PLAY_CMD="vx,vy,wz": fixed twist command for the viewer (m/s, m/s, rad/s)
++    _pc = os.environ.get("MICRODUCK_PLAY_CMD")
++    if _pc:
++        vx, vy, wz = (float(x) for x in _pc.split(","))
++        tw = cfg.commands["twist"]
++        tw.ranges.lin_vel_x = (vx, vx); tw.ranges.lin_vel_y = (vy, vy); tw.ranges.ang_vel_z = (wz, wz)
++        tw.rel_standing_envs = 0.0; tw.rel_turn_in_place_envs = 0.0
++        print(f"[microduck_velocity_env_cfg] MICRODUCK_PLAY_CMD: fixed twist {vx, vy, wz}")
+ 
+     # Head pose command (4D deltas from HOME, in joint order:
+     #   neck_pitch, head_pitch, head_yaw, head_roll). Tracked as a primary
+@@ -661,7 +670,7 @@ def make_microduck_velocity_env_cfg(
+     # from HOME (XML limits minus HOME offset, with ~10% safety margin):
+     #   neck_pitch / head_pitch: ±1.10 rad (limit ±π/2 with HOME=±20°)
+     #   head_yaw                : ±1.40 rad (limit ±π/2 with HOME=0)
+-    #   head_roll               : ±0.31 rad (limit ±20°)
++    #   head_roll               : ±0.26 rad (limit ±15° with HOME=0)
+     # Initial ranges are small non-zero so input neurons stay alive from step 0.
+     cfg.commands["head_pose"] = microduck_mdp.UniformPoseCommandCfg(
+         resampling_time_range=HEAD_POSE_CMD_RESAMPLE_S,
+@@ -751,6 +760,24 @@ def make_microduck_velocity_env_cfg(
+     else:
+         cfg.scene.terrain.terrain_type = "generator"
+         cfg.scene.terrain.terrain_generator = MICRODUCK_ROUGH_TERRAINS_CFG
++        # MICRODUCK_ROUGH_PROPS="flat,stairs,grid,slope": sub-terrain proportions.
++        _rp = os.environ.get("MICRODUCK_ROUGH_PROPS")
++        if _rp:
++            gen = deepcopy(MICRODUCK_ROUGH_TERRAINS_CFG)
++            for k, p in zip(("flat", "pyramid_stairs", "random_grid", "pyramid_slope"), _rp.split(",")):
++                gen.sub_terrains[k].proportion = float(p)
++            cfg.scene.terrain.terrain_generator = gen
++            print(f"[microduck_velocity_env_cfg] MICRODUCK_ROUGH_PROPS={_rp}")
++        # MICRODUCK_ROUGH_MAX="<stairs step m>,<grid height m>": cap the obstacle heights.
++        _rm = os.environ.get("MICRODUCK_ROUGH_MAX")
++        if _rm:
++            st_m, gr_m = (float(x) for x in _rm.split(","))
++            gen = cfg.scene.terrain.terrain_generator
++            if gen is MICRODUCK_ROUGH_TERRAINS_CFG:
++                gen = deepcopy(MICRODUCK_ROUGH_TERRAINS_CFG); cfg.scene.terrain.terrain_generator = gen
++            gen.sub_terrains["pyramid_stairs"].step_height_range = (0.0, st_m)
++            gen.sub_terrains["random_grid"].grid_height_range = (0.0, gr_m)
++            print(f"[microduck_velocity_env_cfg] MICRODUCK_ROUGH_MAX={_rm}")
+ 
+         # Soften terrain box contacts: adjacent boxes at different heights create
+         # hard edges that destabilise the contact solver and produce NaN forces.
+@@ -812,7 +839,7 @@ def make_microduck_velocity_env_cfg(
+     # Head pose command range curriculum — per-joint, scaled to each joint's
+     # reachable delta from HOME (with ~10% margin from XML limits). Same 5-stage
+     # shape as before (5% → 15% → 35% → 65% → 100% of each joint's final cap).
+-    # neck/head pitch final ±1.10 rad, head_yaw ±1.40, head_roll ±0.31.
++    # neck/head pitch final ±1.10 rad, head_yaw ±1.40, head_roll ±0.26.
+     cfg.curriculum["head_pose_range"] = CurriculumTermCfg(
+         func=microduck_mdp.pose_command_range_curriculum,
+         params={
+@@ -823,7 +850,7 @@ def make_microduck_velocity_env_cfg(
+                 {"step": 500 * 24,  "ranges": ((-0.17, 0.17),  (-0.17, 0.17),  (-0.21, 0.21),  (-0.047, 0.047))},
+                 {"step": 1000 * 24, "ranges": ((-0.39, 0.39),  (-0.39, 0.39),  (-0.49, 0.49),  (-0.11, 0.11))},
+                 {"step": 1500 * 24, "ranges": ((-0.72, 0.72),  (-0.72, 0.72),  (-0.91, 0.91),  (-0.20, 0.20))},
+-                {"step": 2000 * 24, "ranges": ((-1.10, 1.10),  (-1.10, 1.10),  (-1.40, 1.40),  (-0.31, 0.31))},
++                {"step": 2000 * 24, "ranges": ((-1.10, 1.10),  (-1.10, 1.10),  (-1.40, 1.40),  (-0.26, 0.26))},
+             ],
+         },
+     )
+@@ -905,6 +932,172 @@ def make_microduck_velocity_env_cfg(
+             ],
+         },
+     )
++    # MICRODUCK_HEAD_BIAS_MULT=<m>: multiply the head_pose_bias weight stages by m.
++    _hbm = os.environ.get("MICRODUCK_HEAD_BIAS_MULT")
++    if _hbm:
++        for st in cfg.curriculum["head_pose_bias_weight"].params["weight_stages"]:
++            st["weight"] *= float(_hbm)
++        print(f"[microduck_velocity_env_cfg] MICRODUCK_HEAD_BIAS_MULT={_hbm}")
++
++    # HD-1910 switches. Without the env vars the recipe is Pollen's, unchanged.
++    _scale = os.environ.get("MICRODUCK_ACTION_SCALE")
++    if _scale:
++        cfg.actions["joint_pos"].scale = float(_scale)
++        print(f"[microduck_velocity_env_cfg] MICRODUCK_ACTION_SCALE={_scale}")
++    if os.environ.get("MICRODUCK_ACTION_CLIP", "").lower() == "limits":
++        # Clamp the target (after scale/offset) to each joint's range instead of the raw policy output.
++        spec = cfg.scene.entities["robot"].spec_fn()
++        lim = {j.name: (float(j.range[0]), float(j.range[1])) for j in spec.joints
++               if j.name and not j.name.startswith("passive_") and j.range[1] > j.range[0]}
++        cfg.actions["joint_pos"].clip = lim
++        print(f"[microduck_velocity_env_cfg] MICRODUCK_ACTION_CLIP=limits: target clamped to joint range on {len(lim)} joints")
++    # action_rate_l2 is computed on RAW policy outputs: with MICRODUCK_ACTION_SCALE=s the same joint
++    # motion costs 1/s^2 more than in the stock recipe. MICRODUCK_ACTION_RATE_MULT
++    # rescales the initial weight and every curriculum stage (s^2 restores the recipe's price).
++    _arm = os.environ.get("MICRODUCK_ACTION_RATE_MULT")
++    if _arm:
++        m = float(_arm)
++        cfg.rewards["action_rate_l2"].weight *= m
++        for st in cfg.curriculum["action_rate_weight"].params["weight_stages"]:
++            st["weight"] *= m
++        print(f"[microduck_velocity_env_cfg] MICRODUCK_ACTION_RATE_MULT={m}: action_rate weights x{m}")
++    # Tracking kernels exp(-err^2/std^2): stock std = sqrt(0.1) m/s and sqrt(0.5) rad/s, loose enough
++    # that half the commanded speed costs little. Override the std in m/s and rad/s.
++    _sl, _sa = os.environ.get("MICRODUCK_TRACK_STD_LIN"), os.environ.get("MICRODUCK_TRACK_STD_ANG")
++    if _sl:
++        cfg.rewards["track_linear_velocity"].params["std"] = float(_sl)
++        print(f"[microduck_velocity_env_cfg] MICRODUCK_TRACK_STD_LIN={_sl}")
++    if _sa:
++        cfg.rewards["track_angular_velocity"].params["std"] = float(_sa)
++        print(f"[microduck_velocity_env_cfg] MICRODUCK_TRACK_STD_ANG={_sa}")
++    # MICRODUCK_FIXED_CMD="vx,vy,wz": one fixed command for every env (viewer / eval only).
++    _fc = os.environ.get("MICRODUCK_FIXED_CMD")
++    if _fc:
++        vx, vy, wz = (float(x) for x in _fc.split(","))
++        tw = cfg.commands["twist"]
++        tw.ranges.lin_vel_x = (vx, vx); tw.ranges.lin_vel_y = (vy, vy); tw.ranges.ang_vel_z = (wz, wz)
++        tw.rel_standing_envs = 0.0; tw.rel_turn_in_place_envs = 0.0
++        # head and body pose commands pinned to zero, their range curricula off
++        for cname in ("head_pose", "body_pose"):
++            pc = cfg.commands[cname]
++            pc.ranges = tuple((0.0, 0.0) for _ in pc.ranges); pc.zero_command_prob = 1.0
++        for cur in ("head_pose_range", "body_pose_range"):
++            cfg.curriculum.pop(cur, None)
++        print(f"[microduck_velocity_env_cfg] MICRODUCK_FIXED_CMD={_fc} (head/body pose = 0)")
++    # MICRODUCK_ACTION_FILTER_TAU=<s>: first-order low-pass on the joint targets (software stand-in for
++    # the XL330's ~2.4 Hz position loop; the robot runtime must apply the same filter).
++    _tau = os.environ.get("MICRODUCK_ACTION_FILTER_TAU")
++    if _tau:
++        import dataclasses as _dc
++        from mjlab_microduck.actuator.filtered_action import FilteredJointPositionActionCfg
++        _old = cfg.actions["joint_pos"]
++        cfg.actions["joint_pos"] = FilteredJointPositionActionCfg(
++            **{f.name: getattr(_old, f.name) for f in _dc.fields(_old) if f.init}, tau_s=float(_tau))
++        print(f"[microduck_velocity_env_cfg] MICRODUCK_ACTION_FILTER_TAU={_tau}")
++    # MICRODUCK_POSE_STD_WALK="hip_roll=0.15,hip_yaw=0.5": per-joint std (rad) of the pose reward in the
++    # walking regime (stock: hip_roll 0.05, hip_yaw 0.3).
++    _psw = os.environ.get("MICRODUCK_POSE_STD_WALK")
++    if _psw:
++        sw = dict(cfg.rewards["pose"].params["std_walking"])
++        for kv in _psw.split(","):
++            k, v = kv.split("=")
++            sw[f".*{k.strip()}.*"] = float(v)
++        cfg.rewards["pose"].params["std_walking"] = sw
++        cfg.rewards["pose"].params["std_running"] = sw
++        print(f"[microduck_velocity_env_cfg] MICRODUCK_POSE_STD_WALK={_psw}")
++    # MICRODUCK_TRACK_STD_ANG_ZERO=<rad/s>: wider yaw-tracking std when no turn is commanded
++    # (track_angular_velocity_dual_std).
++    _saz = os.environ.get("MICRODUCK_TRACK_STD_ANG_ZERO")
++    if _saz:
++        from mjlab_microduck.actuator.rewards_hd1910 import track_angular_velocity_dual_std
++        t = cfg.rewards["track_angular_velocity"]
++        t.func = track_angular_velocity_dual_std
++        t.params = {"std": t.params["std"], "std_zero_cmd": float(_saz), "command_name": t.params["command_name"]}
++        print(f"[microduck_velocity_env_cfg] MICRODUCK_TRACK_STD_ANG_ZERO={_saz}")
++    # MICRODUCK_VX_MAX=<m/s>: forward/backward command range (stock ±0.4).
++    _vx = os.environ.get("MICRODUCK_VX_MAX")
++    if _vx:
++        cfg.commands["twist"].ranges.lin_vel_x = (-float(_vx), float(_vx))
++        print(f"[microduck_velocity_env_cfg] MICRODUCK_VX_MAX={_vx}")
++    _turn = os.environ.get("MICRODUCK_TURN_FRAC")
++    if _turn:
++        cfg.commands["twist"].rel_turn_in_place_envs = float(_turn)
++        print(f"[microduck_velocity_env_cfg] MICRODUCK_TURN_FRAC={_turn}")
++    # MICRODUCK_TURN_INPLACE_MAX=<rad/s>: widen only the turn-in-place bucket (lin = 0) to |wz| up to this
++    # value; walking/turning combinations keep ranges.ang_vel_z (recipe ±1.0). actuator/commands_hd1910.py.
++    # MICRODUCK_WALK_TORQUE_LIMIT="<frac of stall>,<weight>[,<skip s>]": servo-load penalty sum relu(|tau|/1.37 - frac)^2
++    # (actuator/rewards_hd1910.py::servo_torque_over_limit), from iter 1000.
++    _wtl = os.environ.get("MICRODUCK_WALK_TORQUE_LIMIT")
++    if _wtl:
++        from mjlab_microduck.actuator.rewards_hd1910 import servo_torque_over_limit
++        _p = [float(x) for x in _wtl.split(",")]
++        _skip = _p[2] if len(_p) > 2 else 0.0
++        cfg.rewards["servo_torque_limit"] = RewardTermCfg(func=servo_torque_over_limit, weight=0.0, params={"frac": _p[0], "skip_s": _skip})
++        cfg.curriculum["servo_torque_limit_weight"] = CurriculumTermCfg(
++            func=microduck_mdp.reward_weight,
++            params={"reward_name": "servo_torque_limit",
++                    "weight_stages": [{"step": 0, "weight": 0.0}, {"step": 1000 * NUM_STEPS_PER_ENV, "weight": -_p[1]}]},
++        )
++        print(f"[microduck_velocity_env_cfg] MICRODUCK_WALK_TORQUE_LIMIT: servo torque above {_p[0]:.0%} of stall penalised, weight {_p[1]} from iter 1000, not in the first {_skip} s")
++    # MICRODUCK_WALK_MOTOR_LINE="<frac>,<weight>,<from iter>,<ramp iters>": servo load against the HD-1910 motor line
++    # at the joint's current speed (actuator/rewards_hd1910.py::servo_motor_line_excess), weight grows quadratically
++    # over <ramp iters> in 8 steps from <from iter>.
++    # MICRODUCK_WALK_LIMIT_MARGIN="<margin rad>,<weight>": L1 on joints inside <margin> of their hard stops
++    # (mdp.joint_pos_limit_proximity), legs only, from iter 0.
++    # MICRODUCK_WALK_PROGRESS="<weight>,<vmax m/s>[,<head gate rad>]": linear pay for speed along the command, capped at
++    # the command (actuator/rewards_hd1910.py::walk_progress).
++    _wpg = os.environ.get("MICRODUCK_WALK_PROGRESS")
++    if _wpg:
++        from mjlab_microduck.actuator.rewards_hd1910 import walk_progress
++        _p = [float(x) for x in _wpg.split(",")]; wt, vm = _p[0], _p[1]; hg = _p[2] if len(_p) > 2 else 0.0
++        # 3rd value: head gate, rad. Speed pays only while the nose is not held down past the head command
++        # (1 s EMA of head_pose_bias); full pay at 0, zero at <gate> rad.
++        cfg.rewards["walk_progress"] = RewardTermCfg(func=walk_progress, weight=wt, params={"vmax": vm, "head_gate": hg})
++        print(f"[microduck_velocity_env_cfg] MICRODUCK_WALK_PROGRESS: weight {wt}, vmax {vm}, head gate {hg} rad")
++    _wml = os.environ.get("MICRODUCK_WALK_MOTOR_LINE")
++    if _wml:
++        from mjlab_microduck.actuator.rewards_hd1910 import servo_motor_line_excess
++        fr, wt, it0, ramp = (float(x) for x in _wml.split(","))
++        cfg.rewards["servo_motor_line"] = RewardTermCfg(func=servo_motor_line_excess, weight=0.0, params={"frac": fr})
++        _st = [{"step": 0, "weight": 0.0}]
++        _st += [{"step": (int(it0) + int(ramp) * k // 8) * NUM_STEPS_PER_ENV, "weight": -wt * (k / 8) ** 2} for k in range(1, 9)]
++        cfg.curriculum["servo_motor_line_weight"] = CurriculumTermCfg(
++            func=microduck_mdp.reward_weight, params={"reward_name": "servo_motor_line", "weight_stages": _st})
++        print(f"[microduck_velocity_env_cfg] MICRODUCK_WALK_MOTOR_LINE: above {fr:.0%} of the motor line, weight {wt}, from iter {int(it0)}, ramp {int(ramp)}")
++    # MICRODUCK_TAU_RATE="<w_start>,<w_end>,<it_ramp_in>,<it_hold_end>,<it_full>": servo torque-rate
++    # penalty (rewards_hd1910.servo_torque_rate). Absolute iterations (a resume keeps the checkpoint's counter): 0 -> w_start
++    # linearly up to it_ramp_in, hold w_start to it_hold_end, linearly to w_end at it_full, hold.
++    _tr = os.environ.get("MICRODUCK_TAU_RATE")
++    if _tr:
++        from mjlab_microduck.actuator.rewards_hd1910 import servo_torque_rate
++        w0, w1, i0, i1, i2 = (float(x) for x in _tr.split(","))
++        # MICRODUCK_TAU_RATE_JOINTS=<regex>: only these joints are priced (default: all)
++        cfg.rewards["servo_torque_rate"] = RewardTermCfg(func=servo_torque_rate, weight=0.0, params={"joints": os.environ.get("MICRODUCK_TAU_RATE_JOINTS", "")})
++        _st = [{"step": 0, "weight": -1e-6}]                       # tiny non-zero: the term must run once to arm the accumulator
++        _st += [{"step": int(i0 * k / 8) * NUM_STEPS_PER_ENV, "weight": -w0 * k / 8} for k in range(1, 9)] if i0 > 0 else [{"step": 0, "weight": -w0}]
++        _st += [{"step": int(i1 + (i2 - i1) * k / 8) * NUM_STEPS_PER_ENV, "weight": -(w0 + (w1 - w0) * k / 8)} for k in range(1, 9)]
++        cfg.curriculum["servo_torque_rate_weight"] = CurriculumTermCfg(
++            func=microduck_mdp.reward_weight, params={"reward_name": "servo_torque_rate", "weight_stages": _st})
++        print(f"[microduck_velocity_env_cfg] MICRODUCK_TAU_RATE: {w0} by iter {int(i0)}, hold to {int(i1)}, {w1} at iter {int(i2)}")
++    # MICRODUCK_CAM_STAB="<weight>,<thresh rad²/s²>[,<gate std rad>]": camera held still in space (rewards_hd1910.camera_stabilization)
++    _cs = os.environ.get("MICRODUCK_CAM_STAB")
++    if _cs:
++        from mjlab_microduck.actuator.rewards_hd1910 import camera_stabilization
++        _p = [float(x) for x in _cs.split(",")]; _w, _th = _p[0], _p[1]; _gs = _p[2] if len(_p) > 2 else 0.0   # 3rd: head-arrived gate std, rad
++        cfg.rewards["camera_stabilization"] = RewardTermCfg(func=camera_stabilization, weight=-_w, params={"thresh": _th, "gate_std": _gs})
++        print(f"[microduck_velocity_env_cfg] MICRODUCK_CAM_STAB: weight {_w}, thresh {_th}, gate std {_gs}")
++    _wlm = os.environ.get("MICRODUCK_WALK_LIMIT_MARGIN")
++    if _wlm:
++        mg, wt = (float(x) for x in _wlm.split(","))
++        cfg.rewards["joint_limit_margin"] = RewardTermCfg(
++            func=microduck_mdp.joint_pos_limit_proximity, weight=-wt,
++            params={"margin": mg, "asset_cfg": SceneEntityCfg("robot", joint_names=(r"^(left|right)_(hip_yaw|hip_roll|hip_pitch|knee|ankle)$",))})
++        print(f"[microduck_velocity_env_cfg] MICRODUCK_WALK_LIMIT_MARGIN: joints within {mg} rad of their stops penalised, weight {wt}")
++    _tim = os.environ.get("MICRODUCK_TURN_INPLACE_MAX")
++    if _tim:
++        from mjlab_microduck.actuator.commands_hd1910 import TurnInPlaceWideCommandCfg
++        cfg.commands["twist"] = TurnInPlaceWideCommandCfg(**{**vars(cfg.commands["twist"]), "turn_in_place_max": float(_tim)})
++        print(f"[microduck_velocity_env_cfg] MICRODUCK_TURN_INPLACE_MAX={_tim}: turn-in-place |wz| up to {_tim}, walking combos keep {cfg.commands['twist'].ranges.ang_vel_z}")
+ 
+     return cfg
+ 
+@@ -947,3 +1140,11 @@ MicroduckRlCfg = RslRlOnPolicyRunnerCfg(
+     num_steps_per_env=24,
+     max_iterations=50_000,
+ )
++# MICRODUCK_ACTION_CLIP=<x>: clamp raw policy outputs to +-x
++# in the RslRlVecEnvWrapper (train, play and export all read agent_cfg.clip_actions).
++if os.environ.get("MICRODUCK_ENTROPY_COEF"):
++    MicroduckRlCfg.algorithm.entropy_coef = float(os.environ["MICRODUCK_ENTROPY_COEF"])
++    print(f"[microduck_velocity_env_cfg] MICRODUCK_ENTROPY_COEF={MicroduckRlCfg.algorithm.entropy_coef}")
++if os.environ.get("MICRODUCK_ACTION_CLIP", "").replace(".", "", 1).isdigit():
++    MicroduckRlCfg.clip_actions = float(os.environ["MICRODUCK_ACTION_CLIP"])
++    print(f"[microduck_velocity_env_cfg] MICRODUCK_ACTION_CLIP={MicroduckRlCfg.clip_actions}")
+diff --git a/src/mjlab_microduck/tasks/microduck_velocity_rollers_env_cfg.py b/src/mjlab_microduck/tasks/microduck_velocity_rollers_env_cfg.py
+index 1d2c466..5842b44 100644
+--- a/src/mjlab_microduck/tasks/microduck_velocity_rollers_env_cfg.py
++++ b/src/mjlab_microduck/tasks/microduck_velocity_rollers_env_cfg.py
+@@ -26,6 +26,7 @@ Task design (unchanged — the roller recipe):
+   skating style.
+ """
+ 
++import os
+ import math
+ from copy import deepcopy
+ 
+@@ -626,6 +627,606 @@ def make_microduck_velocity_rollers_env_cfg(
+             },
+         )
+ 
++    # HD-1910 switches, as in the other tasks; without the env vars Pollen's recipe is unchanged.
++    # MICRODUCK_ACTION_SCALE=<s>, MICRODUCK_ACTION_CLIP=limits (target clamped to the joint range),
++    # MICRODUCK_ACTION_RATE_MULT=<m>.
++    _scale = os.environ.get("MICRODUCK_ACTION_SCALE")
++    if _scale:
++        joint_pos_action.scale = float(_scale)
++        print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_ACTION_SCALE={_scale}")
++    if os.environ.get("MICRODUCK_ACTION_CLIP", "").lower() == "limits":
++        spec = cfg.scene.entities["robot"].spec_fn()
++        lim = {j.name: (float(j.range[0]), float(j.range[1])) for j in spec.joints
++               if j.name and not j.name.startswith("passive_") and j.range[1] > j.range[0]}
++        # MICRODUCK_ACTION_CLIP_MARGIN="<rad>[,<joint regex>]": keep the target this far inside the stops (matching joints;
++        # default all). The runtime applies the same clamp.
++        _cm = os.environ.get("MICRODUCK_ACTION_CLIP_MARGIN")
++        if _cm:
++            import re as _re
++            _mp = _cm.split(","); _mg = float(_mp[0]); _rx = _re.compile(_mp[1] if len(_mp) > 1 else ".*")
++            lim = {n: ((lo + _mg, hi - _mg) if _rx.search(n) else (lo, hi)) for n, (lo, hi) in lim.items()}
++            print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_ACTION_CLIP_MARGIN={_cm}: targets kept {_mg} rad inside the stops")
++        joint_pos_action.clip = lim
++        print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_ACTION_CLIP=limits: target clamped to joint range on {len(lim)} joints")
++    _arm = os.environ.get("MICRODUCK_ACTION_RATE_MULT")
++    if _arm:
++        m = float(_arm)
++        cfg.rewards["action_rate_l2"].weight *= m
++        for st in cfg.curriculum["action_rate_weight"].params["weight_stages"]:
++            st["weight"] *= m
++        print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_ACTION_RATE_MULT={m}: action_rate weights x{m}")
++    # MICRODUCK_ROLLER_COM_BAND="<lo>,<hi>" (m): paid trunk-height band.
++    _cb = os.environ.get("MICRODUCK_ROLLER_COM_BAND")
++    if _cb:
++        lo, hi = (float(x) for x in _cb.split(","))
++        cfg.rewards["com_height_target"].params.update({"target_height_min": lo, "target_height_max": hi})
++        print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_ROLLER_COM_BAND: {lo}-{hi} m")
++    # MICRODUCK_ROLLER_MOTOR_LINE="<frac>,<w>,<from iter>,<ramp>" and MICRODUCK_ROLLER_LIMIT_MARGIN="<margin rad>,<w>,<from>,<ramp>":
++    # servo-load and joint-stop penalties, weight ramped quadratically in 8 steps from <from iter> over <ramp> iterations.
++    def _ramp(name, w, it0, ramp):
++        st = [{"step": 0, "weight": 0.0}] + [{"step": (int(it0) + int(ramp) * k // 8) * 24, "weight": -w * (k / 8) ** 2} for k in range(1, 9)]
++        cfg.curriculum[f"{name}_weight"] = CurriculumTermCfg(func=microduck_mdp.reward_weight, params={"reward_name": name, "weight_stages": st})
++    _ml = os.environ.get("MICRODUCK_ROLLER_MOTOR_LINE")
++    if _ml:
++        from mjlab_microduck.actuator.rewards_hd1910 import servo_motor_line_excess
++        fr, wt, it0, ramp = (float(x) for x in _ml.split(","))
++        cfg.rewards["servo_motor_line"] = RewardTermCfg(func=servo_motor_line_excess, weight=0.0, params={"frac": fr})
++        _ramp("servo_motor_line", wt, it0, ramp)
++        print(f"[microduck_velocity_rollers_env_cfg] MOTOR_LINE: above {fr:.0%}, weight {wt}, from iter {int(it0)}, ramp {int(ramp)}")
++    _lm = os.environ.get("MICRODUCK_ROLLER_LIMIT_MARGIN")
++    if _lm:
++        mg, wt, it0, ramp = (float(x) for x in _lm.split(","))
++        cfg.rewards["joint_limit_margin"] = RewardTermCfg(
++            func=microduck_mdp.joint_pos_limit_proximity, weight=0.0,
++            params={"margin": mg, "asset_cfg": SceneEntityCfg("robot", joint_names=(
++                r"^(left|right)_(hip_yaw|hip_roll|hip_pitch|knee|ankle)$", r"^neck_pitch$", r"^head_pitch$", r"^head_roll$"))})
++        _ramp("joint_limit_margin", wt, it0, ramp)
++        print(f"[microduck_velocity_rollers_env_cfg] LIMIT_MARGIN: {mg} rad, weight {wt}, from iter {int(it0)}, ramp {int(ramp)}")
++    # MICRODUCK_ROLLER_WHEEL_W=<w>: weight of wheel_speed, the only positive task term.
++    _ww = os.environ.get("MICRODUCK_ROLLER_WHEEL_W")
++    if _ww:
++        cfg.rewards["wheel_speed"].weight = float(_ww)
++        print(f"[microduck_velocity_rollers_env_cfg] wheel_speed weight {_ww}")
++    # MICRODUCK_ROLLER_SPEED=body|rolling: pay the trunk's forward speed (rollers_hd1910.body_speed_reward) or the rolling
++    # speed (rollers_hd1910.rolling_speed_reward) instead of the wheel spin.
++    if os.environ.get("MICRODUCK_ROLLER_SPEED") in ("body", "rolling"):
++        from mjlab_microduck.tasks import rollers_hd1910 as rl
++        ws = cfg.rewards["wheel_speed"]
++        _f = rl.rolling_speed_reward if os.environ["MICRODUCK_ROLLER_SPEED"] == "rolling" else rl.body_speed_reward
++        cfg.rewards["wheel_speed"] = RewardTermCfg(func=_f, weight=ws.weight,
++                                                   params={"command_name": ws.params.get("command_name", "twist"),
++                                                           "vel_scale": ws.params.get("vel_scale", 0.3)})
++        print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_ROLLER_SPEED={os.environ['MICRODUCK_ROLLER_SPEED']}: wheel_speed replaced ({_f.__name__})")
++    # MICRODUCK_ROLLER_HEADING_OBS="<max rad>": cmd[2] = heading error vs the heading at episode start, clipped to ±max
++    # (rollers_hd1910.SpawnHeadingVelocityCommand). In the stock recipe ang_vel_z=(0,0), so cmd[2] is always 0.
++    _ho = os.environ.get("MICRODUCK_ROLLER_HEADING_OBS")
++    if _ho:
++        from mjlab_microduck.tasks import rollers_hd1910 as rl
++        tw = cfg.commands["twist"]
++        tw.ranges.ang_vel_z = (-float(_ho), float(_ho))
++        cfg.commands["twist"] = rl.SpawnHeadingVelocityCommandCfg(**vars(tw))
++        print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_ROLLER_HEADING_OBS: cmd[2] = heading error vs spawn, clip ±{_ho} rad")
++    _hw = os.environ.get("MICRODUCK_ROLLER_HEADING_W")
++    if _hw:
++        cfg.rewards["heading_hold"].weight = float(_hw)
++        print(f"[microduck_velocity_rollers_env_cfg] heading_hold weight {_hw}")
++    _sb = os.environ.get("MICRODUCK_SIM_BUFFERS")
++    if _sb:
++        cfg.sim.nconmax, cfg.sim.njmax = (int(x) for x in _sb.split(","))
++        print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_SIM_BUFFERS: nconmax {cfg.sim.nconmax}, njmax {cfg.sim.njmax}")
++
++    # MICRODUCK_ROLLER_RECIPE=aswizzle: ride recipe for the HD-1910 duck. Both skates on the floor, legs mirrored (swizzle);
++    # the power stroke is the A-phase (toes in, pulling the skates together). Signed speed command (m/s), paid only by
++    # rolling (grounded wheels turning with the ground, capped by the trunk speed); heading error vs the spawn heading in
++    # cmd[2]; head commands. Pollen's stride terms (single support, glide, air time, hip_roll_neutral, forward lean,
++    # feet_flat, throttle/brake) are removed.
++    if os.environ.get("MICRODUCK_ROLLER_RECIPE") == "aswizzle":
++        from mjlab_microduck.tasks import rollers_hd1910 as rl
++        for name in ("wheel_speed", "braking", "skating_air_time", "glide", "single_support", "gait_symmetry", "hip_roll_neutral",
++                     "forward_lean", "heading_hold", "feet_flat", "action_over_limit", "neck_joint_pos_l2"):
++            cfg.rewards.pop(name, None)
++        # Default weights W, overridable with MICRODUCK_ROLLER_W="key=value,...". Speed-tracking std:
++        # MICRODUCK_ROLLER_SPEED_STD (m/s, default 0.25).
++        W = {"speed": 8.0, "push": 30.0, "grounded": 2.0, "leg_symmetry": 2.0, "heading": 2.0, "blade_pitch": -2.0, "head": 2.0}
++        for k, v in (x.split("=") for x in os.environ.get("MICRODUCK_ROLLER_W", "").split(",") if x):
++            W[k] = float(v)
++        cfg.rewards["speed_track"] = RewardTermCfg(func=rl.rolling_speed_track, weight=W["speed"],
++                                                   params={"command_name": "twist", "std": float(os.environ.get("MICRODUCK_ROLLER_SPEED_STD", "0.25"))})
++        # Discovery term: rolling_speed_reward pays |cmd| x tanh(rolling speed in the commanded direction / 0.3) from v = 0,
++        # weight W["push"], halved at iter 1500, 0 at iter 2000.
++        cfg.rewards["speed_push"] = RewardTermCfg(func=rl.rolling_speed_reward, weight=W["push"],
++                                                  params={"command_name": "twist", "vel_scale": 0.3, "bidirectional": True})
++        cfg.curriculum["speed_push_weight"] = CurriculumTermCfg(func=microduck_mdp.reward_weight, params={
++            "reward_name": "speed_push", "weight_stages": [{"step": 0, "weight": W["push"]}, {"step": 1500 * 24, "weight": W["push"] / 2},
++                                                           {"step": 2000 * 24, "weight": 0.0}]})
++        cfg.rewards["grounded"] = RewardTermCfg(func=rl.both_blades_grounded, weight=W["grounded"])
++        cfg.rewards["leg_symmetry"] = RewardTermCfg(func=microduck_mdp.leg_symmetry_reward, weight=W["leg_symmetry"],
++                                                    params={"asset_cfg": SceneEntityCfg("robot")})
++        cfg.rewards["heading_tracking"] = RewardTermCfg(func=microduck_mdp.heading_tracking_reward, weight=W["heading"],
++                                                        params={"command_name": "twist", "std": 0.5})
++        cfg.rewards["blade_pitch"] = RewardTermCfg(func=rl.blade_pitch_penalty, weight=W["blade_pitch"])
++        # MICRODUCK_ROLLER_GLIDE_QUIET="w[,std]": glide_quiet_tracking pays rolling on both blades with still legs
++        # (exp(-legs_rms^2/std^2), std in rad/s, default 2.0), gated by the speed tracking.
++        _gq = os.environ.get("MICRODUCK_ROLLER_GLIDE_QUIET")
++        if _gq:
++            _gqp = [float(x) for x in _gq.split(",")]
++            cfg.rewards["glide_quiet"] = RewardTermCfg(func=rl.glide_quiet_tracking, weight=_gqp[0],
++                                                       params={"command_name": "twist", "std": _gqp[1] if len(_gqp) > 1 else 2.0,
++                                                               "speed_std": float(os.environ.get("MICRODUCK_ROLLER_SPEED_STD", "0.25"))})
++            print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_ROLLER_GLIDE_QUIET: weight {_gqp[0]}")
++        # MICRODUCK_ROLLER_SPEED_V2="std,lat_std": speed_track pays the trunk speed x rolling quality (sideways skid of the
++        # grounded blades, m/s); the glide_quiet term is gated by the same measure.
++        _sv2 = os.environ.get("MICRODUCK_ROLLER_SPEED_V2")
++        if _sv2:
++            _s2, _l2 = (float(x) for x in _sv2.split(","))
++            cfg.rewards["speed_track"] = RewardTermCfg(func=rl.rolling_quality_track, weight=W["speed"],
++                                                       params={"command_name": "twist", "std": _s2, "lat_std": _l2})
++            if "glide_quiet" in cfg.rewards:
++                cfg.rewards["glide_quiet"] = RewardTermCfg(func=rl.glide_quiet_quality, weight=cfg.rewards["glide_quiet"].weight,
++                                                           params={"command_name": "twist", "std": cfg.rewards["glide_quiet"].params["std"],
++                                                                   "speed_std": _s2, "lat_std": _l2})
++            print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_ROLLER_SPEED_V2: trunk speed x rolling quality, std {_s2}, skid std {_l2}")
++        # MICRODUCK_ROLLER_SWIZZLE="amp,toe_deg,f_max,weight,std": prescribed swizzle push. A clock (sin, cos; rate from the
++        # speed command, up to f_max Hz) is observed; swizzle_gait_track pays hip roll/yaw following the reference (amp rad,
++        # toe deg); balance and speed are left to the policy. Pose std of hip roll/yaw 0.5 rad; the clock mirrors as itself
++        # (both legs out and in together).
++        _swz = os.environ.get("MICRODUCK_ROLLER_SWIZZLE")
++        if _swz:
++            import math as _m
++            from mjlab_microduck.tasks import symmetry as _sym
++            _sa, _st, _sf, _sw_w, _ss = (float(x) for x in _swz.split(","))
++            cfg.commands["swizzle_phase"] = rl.SwizzleClockCommandCfg(resampling_time_range=(1000.0, 1000.0), amp=_sa, f_max=_sf)
++            for group in ("actor", "critic"):
++                cfg.observations[group].terms["swizzle_phase"] = ObservationTermCfg(func=mdp.generated_commands, params={"command_name": "swizzle_phase"})
++            cfg.rewards["swizzle_gait"] = RewardTermCfg(func=rl.swizzle_gait_track, weight=_sw_w,
++                                                        params={"amp": _sa, "toe": _m.radians(_st), "std": _ss})
++            for std_key in ("std_walking", "std_running"):                # standing keeps the tight HOME pose
++                if std_key in cfg.rewards["pose"].params:
++                    cfg.rewards["pose"].params[std_key] = {k: (0.5 if ("hip_yaw" in k or "hip_roll" in k) else v)
++                                                           for k, v in cfg.rewards["pose"].params[std_key].items()}
++            _sym.CLOCK_MIRROR_SIGN = 1.0
++            print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_ROLLER_SWIZZLE: amp {_sa} rad, toe {_st} deg, f_max {_sf} Hz, weight {_sw_w}, std {_ss}")
++        # speed command, 20 % standing; cmd[2] = heading error vs spawn (SpawnHeading), clip ±0.5 rad
++        SKIP = os.environ.get("MICRODUCK_ROLLER_RECIPE_SKIP", "").split(",")   # diagnostics only
++        tw = cfg.commands["twist"]
++        tw.ranges.lin_vel_x = (-0.45, 0.45)
++        _pc = os.environ.get("MICRODUCK_ROLLER_PLAY_CMD")               # viewer: fixed speed command, m/s, e.g. "-0.3" (ride backward)
++        if _pc:
++            tw.ranges.lin_vel_x = (float(_pc), float(_pc))
++            SKIP.append("standing")
++        # MICRODUCK_RIDE_V0="lo,hi": spawn already rolling at lo..hi m/s (rolling entry, wheels on the floor, yaw 0)
++        _rv0 = os.environ.get("MICRODUCK_RIDE_V0")
++        if _rv0:
++            _lo, _hi = (float(x) for x in _rv0.split(","))
++            cfg.events["reset_rolling_entry"] = EventTermCfg(func=microduck_mdp.reset_rolling_entry, mode="reset", params={"speed_range": (_lo, _hi)})
++            cfg.events["reset_base"].params["pose_range"]["z"] = (0.140, 0.141)
++            cfg.events["reset_base"].params["pose_range"]["yaw"] = (0.0, 0.0)
++            cfg.events["reset_base"].params["velocity_range"] = {}
++        # MICRODUCK_ROLLER_CIRCLE="lo,hi": the ride with a yaw-rate command in cmd[2] (|omega| lo..hi rad/s, random sign)
++        # tracked by yaw_rate_track instead of the heading hold; speed 0.2..0.5 m/s, no standing
++        _circle = os.environ.get("MICRODUCK_ROLLER_CIRCLE")
++        if _circle:
++            _ylo, _yhi = (float(x) for x in _circle.split(","))
++            tw.ranges.lin_vel_x = (0.2, 0.5)
++            tw.rel_standing_envs = 0.0
++            cfg.commands["twist"] = rl.CircleCommandCfg(**vars(tw))
++            cfg.rewards.pop("heading_tracking", None)
++            cfg.rewards["yaw_rate_track"] = RewardTermCfg(func=rl.yaw_rate_track, weight=2 * W["heading"], params={"command_name": "twist", "std": 0.5})
++            SKIP += ["heading", "standing"]
++        if "heading" not in SKIP:
++            tw.ranges.ang_vel_z = (-0.5, 0.5)
++            cfg.commands["twist"] = rl.SpawnHeadingVelocityCommandCfg(**vars(tw))
++        if "standing" not in SKIP:
++            tw.rel_standing_envs = 0.2
++        # MICRODUCK_ROLLER_CROUCH="<depth m>,<weight>,<zero_prob>[,<std m>]": crouch while riding. cmd[1] = depth u in
++        # [0, 0.3] (rollers_hd1910.py::CrouchCommand, drawn with the speed, zero with zero_prob); crouch_height_track pays
++        # the trunk at z_home - (u/0.3)*depth (Gaussian, std default 0.03 m) instead of the com_height band, which is removed.
++        # Symmetry: cmd[1] must keep its sign -> MICRODUCK_SYM_TWIST_SIGN=1,1,-1 (tasks/symmetry.py).
++        _cr = os.environ.get("MICRODUCK_ROLLER_CROUCH")
++        if _cr:
++            _cp = [float(x) for x in _cr.split(",")]
++            _dep, _wc, _zp = _cp[:3]
++            _std = _cp[3] if len(_cp) > 3 else 0.03   # height Gaussian std, m
++            _band = cfg.rewards["com_height_target"].params
++            _zh = 0.5 * (float(_band["target_height_min"]) + float(_band["target_height_max"]))
++            cfg.rewards.pop("com_height_target", None)
++            cfg.rewards["crouch_height"] = RewardTermCfg(func=rl.crouch_height_track, weight=_wc,
++                                                         params={"command_name": "twist", "depth": _dep, "z_home": _zh, "std": _std})
++            cfg.commands["twist"] = rl.CrouchCommandCfg(**vars(cfg.commands["twist"]))   # zero_prob read from the env var
++            print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_ROLLER_CROUCH: depth {_dep} m from z_home {_zh:.3f}, weight {_wc}, zero prob {_zp}, std {_std}")
++            # MICRODUCK_ROLLER_CROUCH_FINE="std,weight": a second, narrower crouch height term (std in m)
++            _cf = os.environ.get("MICRODUCK_ROLLER_CROUCH_FINE")
++            if _cf:
++                _fs, _fw = (float(x) for x in _cf.split(","))
++                cfg.rewards["crouch_height_fine"] = RewardTermCfg(func=rl.crouch_height_track, weight=_fw,
++                                                                  params={"command_name": "twist", "depth": _dep, "z_home": _zh, "std": _fs})
++                print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_ROLLER_CROUCH_FINE: std {_fs}, weight {_fw}")
++            # MICRODUCK_ROLLER_HEAD_TOUCH=<w>: -w per step while the head (jaw_soft) touches the floor
++            _ht = os.environ.get("MICRODUCK_ROLLER_HEAD_TOUCH")
++            if _ht:
++                if not any(sn.name == "head_ground_contact" for sn in cfg.scene.sensors):
++                    cfg.scene.sensors = tuple(cfg.scene.sensors) + (ContactSensorCfg(
++                        name="head_ground_contact", primary=ContactMatch(mode="body", pattern="jaw_soft", entity="robot"),
++                        secondary=ContactMatch(mode="body", pattern="terrain"), fields=("found",), reduce="none", num_slots=1),)
++                from mjlab_microduck.actuator.rewards_hd1910 import head_ground_touch
++                cfg.rewards["head_touch"] = RewardTermCfg(func=head_ground_touch, weight=-float(_ht), params={"sensor_name": "head_ground_contact"})
++                print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_ROLLER_HEAD_TOUCH: head-floor contact -{float(_ht)} per step")
++            # MICRODUCK_ROLLER_CROUCH_POSE="hip,knee,ankle": the pose reference follows the depth (rl.crouch_posture); left-leg
++            # deltas at full depth, right mirrored; applied below, after the pose term's joint scope is set.
++        # head: commands from the start (moderate), full range by 1500; pose reward scoped to the legs
++        if "head" not in SKIP:
++          cfg.commands["head_pose"] = microduck_mdp.UniformPoseCommandCfg(
++            resampling_time_range=(2.0, 5.0), zero_command_prob=0.2,
++            ranges=((-0.3, 0.3), (-0.3, 0.3), (-0.5, 0.5), (-0.1, 0.1)))
++          for group in ("actor", "critic"):
++            cfg.observations[group].terms["head_command"] = ObservationTermCfg(func=mdp.generated_commands, params={"command_name": "head_pose"})
++          cfg.rewards["head_pose_tracking"] = RewardTermCfg(func=microduck_mdp.head_pose_tracking, weight=W["head"],
++                                                          params={"command_name": "head_pose", "std": 0.5})
++          cfg.curriculum["head_pose_range"] = CurriculumTermCfg(func=microduck_mdp.pose_command_range_curriculum, params={
++            "command_name": "head_pose", "range_stages": [
++                {"step": 0, "ranges": ((-0.3, 0.3), (-0.3, 0.3), (-0.5, 0.5), (-0.1, 0.1))},
++                {"step": 1500 * 24, "ranges": ((-0.6, 0.6), (-0.6, 0.6), (-1.0, 1.0), (-0.2, 0.2))}]})
++        for std_key in ("std_standing", "std_walking", "std_running"):
++            cfg.rewards["pose"].params[std_key] = {k: v for k, v in cfg.rewards["pose"].params[std_key].items()
++                                                   if "neck" not in k and "head" not in k and "passive" not in k}
++        cfg.rewards["pose"].params["asset_cfg"] = SceneEntityCfg("robot", joint_names=(r"^(?!passive_|.*neck.*|.*head.*).*",))
++        cfg.rewards["pose"].weight = 1.0
++        _cpz = os.environ.get("MICRODUCK_ROLLER_CROUCH_POSE") if os.environ.get("MICRODUCK_ROLLER_CROUCH") else None
++        if _cpz:
++            _cd = tuple(float(x) for x in _cpz.split(","))
++            cfg.rewards["pose"].func = rl.crouch_posture
++            cfg.rewards["pose"].params["crouch_delta"] = _cd
++            _wl1 = float(os.environ.get("MICRODUCK_ROLLER_CROUCH_L1", "2.0"))   # crouch L1 bootstrap weight (Pollen's)
++            cfg.rewards["crouch_pose_l1"] = RewardTermCfg(func=rl.crouch_posture_l1, weight=_wl1, params={"command_name": "twist", "crouch_delta": _cd})
++            if os.environ.get("MICRODUCK_ROLLER_CROUCH_COAST") == "1" and "speed_track" in cfg.rewards:   # gate the speed credit by the crouch depth
++                # with SPEED_V2 the speed credit is rolling_quality_track; the swizzle clock reward is gated too
++                if cfg.rewards["speed_track"].func is rl.rolling_quality_track:
++                    cfg.rewards["speed_track"].func = rl.crouch_gated_quality_track
++                else:
++                    cfg.rewards["speed_track"].func = rl.crouch_gated_speed_track
++                if "swizzle_gait" in cfg.rewards:
++                    cfg.rewards["swizzle_gait"].func = rl.crouch_gated_swizzle_gait
++                print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_ROLLER_CROUCH_COAST: {cfg.rewards['speed_track'].func.__name__}"
++                      f"{' + crouch_gated_swizzle_gait' if 'swizzle_gait' in cfg.rewards else ''} x (1 - depth/0.3)")
++            print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_ROLLER_CROUCH_POSE: pose reference HOME + (cmd[1]/0.3) * {_cd}")
++        # MICRODUCK_ROLLER_FISH="amp,T_lo,T_hi,std": slalom. The ride + a clock (sin, cos; period T_lo..T_hi s per episode,
++        # observed, mirrored by symmetry.py like the stride clock) and fish_reward (both skates swivel together amp*sin under
++        # the trunk that holds its heading). leg_symmetry is removed; hip-yaw std of the pose term 0.5 rad;
++        # speed 0.25-0.4 m/s, no standing.
++        _fish = os.environ.get("MICRODUCK_ROLLER_FISH")
++        if _fish:
++            _amp, _tlo, _thi, _fstd = (float(x) for x in _fish.split(","))
++            cfg.rewards.pop("leg_symmetry", None)
++            cfg.rewards["fish"] = RewardTermCfg(func=rl.fish_reward, weight=W.get("fish", 8.0), params={"amp": _amp, "std": _fstd})
++            cfg.commands["fish_phase"] = rl.StridePhaseCommandCfg(resampling_time_range=(1000.0, 1000.0), period=_tlo, period_range=(_tlo, _thi))
++            for group in ("actor", "critic"):
++                cfg.observations[group].terms["fish_phase"] = ObservationTermCfg(func=mdp.generated_commands, params={"command_name": "fish_phase"})
++            cfg.commands["twist"].ranges.lin_vel_x = (0.25, 0.4)
++            cfg.commands["twist"].rel_standing_envs = 0.0
++            for std_key in ("std_walking", "std_running"):
++                cfg.rewards["pose"].params[std_key] = {k: (0.5 if "hip_yaw" in k else v) for k, v in cfg.rewards["pose"].params[std_key].items()}
++            # MICRODUCK_ROLLER_FISH_NARROW="across_max,weight,speed": stance-width penalty (skate axes beyond across_max, m) and
++            # a fixed speed command (m/s). With MICRODUCK_ROLLER_FISH "amp,T,T,std" the period is fixed as well.
++            _fn = os.environ.get("MICRODUCK_ROLLER_FISH_NARROW")
++            if _fn:
++                _am_n, _w_n, _v_n = (float(x) for x in _fn.split(","))
++                cfg.rewards["fish_spread"] = RewardTermCfg(func=rl.snake_spread, weight=-_w_n, params={"across_max": _am_n})
++                cfg.commands["twist"].ranges.lin_vel_x = (_v_n, _v_n)
++                if "reset_rolling_entry" not in cfg.events:
++                    cfg.events["reset_rolling_entry"] = EventTermCfg(func=microduck_mdp.reset_rolling_entry, mode="reset", params={"speed_range": (_v_n, _v_n)})
++                    cfg.events["reset_base"].params["pose_range"]["z"] = (0.140, 0.141)
++                    cfg.events["reset_base"].params["pose_range"]["yaw"] = (0.0, 0.0)
++                    cfg.events["reset_base"].params["velocity_range"] = {}
++                else:
++                    cfg.events["reset_rolling_entry"].params["speed_range"] = (_v_n, _v_n)
++            # MICRODUCK_ROLLER_SNAKE="ahead_full,across_max": Fish in scissors; cmd[1] = +-1 which skate leads
++            # (OneSkateSideCommand keeps it for the episode), snake_reward replaces fish_reward (Fish x scissors factor)
++            _snake = os.environ.get("MICRODUCK_ROLLER_SNAKE")
++            if _snake:
++                _af, _am = (float(x) for x in _snake.split(","))
++                cfg.rewards.pop("fish", None)
++                cfg.rewards["snake"] = RewardTermCfg(func=rl.snake_reward, weight=W.get("fish", 8.0), params={
++                    "amp": _amp, "std": _fstd, "ahead_full": _af, "across_max": _am})
++                # additive shaping: W["push"] x lead (m, up to 5 cm) and -W["push"] x spread beyond across_max (m)
++                cfg.rewards["snake_scissors"] = RewardTermCfg(func=rl.snake_scissors, weight=W["push"], params={"ahead_full": 0.05})
++                cfg.rewards["snake_spread"] = RewardTermCfg(func=rl.snake_spread, weight=-W["push"], params={"across_max": _am})
++                _tw = cfg.commands["twist"]; _tw.ranges.lin_vel_y = (-1.0, 1.0)
++                cfg.commands["twist"] = rl.OneSkateSideCommandCfg(**vars(_tw))
++            if "reset_rolling_entry" not in cfg.events:
++                cfg.events["reset_rolling_entry"] = EventTermCfg(func=microduck_mdp.reset_rolling_entry, mode="reset", params={"speed_range": (0.25, 0.4)})
++                cfg.events["reset_base"].params["pose_range"]["z"] = (0.140, 0.141)
++                cfg.events["reset_base"].params["pose_range"]["yaw"] = (0.0, 0.0)
++                cfg.events["reset_base"].params["velocity_range"] = {}
++        print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_ROLLER_RECIPE=aswizzle: weights {W}; terms {sorted(cfg.rewards)}")
++
++    # MICRODUCK_ROLLER_RECIPE=brake: stop from a ride. Spawn already rolling (reset_rolling_entry: base + wheels,
++    # no slip), command = zeros ("stop"), 2.5 s episodes. Pays the speed drop each step (potential) and being stopped
++    # upright on both blades (per step). Pollen's stride/throttle terms are removed; safety terms as in the ride.
++    if os.environ.get("MICRODUCK_ROLLER_RECIPE") == "brake":
++        from mjlab_microduck.tasks import rollers_hd1910 as rl
++        for name in ("wheel_speed", "braking", "skating_air_time", "glide", "single_support", "gait_symmetry", "hip_roll_neutral",
++                     "forward_lean", "heading_hold", "feet_flat", "action_over_limit", "neck_joint_pos_l2"):
++            cfg.rewards.pop(name, None)
++        # Default weights W, overridable with MICRODUCK_ROLLER_W="key=value,...". No pose term while braking (HOME is
++        # paid inside `stopped`). Spawn at the rest height 0.140 m.
++        W = {"progress": 200.0, "stopped": 6.0, "grounded": 2.0, "heading": 2.0, "blade_pitch": -2.0, "leg_symmetry": 0.0}
++        for k, v in (x.split("=") for x in os.environ.get("MICRODUCK_ROLLER_W", "").split(",") if x):
++            W[k] = float(v)
++        cfg.rewards["brake_progress"] = RewardTermCfg(func=rl.brake_progress, weight=W["progress"])
++        cfg.rewards["stopped"] = RewardTermCfg(func=rl.stopped_upright, weight=W["stopped"])
++        cfg.rewards["grounded"] = RewardTermCfg(func=rl.both_blades_grounded, weight=W["grounded"])
++        cfg.rewards["heading_tracking"] = RewardTermCfg(func=microduck_mdp.heading_tracking_reward, weight=W["heading"],
++                                                        params={"command_name": "twist", "std": 0.5})
++        cfg.rewards["blade_pitch"] = RewardTermCfg(func=rl.blade_pitch_penalty, weight=W["blade_pitch"])
++        if W["leg_symmetry"]:
++            cfg.rewards["leg_symmetry"] = RewardTermCfg(func=microduck_mdp.leg_symmetry_reward, weight=W["leg_symmetry"],
++                                                        params={"asset_cfg": SceneEntityCfg("robot")})
++        cfg.rewards.pop("pose", None)
++        cfg.episode_length_s = 2.5
++        tw = cfg.commands["twist"]
++        tw.ranges.lin_vel_x = (-0.01, 0.01)
++        tw.ranges.ang_vel_z = (-0.5, 0.5)
++        tw.rel_standing_envs = 0.0
++        tw.resampling_time_range = (10.0, 10.0)
++        cfg.commands["twist"] = rl.SpawnHeadingVelocityCommandCfg(**vars(tw))
++        # MICRODUCK_BRAKE_BIDIR=1: starts rolling backward too, cmd[0] = +/-0.3 gives the direction
++        if os.environ.get("MICRODUCK_BRAKE_BIDIR") == "1":
++            cfg.commands["twist"] = rl.BrakeDirCommandCfg(**vars(tw))
++        cfg.commands["head_pose"] = microduck_mdp.UniformPoseCommandCfg(resampling_time_range=(10.0, 10.0), zero_command_prob=0.5,
++                                                                        ranges=((-0.05, 0.05), (-0.05, 0.05), (-0.05, 0.05), (-0.02, 0.02)))
++        for group in ("actor", "critic"):
++            cfg.observations[group].terms["head_command"] = ObservationTermCfg(func=mdp.generated_commands, params={"command_name": "head_pose"})
++        cfg.rewards["head_pose_tracking"] = RewardTermCfg(func=microduck_mdp.head_pose_tracking, weight=1.0,
++                                                          params={"command_name": "head_pose", "std": 0.5})
++        cfg.events["reset_base"].params["velocity_range"] = {}
++        cfg.events["reset_base"].params["pose_range"]["z"] = (0.140, 0.141)
++        cfg.events["reset_base"].params["pose_range"]["yaw"] = (0.0, 0.0)   # reset_rolling_entry pushes along world x
++        # MICRODUCK_BRAKE_V0="lo,hi": entry speed range, m/s (default 0.2,0.5)
++        _v0 = tuple(float(x) for x in os.environ.get("MICRODUCK_BRAKE_V0", "0.2,0.5").split(","))
++        cfg.events["reset_rolling_entry"] = EventTermCfg(func=microduck_mdp.reset_rolling_entry, mode="reset",
++                                                         params={"speed_range": _v0})
++        if os.environ.get("MICRODUCK_BRAKE_BIDIR") == "1":
++            cfg.events["reset_rolling_entry"] = EventTermCfg(func=rl.reset_rolling_entry_bidir, mode="reset",
++                                                             params={"speed_range": _v0, "back_prob": 0.5})
++        # MICRODUCK_BRAKE_BANK="<bank .pt>,<frac>": frac of the starts from recorded states (rl.reset_from_state_bank);
++        # a separate event key, so it runs after reset_rolling_entry.
++        _bk = os.environ.get("MICRODUCK_BRAKE_BANK")
++        if _bk:
++            _bp, _bf = _bk.rsplit(",", 1)
++            cfg.events["reset_state_bank"] = EventTermCfg(func=rl.reset_from_state_bank, mode="reset", params={"path": _bp, "frac": float(_bf)})
++            print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_BRAKE_BANK: {float(_bf):.2f} of the starts from {_bp}")
++        cfg.curriculum.pop("wheel_friction", None)                      # bearings free
++        print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_ROLLER_RECIPE=brake: weights {W}; terms {sorted(cfg.rewards)}")
++
++    # MICRODUCK_ROLLER_RECIPE=stride: skater's stride (push, glide on one skate, set the other down, push with the one
++    # that was gliding). The ride's speed terms (rolling speed tracking + fading push) plus a
++    # gait clock (StridePhaseCommand, observed): by phase the free skate is held still 2-4 cm up while the other rolls; around
++    # the phase change both are down. No 'both blades down' term, no HOME pose term,
++    # no leg symmetry. MICRODUCK_STRIDE="period s,transition,lift_min m,lift_full m,swing_quiet_std m/s".
++    if os.environ.get("MICRODUCK_ROLLER_RECIPE") == "stride":
++        from mjlab_microduck.tasks import rollers_hd1910 as rl
++        for name in ("wheel_speed", "braking", "skating_air_time", "glide", "single_support", "gait_symmetry", "hip_roll_neutral",
++                     "forward_lean", "heading_hold", "feet_flat", "action_over_limit", "neck_joint_pos_l2", "pose"):
++            cfg.rewards.pop(name, None)
++        W = {"speed": 8.0, "push": 30.0, "stride": 8.0, "wrong_foot": -2.0, "heading": 2.0, "blade_pitch": -2.0, "head": 2.0}
++        for k, v in (x.split("=") for x in os.environ.get("MICRODUCK_ROLLER_W", "").split(",") if x):
++            W[k] = float(v)
++        _sp = [float(x) for x in os.environ.get("MICRODUCK_STRIDE", "1.2,0.15,0.02,0.04,0.3").split(",")]
++        period, transition, lift_min, lift_full, swing_std = _sp
++        cfg.rewards["speed_track"] = RewardTermCfg(func=rl.rolling_speed_track, weight=W["speed"],
++                                                   params={"command_name": "twist", "std": float(os.environ.get("MICRODUCK_ROLLER_SPEED_STD", "0.25"))})
++        cfg.rewards["speed_push"] = RewardTermCfg(func=rl.rolling_speed_reward, weight=W["push"],
++                                                  params={"command_name": "twist", "bidirectional": True})
++        cfg.curriculum["speed_push_weight"] = CurriculumTermCfg(func=microduck_mdp.reward_weight, params={
++            "reward_name": "speed_push", "weight_stages": [{"step": 0, "weight": W["push"]}, {"step": 1500 * 24, "weight": W["push"] / 2},
++                                                           {"step": 2000 * 24, "weight": 0.0}]})
++        cfg.rewards["stride"] = RewardTermCfg(func=rl.stride_reward, weight=W["stride"], params={
++            "lift_min": lift_min, "lift_full": lift_full, "swing_quiet_std": swing_std, "transition": transition})
++        cfg.rewards["wrong_foot"] = RewardTermCfg(func=rl.stride_wrong_foot, weight=W["wrong_foot"], params={"transition": transition})
++        if W.get("single", 0.0):                                             # optional: any single-skate glide (no clock), weight W["single"]
++            cfg.rewards["single_glide"] = RewardTermCfg(func=rl.single_glide, weight=W["single"], params={
++                "lift_min": lift_min, "lift_full": lift_full, "swing_quiet_std": swing_std})
++        cfg.rewards["heading_tracking"] = RewardTermCfg(func=microduck_mdp.heading_tracking_reward, weight=W["heading"],
++                                                        params={"command_name": "twist", "std": 0.5})
++        cfg.rewards["blade_pitch"] = RewardTermCfg(func=rl.blade_pitch_penalty, weight=W["blade_pitch"])
++        tw = cfg.commands["twist"]
++        tw.ranges.lin_vel_x = (0.2, 0.5)
++        tw.ranges.ang_vel_z = (-0.5, 0.5)
++        tw.rel_standing_envs = 0.1
++        cfg.commands["twist"] = rl.SpawnHeadingVelocityCommandCfg(**vars(tw))
++        cfg.commands["stride_phase"] = rl.StridePhaseCommandCfg(resampling_time_range=(1000.0, 1000.0), period=period)
++        cfg.commands["head_pose"] = microduck_mdp.UniformPoseCommandCfg(resampling_time_range=(3.0, 6.0), zero_command_prob=0.3,
++                                                                        ranges=((-0.3, 0.3), (-0.3, 0.3), (-0.5, 0.5), (-0.1, 0.1)))
++        for group in ("actor", "critic"):
++            cfg.observations[group].terms["head_command"] = ObservationTermCfg(func=mdp.generated_commands, params={"command_name": "head_pose"})
++            cfg.observations[group].terms["stride_phase"] = ObservationTermCfg(func=mdp.generated_commands, params={"command_name": "stride_phase"})
++        cfg.rewards["head_pose_tracking"] = RewardTermCfg(func=microduck_mdp.head_pose_tracking, weight=W["head"],
++                                                          params={"command_name": "head_pose", "std": 0.5})
++        cfg.events["reset_base"].params["pose_range"]["z"] = (0.140, 0.141)
++        cfg.curriculum.pop("wheel_friction", None)
++        print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_ROLLER_RECIPE=stride: weights {W}, stride {_sp}; terms {sorted(cfg.rewards)}")
++
++    # MICRODUCK_ROLLER_RECIPE=oneskate | spin | crab | pivot | heeltoe: tricks, each its own policy on the flat roller task.
++    # Common: no Pollen stride terms; upright / heading / blades / head terms.
++    _rc = os.environ.get("MICRODUCK_ROLLER_RECIPE")
++    if _rc in ("oneskate", "spin", "crab", "pivot", "heeltoe"):
++        from mjlab_microduck.tasks import rollers_hd1910 as rl
++        _neck_term = cfg.rewards.get("neck_joint_pos_l2")                   # kept for the MICRODUCK_ONESKATE_V5 neck penalty
++        for name in ("wheel_speed", "braking", "skating_air_time", "glide", "single_support", "gait_symmetry", "hip_roll_neutral",
++                     "forward_lean", "heading_hold", "feet_flat", "action_over_limit", "neck_joint_pos_l2", "pose"):
++            cfg.rewards.pop(name, None)
++        W = {"task": 8.0, "push": 30.0, "grounded": 2.0, "heading": 2.0, "blade_pitch": -2.0, "head": 1.0, "place": -2.0}
++        for k, v in (x.split("=") for x in os.environ.get("MICRODUCK_ROLLER_W", "").split(",") if x):
++            W[k] = float(v)
++        tw = cfg.commands["twist"]
++        tw.rel_standing_envs = 0.0
++        tw.resampling_time_range = (10.0, 10.0)
++        cfg.events["reset_base"].params["pose_range"]["z"] = (0.140, 0.141)
++        # MICRODUCK_HEAD_BAND="neck°,head_pitch°,head_roll°,weight": head kept in a band around HOME (rl.head_band_excess)
++        _hbd = os.environ.get("MICRODUCK_HEAD_BAND")
++        if _hbd:
++            _b1, _b2, _b3, _wb = (float(x) for x in _hbd.split(","))
++            cfg.rewards["head_band"] = RewardTermCfg(func=rl.head_band_excess, weight=-_wb, params={"bands_deg": (_b1, _b2, _b3)})
++        if _rc == "oneskate":
++            # start rolling 0.3-0.5 m/s, cmd[1] = which skate to lift (+ left / - right), 3 s; glide on the other
++            # MICRODUCK_ONESKATE_LIFT="lift_min,lift_full,swing_quiet_std": pay only above lift_min (m), full at lift_full (m),
++            # lifted foot still (std, m/s)
++            _lp = os.environ.get("MICRODUCK_ONESKATE_LIFT")
++            _lk = dict(zip(("lift_min", "lift_full", "swing_quiet_std"), (float(x) for x in _lp.split(",")))) if _lp else {}
++            cfg.rewards["one_skate"] = RewardTermCfg(func=rl.one_skate_glide, weight=W["task"], params={"command_name": "twist", "vel_scale": 0.3, **_lk})
++            tw.ranges.lin_vel_x = (-0.01, 0.01); tw.ranges.lin_vel_y = (-1.0, 1.0); tw.ranges.ang_vel_z = (-0.5, 0.5)
++            cfg.commands["twist"] = rl.OneSkateSideCommandCfg(**vars(tw))
++            cfg.events["reset_base"].params["velocity_range"] = {}
++            cfg.events["reset_base"].params["pose_range"]["yaw"] = (0.0, 0.0)
++            cfg.events["reset_rolling_entry"] = EventTermCfg(func=microduck_mdp.reset_rolling_entry, mode="reset", params={"speed_range": (0.4, 0.6)})
++            cfg.episode_length_s = 2.0                                       # glide window, s
++            # MICRODUCK_ONESKATE_V5="back_min,back_full,lift_min,lean_target" (rad, rad, m, rad): spiral. Free leg back,
++            # trunk leaned forward, no pushes (no_push_penalty), start 0.5-0.8 m/s, 3 s; for the last
++            # MICRODUCK_ONESKATE_END_HOLD s cmd[1] = 0 (put the skate down); neck penalty.
++            # MICRODUCK_ONESKATE_STRIDE="t_lo,t_hi,v_lo,v_hi": one-skate glide with the side flipping every T_half in
++            # t_lo..t_hi s; cmd[0] = speed v_lo..v_hi m/s tracked by W["speed"] x rolling_speed_track; 6 s, start 0.3-0.5 m/s
++            _st = os.environ.get("MICRODUCK_ONESKATE_STRIDE")
++            if _st:
++                _vlo, _vhi = (float(x) for x in _st.split(",")[2:4])
++                tw.ranges.lin_vel_x = (_vlo, _vhi)
++                cfg.commands["twist"] = rl.OneSkateSideCommandCfg(**vars(tw))
++                cfg.rewards["speed_track"] = RewardTermCfg(func=rl.rolling_speed_track, weight=W.get("speed", 4.0),
++                                                           params={"command_name": "twist", "std": 0.25})
++                cfg.events["reset_rolling_entry"].params["speed_range"] = (0.3, 0.5)
++                cfg.episode_length_s = 6.0
++            _v5 = os.environ.get("MICRODUCK_ONESKATE_V5")
++            if _v5:
++                _bm, _bf, _lm, _lt = (float(x) for x in _v5.split(","))
++                cfg.rewards["one_skate"] = RewardTermCfg(func=rl.one_skate_spiral, weight=W["task"], params={
++                    "command_name": "twist", "back_min": _bm, "back_full": _bf, "lift_min": _lm, "lean_target": _lt})
++                cfg.rewards["no_push"] = RewardTermCfg(func=rl.no_push_penalty, weight=W.get("no_push", -200.0))
++                cfg.events["reset_rolling_entry"].params["speed_range"] = (0.5, 0.8)
++                cfg.episode_length_s = 3.0
++                os.environ.setdefault("MICRODUCK_ONESKATE_END_HOLD", "0.5")
++                if _neck_term is not None:
++                    cfg.rewards["neck_joint_pos_l2"] = _neck_term; cfg.rewards["neck_joint_pos_l2"].weight = -1.0
++        elif _rc == "pivot":
++            # pivot: start rolling 0.4-0.6 m/s, cmd[1] = which skate is the pivot, 4 s; W["task"] pivot
++            # reward + W["push"] x front-wheel lift (m, shaping), no speed terms
++            cfg.rewards["pivot"] = RewardTermCfg(func=rl.pivot_reward, weight=W["task"], params={"command_name": "twist"})
++            cfg.rewards["pivot_lift"] = RewardTermCfg(func=rl.pivot_front_up, weight=W["push"], params={"command_name": "twist"})
++            cfg.rewards["pivot_turn"] = RewardTermCfg(func=rl.pivot_turn_shaping, weight=W.get("turn", 1.0), params={"command_name": "twist"})
++            tw.ranges.lin_vel_x = (-0.01, 0.01); tw.ranges.lin_vel_y = (-1.0, 1.0); tw.ranges.ang_vel_z = (-0.5, 0.5)
++            cfg.commands["twist"] = rl.OneSkateSideCommandCfg(**vars(tw))
++            cfg.events["reset_rolling_entry"] = EventTermCfg(func=microduck_mdp.reset_rolling_entry, mode="reset", params={"speed_range": (0.4, 0.6)})
++            cfg.events["reset_base"].params["pose_range"]["z"] = (0.140, 0.141)   # wheels on the floor
++            cfg.events["reset_base"].params["pose_range"]["yaw"] = (0.0, 0.0)     # the rolling entry pushes along world x
++            cfg.episode_length_s = 4.0
++        elif _rc == "heeltoe":
++            # heel-toe: start rolling 0.5-0.7 m/s, cmd[1] = which skate leads, 3 s; W["task"]
++            # heeltoe reward + W["push"] x wheel lifts (shaping), no speed terms
++            cfg.rewards["heeltoe"] = RewardTermCfg(func=rl.heeltoe_reward, weight=W["task"], params={"command_name": "twist"})
++            cfg.rewards["heeltoe_lift"] = RewardTermCfg(func=rl.heeltoe_lift, weight=W["push"], params={"command_name": "twist"})
++            # MICRODUCK_HEELTOE_V2="cap,w_excess,w_pitch": penalties on lift above cap (m) and on trunk pitch^2
++            _hv2 = os.environ.get("MICRODUCK_HEELTOE_V2")
++            if _hv2:
++                _cap, _we, _wp = (float(x) for x in _hv2.split(","))
++                cfg.rewards["heeltoe_excess"] = RewardTermCfg(func=rl.heeltoe_excess, weight=-_we, params={"command_name": "twist", "cap": _cap})
++                cfg.rewards["trunk_pitch"] = RewardTermCfg(func=rl.trunk_pitch_sq, weight=-_wp)
++            # MICRODUCK_HEELTOE_HEAD="<w>": -w per step while the head (jaw_soft) touches the floor, from iteration 0
++            _hh = os.environ.get("MICRODUCK_HEELTOE_HEAD")
++            if _hh:
++                if not any(sn.name == "head_ground_contact" for sn in cfg.scene.sensors):
++                    cfg.scene.sensors = tuple(cfg.scene.sensors) + (ContactSensorCfg(
++                        name="head_ground_contact", primary=ContactMatch(mode="body", pattern="jaw_soft", entity="robot"),
++                        secondary=ContactMatch(mode="body", pattern="terrain"), fields=("found",), reduce="none", num_slots=1),)
++                from mjlab_microduck.actuator.rewards_hd1910 import head_ground_touch
++                cfg.rewards["head_touch"] = RewardTermCfg(func=head_ground_touch, weight=-float(_hh), params={"sensor_name": "head_ground_contact"})
++                print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_HEELTOE_HEAD: head-floor contact -{float(_hh)} per step from iteration 0")
++            tw.ranges.lin_vel_x = (-0.01, 0.01); tw.ranges.lin_vel_y = (-1.0, 1.0); tw.ranges.ang_vel_z = (-0.5, 0.5)
++            cfg.commands["twist"] = rl.OneSkateSideCommandCfg(**vars(tw))
++            cfg.events["reset_rolling_entry"] = EventTermCfg(func=microduck_mdp.reset_rolling_entry, mode="reset", params={"speed_range": (0.5, 0.7)})
++            cfg.events["reset_base"].params["pose_range"]["z"] = (0.140, 0.141)
++            cfg.events["reset_base"].params["pose_range"]["yaw"] = (0.0, 0.0)
++            cfg.episode_length_s = 3.0
++        elif _rc == "spin":
++            # spin on the spot: cmd[2] = yaw rate ±(1..3) rad/s, 4 s, stay in place
++            cfg.rewards["spin"] = RewardTermCfg(func=rl.yaw_rate_track, weight=W["task"], params={"command_name": "twist", "std": 1.0})
++            cfg.rewards["stay_in_place"] = RewardTermCfg(func=rl.stay_in_place, weight=W["place"])
++            cfg.rewards["grounded"] = RewardTermCfg(func=rl.both_blades_grounded, weight=W["grounded"])
++            tw.ranges.lin_vel_x = (-0.01, 0.01); tw.ranges.lin_vel_y = (-0.01, 0.01); tw.ranges.ang_vel_z = (-3.0, 3.0)
++            cfg.commands["twist"] = rl.SpinCommandCfg(**vars(tw))
++            cfg.episode_length_s = 4.0
++            # MICRODUCK_SPIN_ENTRY="frac,v_lo,v_hi,joint_noise": `frac` of the starts roll at v_lo..v_hi m/s (yaw 0), all starts
++            # get joint offsets +-joint_noise rad around HOME.
++            _se = os.environ.get("MICRODUCK_SPIN_ENTRY")
++            if _se:
++                _fr, _vlo, _vhi, _jn = (float(x) for x in _se.split(","))
++                cfg.events["reset_spin_entry"] = EventTermCfg(func=rl.reset_rolling_entry_frac, mode="reset",
++                                                              params={"frac": _fr, "speed_range": (_vlo, _vhi)})
++                cfg.events["reset_base"].params["pose_range"]["yaw"] = (0.0, 0.0)
++                cfg.events["reset_robot_joints"].params["position_range"] = (-_jn, _jn)
++            # MICRODUCK_SPIN_PIVOT="r_max m,w_lift,w_drift,d_min m": spin about the plant skate's rear wheel. cmd[1] = plant side
++            # (SpinPivotCommand); plant front wheel lifted 5-20 mm (pivot_lift_band); plant rear wheel
++            # drift <= |w|*r_max (pivot_rear_drift, negative weight); free skate >= d_min from the plant (pivot_spacing);
++            # stay_in_place removed. The plant angle is not prescribed.
++            _pv = os.environ.get("MICRODUCK_SPIN_PIVOT")
++            if _pv:
++                _rm, _wl, _wd, _dm = (float(x) for x in _pv.split(","))
++                cfg.rewards.pop("stay_in_place", None)
++                cfg.rewards["pivot_lift"] = RewardTermCfg(func=rl.pivot_lift_band, weight=_wl, params={"command_name": "twist"})
++                cfg.rewards["pivot_drift"] = RewardTermCfg(func=rl.pivot_rear_drift, weight=-_wd, params={"command_name": "twist", "r_max": _rm})
++                cfg.rewards["pivot_spacing"] = RewardTermCfg(func=rl.pivot_spacing, weight=_wl, params={"command_name": "twist", "d_min": _dm})
++                cfg.commands["twist"] = rl.SpinPivotCommandCfg(**vars(cfg.commands["twist"]))
++                print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_SPIN_PIVOT: compass v2 — r_max {_rm} m, lift/spacing weight {_wl}, drift weight {_wd}, d_min {_dm} m")
++        else:
++            # crab: cmd[1] = lateral speed ±(0.1..0.25) m/s, sideways on skates turned across, 5 s
++            cfg.rewards["crab"] = RewardTermCfg(func=rl.lateral_rolling_track, weight=W["task"], params={"command_name": "twist", "std": 0.08})
++            cfg.rewards["crab_push"] = RewardTermCfg(func=rl.lateral_rolling_track, weight=W["push"], params={"command_name": "twist", "push": True})
++            cfg.curriculum["crab_push_weight"] = CurriculumTermCfg(func=microduck_mdp.reward_weight, params={"reward_name": "crab_push",
++                "weight_stages": [{"step": 0, "weight": W["push"]}, {"step": 1500 * 24, "weight": W["push"] / 2}, {"step": 2000 * 24, "weight": 0.0}]})
++            cfg.rewards["grounded"] = RewardTermCfg(func=rl.both_blades_grounded, weight=W["grounded"])
++            tw.ranges.lin_vel_x = (-0.01, 0.01); tw.ranges.lin_vel_y = (-0.25, 0.25); tw.ranges.ang_vel_z = (-0.5, 0.5)
++            cfg.commands["twist"] = rl.CrabCommandCfg(**vars(tw))
++            cfg.episode_length_s = 5.0
++        if _rc != "spin":
++            cfg.rewards["heading_tracking"] = RewardTermCfg(func=microduck_mdp.heading_tracking_reward, weight=W["heading"], params={"command_name": "twist", "std": 0.5})
++        cfg.rewards["blade_pitch"] = RewardTermCfg(func=rl.blade_pitch_penalty, weight=W["blade_pitch"])
++        cfg.commands["head_pose"] = microduck_mdp.UniformPoseCommandCfg(resampling_time_range=(10.0, 10.0), zero_command_prob=0.5,
++                                                                        ranges=((-0.1, 0.1), (-0.1, 0.1), (-0.2, 0.2), (-0.03, 0.03)))
++        for group in ("actor", "critic"):
++            cfg.observations[group].terms["head_command"] = ObservationTermCfg(func=mdp.generated_commands, params={"command_name": "head_pose"})
++        cfg.rewards["head_pose_tracking"] = RewardTermCfg(func=microduck_mdp.head_pose_tracking, weight=W["head"], params={"command_name": "head_pose", "std": 0.5})
++        cfg.curriculum.pop("wheel_friction", None)
++        print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_ROLLER_RECIPE={_rc}: weights {W}; terms {sorted(cfg.rewards)}")
++
++    # MICRODUCK_ROLLER_HEAD_OFF=1: tiny head-command ranges (the input stays non-zero so its weights stay alive) and
++    # no range curriculum, for any recipe.
++    # MICRODUCK_ROLLER_HIP_ROLL_STANCE="<target rad>,<weight>,<std>": outward hip-roll stance target (rl.hip_roll_stance).
++    _hrs = os.environ.get("MICRODUCK_ROLLER_HIP_ROLL_STANCE")
++    if _hrs:
++        from mjlab_microduck.tasks import rollers_hd1910 as _rl
++        _t, _w, _sd = (float(x) for x in _hrs.split(","))
++        cfg.rewards["hip_roll_stance"] = RewardTermCfg(func=_rl.hip_roll_stance, weight=_w, params={"target": _t, "std": _sd})
++        print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_ROLLER_HIP_ROLL_STANCE: target {_t} rad, weight {_w}, std {_sd}")
++    if os.environ.get("MICRODUCK_ROLLER_HEAD_OFF") == "1" and "head_pose" in cfg.commands:
++        cfg.commands["head_pose"].ranges = ((-0.05, 0.05), (-0.05, 0.05), (-0.07, 0.07), (-0.015, 0.015))
++        cfg.curriculum.pop("head_pose_range", None)
++        print("[microduck_velocity_rollers_env_cfg] MICRODUCK_ROLLER_HEAD_OFF: head commands tiny (±0.05/0.05/0.07/0.015), no range curriculum")
++    # MICRODUCK_WHEEL_FRICTION="lo,hi" (N*m): per-env wheel axle frictionloss range (estimate: TPU 85A tyre hysteresis
++    # + 2 x MR126 bearings) instead of the wheel_friction curriculum. Applies to every recipe built on this factory.
++    _wf = os.environ.get("MICRODUCK_WHEEL_FRICTION")
++    if _wf and "randomize_wheel_friction" in cfg.events:
++        _wlo, _whi = (float(x) for x in _wf.split(","))
++        cfg.curriculum.pop("wheel_friction", None)
++        cfg.events["randomize_wheel_friction"].params["ranges"] = (_wlo, _whi)
++        print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_WHEEL_FRICTION: wheel frictionloss {_wlo}..{_whi} N*m per env")
++
++    # MICRODUCK_ACTION_FILTER_TAU=<s>: target low-pass time constant, same filter as walk/standup and the runtime
++    _tau = os.environ.get("MICRODUCK_ACTION_FILTER_TAU")
++    if _tau:
++        import dataclasses as _dc
++        from mjlab_microduck.actuator.filtered_action import FilteredJointPositionActionCfg
++        _old = cfg.actions["joint_pos"]
++        if not isinstance(_old, FilteredJointPositionActionCfg):          # the base cfg (standup) may have wrapped it already
++            cfg.actions["joint_pos"] = FilteredJointPositionActionCfg(
++                **{f.name: getattr(_old, f.name) for f in _dc.fields(_old) if f.init}, tau_s=float(_tau))
++        print(f"[microduck_velocity_rollers_env_cfg] MICRODUCK_ACTION_FILTER_TAU={_tau}")
+     return cfg
+ 
+ 
+@@ -649,7 +1250,7 @@ MicroduckRollersRlCfg = RslRlOnPolicyRunnerCfg(
+         value_loss_coef=1.0,
+         use_clipped_value_loss=True,
+         clip_param=0.2,
+-        entropy_coef=0.03,  # roller-specific: higher exploration than the walk envs
++        entropy_coef=float(os.environ.get("MICRODUCK_ENTROPY_COEF", "0.03")),  # roller-specific: higher exploration than the walk envs
+         num_learning_epochs=5,
+         num_mini_batches=4,
+         learning_rate=1.0e-3,
+@@ -658,7 +1259,8 @@ MicroduckRollersRlCfg = RslRlOnPolicyRunnerCfg(
+         lam=0.95,
+         desired_kl=0.01,
+         max_grad_norm=1.0,
+-        symmetry_cfg=SYMMETRY_CFG if ENABLE_SYMMETRY else None,
++        # MICRODUCK_ROLLER_SYMMETRY=1: enable the mirror loss (SYMMETRY_CFG).
++        symmetry_cfg=SYMMETRY_CFG if (ENABLE_SYMMETRY or os.environ.get("MICRODUCK_ROLLER_SYMMETRY") == "1") else None,
+     ),
+     wandb_project="mjlab_microduck",
+     experiment_name="velocity_rollers",
+diff --git a/src/mjlab_microduck/tasks/microduck_velstand_env_cfg.py b/src/mjlab_microduck/tasks/microduck_velstand_env_cfg.py
+index 575a8a3..08ce11e 100644
+--- a/src/mjlab_microduck/tasks/microduck_velstand_env_cfg.py
++++ b/src/mjlab_microduck/tasks/microduck_velstand_env_cfg.py
+@@ -235,6 +235,23 @@ from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg
+ 
+ NUM_STEPS_PER_ENV = 24
+ 
++import os as _os
++
++
++def _our_bc_cfg():
++    """HD-1910 switches: the stock BC targets are Pollen's XL330 expert policies. MICRODUCK_EXPERT_BC=0 disables
++    the BC; MICRODUCK_STAND_EXPERT=<model.pt> / MICRODUCK_WALK_ANCHOR=<model.pt> point it at local StandUp and
++    walk checkpoints (distill.py checkpoint_path / anchor_checkpoint_path).
++    Without the env vars the recipe is Pollen's, unchanged."""
++    if _os.environ.get("MICRODUCK_EXPERT_BC", "") == "0" or not ENABLE_EXPERT_BC:
++        return None
++    cfg = {**default_bc_cfg(), "coef": EXPERT_BC_COEF, "gate_tilt_deg": EXPERT_BC_GATE_TILT_DEG}
++    if _os.environ.get("MICRODUCK_STAND_EXPERT"):
++        cfg["checkpoint_path"] = _os.environ["MICRODUCK_STAND_EXPERT"]
++    if _os.environ.get("MICRODUCK_WALK_ANCHOR"):
++        cfg["anchor_checkpoint_path"] = _os.environ["MICRODUCK_WALK_ANCHOR"]
++    return cfg
++
+ # Warm start from the deployed walk (see module docstring). Collapses every
+ # velocity-recipe curriculum to its final stage so the loaded walk is trained
+ # under the conditions it was trained under. Set False to train from scratch
+@@ -731,7 +748,7 @@ MicroduckVelStandRlCfg = RslRlOnPolicyRunnerCfg(
+         desired_kl=0.01,
+         max_grad_norm=1.0,
+         symmetry_cfg=None,
+-        bc_cfg={**default_bc_cfg(), "coef": EXPERT_BC_COEF, "gate_tilt_deg": EXPERT_BC_GATE_TILT_DEG} if ENABLE_EXPERT_BC else None,
++        bc_cfg=_our_bc_cfg(),
+     ),
+     wandb_project="mjlab_microduck",
+     experiment_name="velstand",
+diff --git a/src/mjlab_microduck/tasks/symmetry.py b/src/mjlab_microduck/tasks/symmetry.py
+index e950421..9ce1f74 100644
+--- a/src/mjlab_microduck/tasks/symmetry.py
++++ b/src/mjlab_microduck/tasks/symmetry.py
+@@ -41,6 +41,7 @@ Mirroring rules (left-right reflection about the sagittal plane):
+ 
+ from dataclasses import dataclass
+ 
++import os
+ import torch
+ from tensordict import TensorDict
+ from mjlab.rl import RslRlPpoAlgorithmCfg
+@@ -89,13 +90,17 @@ _OBS_SIGN: list[float] = (
+     + _JOINT_SIGN       # joint_pos
+     + _JOINT_SIGN       # joint_vel
+     + _JOINT_SIGN       # last_action
+-    + [1.0, -1.0, -1.0] # twist: negate lin_vel_y, ang_vel_z
++    + [float(x) for x in os.environ.get("MICRODUCK_SYM_TWIST_SIGN", "1,-1,-1").split(",")]  # twist: negate lin_vel_y, ang_vel_z;
++                                        # MICRODUCK_SYM_TWIST_SIGN overrides the signs (the crouch depth in cmd[1] keeps its sign)
+     + [1.0, 1.0, -1.0, -1.0]  # head: negate head_yaw, head_roll
+     + [1.0, -1.0, 1.0, -1.0, 1.0, -1.0]  # body: negate y, roll, yaw
+ )
+ 
+ # Cache tensors per device to avoid reallocating on every call
+ _cache: dict[torch.device, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
++# Sign of the appended gait clock (sin, cos) under left/right mirroring: the stride clock alternates sides -> half a
++# period (-1); the swizzle clock drives both legs out and in together -> unchanged (+1, set by the ride recipe).
++CLOCK_MIRROR_SIGN = -1.0
+ 
+ 
+ def _get_tensors(
+@@ -143,6 +148,12 @@ def microduck_vel_symmetry(
+     if obs is not None:
+         actor_orig: torch.Tensor = obs["actor"]  # [B, 51]
+         obs_perm, obs_sign, _, _ = _get_tensors(actor_orig.device)
++        if actor_orig.shape[1] == obs_perm.numel() + 2:
++            # stride recipe: the gait clock (sin, cos) is appended last; mirroring left/right = half a period ->
++            # (sin, cos) -> (-sin, -cos)
++            n = obs_perm.numel()
++            obs_perm = torch.cat([obs_perm, torch.tensor([n, n + 1], device=obs_perm.device, dtype=obs_perm.dtype)])
++            obs_sign = torch.cat([obs_sign, torch.tensor([CLOCK_MIRROR_SIGN, CLOCK_MIRROR_SIGN], device=obs_sign.device, dtype=obs_sign.dtype)])
+         actor_sym = actor_orig[:, obs_perm] * obs_sign
+ 
+         critic_orig: torch.Tensor = obs["critic"]

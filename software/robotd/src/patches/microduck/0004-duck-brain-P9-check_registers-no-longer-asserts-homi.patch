@@ -1,0 +1,91 @@
+From 4a8fd5cc9180b7b1e8a1ee647402f77e15e6013e Mon Sep 17 00:00:00 2001
+From: duck-brain <duck-brain@localhost>
+Date: Tue, 13 Oct 2026 17:29:51 +0000
+Subject: [PATCH] duck-brain P9: check_registers no longer asserts
+ homing_offset
+
+Pollen's newer runtime writes homing_offset at startup (knees -512, the
+rest 0). On the duck-brain robot each servo's offset is written once,
+when it is calibrated and given its ID (Alex, 13.10.2026); asserting a
+fixed value would overwrite that calibration. The EEPROM registers the
+loop depends on - return_delay_time, baud_rate, pwm_slope, shutdown -
+are still read and corrected, which is what puts a servo reset to its
+factory settings back in shape.
+---
+ duck-control/src/bus.rs   | 35 ++++++-----------------------------
+ duck-control/src/model.rs |  6 ++++--
+ 2 files changed, 10 insertions(+), 31 deletions(-)
+
+diff --git a/duck-control/src/bus.rs b/duck-control/src/bus.rs
+index da13fa7..0bbdf44 100644
+--- a/duck-control/src/bus.rs
++++ b/duck-control/src/bus.rs
+@@ -27,7 +27,7 @@ use crate::imu::{IMU_BLOCK_LEN, SflpDecoder};
+ use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
+ use crate::model::{
+     BAUD_RATE, EXPECTED_REGISTERS, FACTORY_BAUD_RATE, FACTORY_ID, IMU_DXL_ID, JOINT_IDS,
+-    JOINT_NAMES, NUM_JOINTS, homing_offset,
++    JOINT_NAMES, NUM_JOINTS,
+ };
+ 
+ /// Start of the contiguous block read every tick: `present_pwm`, `present_current`,
+@@ -207,34 +207,11 @@ impl DynamixelIo {
+             std::thread::sleep(EEPROM_SETTLE);
+             fixed += 1;
+         }
+-
+-        // An EEPROM register like the others, so it is written only with torque off, which is how
+-        // a servo powers up and how a fresh one is adopted.
+-        let want = homing_offset(id);
+-        let got = *self
+-            .controller
+-            .read_homing_offset(id)
+-            .map_err(|e| IoError::Bus(format!("read homing_offset on {id}: {e}")))?
+-            .first()
+-            .ok_or(IoError::ShortRead {
+-                what: "register read",
+-                expected: 1,
+-                got: 0,
+-            })?;
+-        if got != want {
+-            tracing::warn!(
+-                id,
+-                register = "homing_offset",
+-                got,
+-                want,
+-                "correcting motor register"
+-            );
+-            self.controller
+-                .write_homing_offset(id, want)
+-                .map_err(|e| IoError::Bus(format!("write homing_offset on {id}: {e}")))?;
+-            std::thread::sleep(EEPROM_SETTLE);
+-            fixed += 1;
+-        }
++        // `homing_offset` is not asserted here (duck-brain patch P9, Alex's decision of 13.10.2026):
++        // on the duck-brain robot each servo's offset is written once, when it is calibrated and
++        // given its ID, and a fixed value here would overwrite that calibration. The registers
++        // above still are — a servo reset to its factory settings comes back with
++        // return_delay_time 250 and shutdown 53 (see EXPECTED_REGISTERS).
+         Ok(fixed)
+     }
+ 
+diff --git a/duck-control/src/model.rs b/duck-control/src/model.rs
+index 731c082..71c89ae 100644
+--- a/duck-control/src/model.rs
++++ b/duck-control/src/model.rs
+@@ -139,8 +139,10 @@ pub const KNEE_HOMING_OFFSET: i32 = -512;
+ /// Right and left knee: the only joints whose `homing_offset` is not 0.
+ pub const KNEE_IDS: [u8; 2] = [13, 23];
+ 
+-/// The `homing_offset` a servo should hold, asserted alongside [`EXPECTED_REGISTERS`]. It is
+-/// kept apart from them because it is an `i32` and differs per joint.
++/// The `homing_offset` a servo should hold on Pollen's robot. Not asserted at startup in the
++/// duck-brain build (patch P9: there each servo's offset is written at calibration, with its ID);
++/// kept for reference. It is kept apart from [`EXPECTED_REGISTERS`]
++/// because it is an `i32` and differs per joint.
+ pub fn homing_offset(id: u8) -> i32 {
+     if KNEE_IDS.contains(&id) {
+         KNEE_HOMING_OFFSET
+-- 
+2.43.0
+

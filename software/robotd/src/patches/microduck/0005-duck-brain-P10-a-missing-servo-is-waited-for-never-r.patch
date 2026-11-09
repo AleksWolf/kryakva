@@ -1,0 +1,154 @@
+From eac4af06df8b938caad67f215e57f0ee8dfc5068 Mon Sep 17 00:00:00 2001
+From: duck-brain <duck-brain@localhost>
+Date: Tue, 13 Oct 2026 19:00:38 +0000
+Subject: [PATCH] duck-brain P10: a missing servo is waited for, never replaced
+ by flashing a fresh one
+
+Pollen's robot flashes a factory-fresh servo (ID 1) as the missing joint
+at startup: ID, baud rate, registers. On the duck-brain robot each
+servo's homing_offset is written when it is calibrated, with its ID, and
+robotd does not write it (P9), so an adopted servo would drive with its
+factory zero. Alex's choice (13.10.2026): no automatic adoption. robotd
+waits, as for a servo that is unplugged; the factory-defaults probe still
+runs, read-only (DynamixelIo::fresh_servo_answers), only to say that a new
+servo is on the bus and must be calibrated (offset and ID) first.
+---
+ duck-control/src/bus.rs | 14 +++++++++
+ robotd/src/main.rs      | 67 ++++++++++++++++++++++-------------------
+ 2 files changed, 50 insertions(+), 31 deletions(-)
+
+diff --git a/duck-control/src/bus.rs b/duck-control/src/bus.rs
+index 0bbdf44..c74cf86 100644
+--- a/duck-control/src/bus.rs
++++ b/duck-control/src/bus.rs
+@@ -246,6 +246,20 @@ impl DynamixelIo {
+             .map_err(|e| IoError::Bus(format!("ping imu {IMU_DXL_ID}: {e}")))
+     }
+ 
++    /// Whether a factory-fresh servo (ID 1, at 1 Mbps or at 57 600 baud) answers on the bus —
++    /// the probe [`Self::adopt_replacement`] starts with, and nothing else: no write. The bus is
++    /// back at [`BAUD_RATE`] afterwards. (duck-brain patch P10: the robot does not flash a new
++    /// servo itself, but it can say that one is there.)
++    pub fn fresh_servo_answers(&mut self) -> Result<bool> {
++        if self.ping_fresh()? {
++            return Ok(true);
++        }
++        self.reopen(FACTORY_BAUD_RATE)?;
++        let found = self.ping_fresh();
++        self.reopen(BAUD_RATE)?;
++        found
++    }
++
+     /// Flash a factory-fresh servo so it takes the place of the one that is missing.
+     ///
+     /// A new XL330 answers as ID 1 at 57 600 baud. Neither is used on this bus, so when exactly
+diff --git a/robotd/src/main.rs b/robotd/src/main.rs
+index d6ad224..885849d 100644
+--- a/robotd/src/main.rs
++++ b/robotd/src/main.rs
+@@ -1157,9 +1157,8 @@ async fn main() -> ExitCode {
+ /// Enable torque and ramp to the home pose.
+ #[cfg(target_os = "linux")]
+ fn run_init(params: &Params, duration: Duration) -> ExitCode {
+-    // The same open as the daemon's, replacement adoption included: `init` is what someone
+-    // reaches for right after a motor swap, and it must not be the one path that refuses the
+-    // new servo.
++    // The same open as the daemon's. In the duck-brain build that includes refusing to flash a
++    // new servo (patch P10): a replacement is calibrated first, offset and ID, by hand.
+     let mut adopted = None;
+     let opened = open_bus(
+         &params.bus,
+@@ -1521,22 +1520,26 @@ fn imu_answers(_io: &mut BusIo, _attempt: u32) -> Option<bool> {
+     Some(true)
+ }
+ 
+-/// The motor-swap path: if exactly one expected servo is silent and a factory-fresh one
+-/// answers instead, flash the new one as the missing joint.
++/// The motor-swap path, as the duck-brain build has it (patch P10): a servo that does not answer
++/// is waited for, never replaced by flashing a factory-fresh one in its place.
+ ///
+-/// A ping census of the fifteen expected IDs is all a complete bus pays for this. The
+-/// factory-defaults probe — which reopens the port at 57 600 baud — only runs once a single
+-/// servo is known to be missing, so an ordinary boot never scans for anything.
++/// Pollen's robot flashes the new servo as the missing joint — ID, baud rate, registers. On the
++/// duck-brain robot each servo's `homing_offset` is written when it is calibrated, together with
++/// its ID (Alex, 13.10.2026), and robotd does not write it (P9): a servo flashed here would get the
++/// ID and drive with its factory zero. So when exactly one servo is silent, the factory-defaults
++/// probe still runs — read-only — and only changes what the wait says: calibrate the new servo
++/// (offset and ID), then start again.
++///
++/// A ping census of the fifteen expected IDs is all a complete bus pays for this.
+ ///
+ /// Returns whether the bus is worth checking further. `false` is "keep waiting": every servo
+-/// unpowered, a servo missing with nothing fresh to replace it, or two missing at once, which
+-/// cannot be told apart and is left to a human.
++/// unpowered, a servo missing, or two missing at once. `adopted` is never set.
+ #[cfg(target_os = "linux")]
+ fn adopt_missing_servo(
+     io: &mut BusIo,
+     loud: bool,
+     silent: &mut Vec<u8>,
+-    adopted: &mut Option<u8>,
++    _adopted: &mut Option<u8>,
+ ) -> bool {
+     use duck_control::bus::replacement_target;
+ 
+@@ -1564,33 +1567,35 @@ fn adopt_missing_servo(
+         if loud {
+             tracing::error!(
+                 ?missing,
+-                "several servos are missing; a replacement can only be adopted one at a time, waiting"
++                "several servos are missing; waiting"
+             );
+         }
+         return false;
+     };
+-    match io.adopt_replacement(id) {
+-        Ok(true) => {
+-            *adopted = Some(id);
+-            true
+-        }
+-        Ok(false) => {
+-            if loud {
+-                tracing::error!(
+-                    id,
+-                    "servo missing and nothing answers at factory defaults (id 1, 57600 baud); \
+-                     is it plugged in? waiting"
+-                );
+-            }
+-            false
+-        }
+-        Err(e) => {
+-            if loud {
+-                tracing::error!(error = %e, id, "adopting the replacement servo failed; waiting");
++    let joint = duck_control::JOINT_IDS
++        .iter()
++        .position(|&j| j == id)
++        .map_or("?", |i| duck_control::JOINT_NAMES[i]);
++    if loud {
++        match io.fresh_servo_answers() {
++            Ok(true) => tracing::error!(
++                id,
++                joint,
++                "servo missing and a factory-fresh servo answers (id 1); this build does not \
++                 flash it (duck-brain P10) — calibrate it (homing offset and ID), then restart; waiting"
++            ),
++            Ok(false) => tracing::error!(
++                id,
++                joint,
++                "servo missing and nothing answers at factory defaults (id 1, 57600 baud); \
++                 is it plugged in? waiting"
++            ),
++            Err(e) => {
++                tracing::error!(error = %e, id, joint, "servo missing; probing for a fresh one failed; waiting")
+             }
+-            false
+         }
+     }
++    false
+ }
+ 
+ #[cfg(not(target_os = "linux"))]
+-- 
+2.43.0
+

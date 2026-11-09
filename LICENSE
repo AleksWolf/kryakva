@@ -1,20 +1,19 @@
-Microduck replica on Feetech HD-1910 servos and Radxa Zero 3W
+kryakva — Pollen Robotics' Microduck on Feetech HD-1910 servos and Radxa Zero 3W
 Copyright 2026 Alex
 
 Dual license:
 
 1. Code, configuration and documentation — Apache License 2.0 (full text below):
-   training/, software/, hardware/, docs/ (our texts, pictures and the assembly guide).
+   software/, training/, hardware/, docs/ (except docs/datasheets/) and the README and *.md files.
 
 2. 3D models and print profiles — Creative Commons Attribution-NonCommercial-ShareAlike 4.0 (CC BY-NC-SA 4.0):
-   cad/ and print/. All parts are designed from scratch. Non-commercial use only, with attribution;
-   derivatives under the same license.
+   cad/ and print/. Non-commercial use only, derivatives under the same license, with attribution.
    Full text: https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode
 
-3. Manufacturer documents in docs/datasheets/ (Radxa, STMicroelectronics, Feetech, Fashion Star) are redistributed as is;
-   their rights belong to their owners.
+3. Manufacturer documents in docs/datasheets/ are redistributed as is; their rights belong to their owners.
+   See docs/datasheets/README.md.
 
-Sources and authors: NOTICE.
+Third-party components, their authors and licenses: NOTICE.
 
 ================================================================================
 Apache License 2.0 — code, configuration, documentation
@@ -197,3 +196,28 @@ Apache License 2.0 — code, configuration, documentation
       of your accepting any such warranty or additional liability.
 
    END OF TERMS AND CONDITIONS
+
+   APPENDIX: How to apply the Apache License to your work.
+
+      To apply the Apache License to your work, attach the following
+      boilerplate notice, with the fields enclosed by brackets "[]"
+      replaced with your own identifying information. (Don't include
+      the brackets!)  The text should be enclosed in the appropriate
+      comment syntax for the file format. We also recommend that a
+      file or class name and description of purpose be included on the
+      same "printed page" as the copyright notice for easier
+      identification within third-party archives.
+
+   Copyright 2026 Pollen Robotics
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.

@@ -1,0 +1,683 @@
+From e561abf8667b0a54afe8aa40f746a601b1c70bcc Mon Sep 17 00:00:00 2001
+From: duck-brain <duck-brain@localhost>
+Date: Wed, 4 Nov 2026 18:18:37 +0000
+Subject: [PATCH] =?UTF-8?q?duck-brain=20P20:=20the=20duck's=20board=20?=
+ =?UTF-8?q?=E2=80=94=20ToF=20on=20i2c-5,=20sound=20on=20`duck`,=20gentle?=
+ =?UTF-8?q?=20sound=20ends,=205=20GHz=20kept?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Alex's board of 04-05.11.2026, as defaults rather than flags:
+- tofd looks for the ToF on /dev/i2c-5 (I2C5-M0, pins 29/31) only:
+  i2c3 carries the body IMU at 200 Hz and the kernel's fusb302.
+- [audio] device defaults to `duck` (duck-brain's /etc/asound.conf:
+  dmix/dsnoop on card duck-i2s3 at its one format, 48 kHz S32_LE
+  stereo) instead of the aic3104 codec this board does not have; the
+  `sounds` CLI and the pet-detect default follow. A PCM name is opened
+  for capture as it is: `duck,0` is no PCM to ALSA, only `hw:`/`plughw:`
+  names get the `,0`.
+- robotd feeds every 16-bit wav (bank sounds, robot.say phrases) to
+  aplay itself: 50 ms of silence first — the amplifier is enabled ~30 ms
+  after the stream starts and would eat the beginning — and 30 ms of
+  zeros last; a sound cut short (a new sound, a hush) fades over 20 ms
+  and ends in zeros instead of being killed mid-wave. The feeder stays
+  at most 100 ms ahead, so a cut still lands within ~0.1 s.
+- The tick journal stops at 256 MiB, marking where: it lives in /tmp,
+  which is RAM.
+- configd keeps a network's band when it replaces its profile, and pins
+  a new network to 5 GHz when the scan sees it there: on the duck the
+  Wi-Fi and the Bluetooth pad share one radio, and on 2.4 GHz the Wi-Fi
+  dropped out whenever the pad was connected.
+---
+ configd/src/nm.rs            | 105 +++++++++++++++
+ pet-detect/src/bin/detect.rs |   2 +-
+ pet-detect/src/worker.rs     |   2 +-
+ robotd-params/src/lib.rs     |  18 ++-
+ robotd/src/journal.rs        |  26 +++-
+ robotd/src/sound.rs          | 240 ++++++++++++++++++++++++++++++++++-
+ sounds/src/main.rs           |   6 +-
+ tof/src/link.rs              |  15 +--
+ 8 files changed, 395 insertions(+), 19 deletions(-)
+
+diff --git a/configd/src/nm.rs b/configd/src/nm.rs
+index 63c586a..338801b 100644
+--- a/configd/src/nm.rs
++++ b/configd/src/nm.rs
+@@ -168,6 +168,9 @@ trait AccessPoint {
+     fn rsn_flags(&self) -> zbus::Result<u32>;
+     #[zbus(property)]
+     fn wpa_flags(&self) -> zbus::Result<u32>;
++    /// MHz.
++    #[zbus(property)]
++    fn frequency(&self) -> zbus::Result<u32>;
+ }
+ 
+ #[zbus::proxy(
+@@ -311,6 +314,63 @@ impl NetworkManager {
+         Ok(ssids)
+     }
+ 
++    /// The `802-11-wireless.band` of a saved profile for `ssid`, if one pins it (P20).
++    async fn saved_band(&self, ssid: &str) -> Option<String> {
++        for path in self.saved_connections(ssid).await.ok()? {
++            let Ok(connection) = ConnectionProxy::builder(&self.bus).path(&path) else {
++                continue;
++            };
++            let Ok(connection) = connection.build().await else {
++                continue;
++            };
++            let Ok(config) = connection.get_settings().await else {
++                continue;
++            };
++            if let Some(band) = config
++                .get("802-11-wireless")
++                .and_then(|section| section.get("band"))
++                .and_then(|value| String::try_from(value.clone()).ok())
++            {
++                return Some(band);
++            }
++        }
++        None
++    }
++
++    /// The frequencies, MHz, of the access points the last scan saw for `ssid` (P20).
++    async fn seen_frequencies(&self, ssid: &str) -> Vec<u32> {
++        let mut seen = Vec::new();
++        let Ok(Some(path)) = self.wifi_device().await else {
++            return seen;
++        };
++        let Ok(builder) = WirelessProxy::builder(&self.bus).path(&path) else {
++            return seen;
++        };
++        let Ok(wireless) = builder.build().await else {
++            return seen;
++        };
++        for ap_path in wireless.get_all_access_points().await.unwrap_or_default() {
++            let Ok(builder) = AccessPointProxy::builder(&self.bus).path(&ap_path) else {
++                continue;
++            };
++            let Ok(ap) = builder.build().await else {
++                continue;
++            };
++            if ap
++                .ssid()
++                .await
++                .ok()
++                .and_then(|b| String::from_utf8(b).ok())
++                .as_deref()
++                == Some(ssid)
++                && let Ok(f) = ap.frequency().await
++            {
++                seen.push(f);
++            }
++        }
++        seen
++    }
++
+     /// Delete every saved profile for `ssid`. Returns how many went.
+     async fn delete_saved(&self, ssid: &str) -> NetResult<usize> {
+         let paths = self.saved_connections(ssid).await?;
+@@ -329,6 +389,19 @@ impl NetworkManager {
+     }
+ }
+ 
++/// The band a new profile for a network is pinned to (duck-brain P20). On the duck the Wi-Fi and the
++/// Bluetooth pad share one aic8800 chip and antenna, and on 2.4 GHz the Wi-Fi dropped out whenever
++/// the pad was connected (Alex, 05.11.2026) — so the robot stays on 5 GHz. The band of the profile
++/// being replaced is kept; a network with no profile yet is pinned to 5 GHz (`"a"`) when the scan
++/// saw it there; one seen only on 2.4 GHz is left unpinned, which is the only way to join it.
++fn band_for(saved: Option<&str>, seen_mhz: &[u32]) -> Option<String> {
++    match saved {
++        Some(band) if !band.is_empty() => Some(band.to_owned()),
++        _ if seen_mhz.iter().any(|&f| f >= 4900) => Some("a".to_owned()),
++        _ => None,
++    }
++}
++
+ fn bus_err(e: impl std::fmt::Display) -> String {
+     format!("NetworkManager D-Bus call failed: {e}")
+ }
+@@ -622,6 +695,19 @@ impl Net for NetworkManager {
+         //
+         // This disconnects the robot if that profile is the active one. Unavoidable: changing a key
+         // means re-associating, and a client on BLE is unaffected by design.
++        // The band survives the replacement, and a new network goes on 5 GHz where it can (P20):
++        // read before the old profile is deleted.
++        let band = band_for(
++            self.saved_band(ssid).await.as_deref(),
++            &self.seen_frequencies(ssid).await,
++        );
++        match &band {
++            Some(band) => tracing::info!(ssid, band, "the profile is pinned to its band"),
++            None => tracing::warn!(
++                ssid,
++                "seen only on 2.4 GHz: the Wi-Fi will drop out while the Bluetooth pad is connected"
++            ),
++        }
+         match self.delete_saved(ssid).await {
+             Ok(0) => {}
+             Ok(n) => tracing::info!(ssid, replaced = n, "replacing saved profile(s)"),
+@@ -638,6 +724,9 @@ impl Net for NetworkManager {
+         let mut wireless: HashMap<&str, Value<'_>> = HashMap::new();
+         wireless.insert("ssid", Value::from(ssid.as_bytes().to_vec()));
+         wireless.insert("mode", Value::from("infrastructure"));
++        if let Some(band) = &band {
++            wireless.insert("band", Value::from(band.as_str()));
++        }
+ 
+         let mut connection: HashMap<&str, Value<'_>> = HashMap::new();
+         connection.insert("id", Value::from(ssid));
+@@ -794,6 +883,22 @@ impl Net for NetworkManager {
+ mod tests {
+     use super::*;
+ 
++    /// P20: a replaced profile keeps its band; a new network seen on 5 GHz is pinned there; one seen
++    /// only on 2.4 GHz is not pinned (it could not be joined otherwise).
++    #[test]
++    fn the_band_is_kept_or_5ghz_where_seen() {
++        assert_eq!(band_for(Some("a"), &[2437]).as_deref(), Some("a"));
++        assert_eq!(
++            band_for(Some("bg"), &[5180]).as_deref(),
++            Some("bg"),
++            "the operator's choice stands"
++        );
++        assert_eq!(band_for(None, &[2437, 5180]).as_deref(), Some("a"));
++        assert_eq!(band_for(Some(""), &[5745]).as_deref(), Some("a"));
++        assert_eq!(band_for(None, &[2412, 2437]), None);
++        assert_eq!(band_for(None, &[]), None);
++    }
++
+     /// The security mapping decides whether a client asks for a password, and which kind. Pure
+     /// arithmetic on NM's flags, so it is testable without a bus — and worth testing, because
+     /// getting `Open` wrong for a secured network means silently attempting an unauthenticated
+diff --git a/pet-detect/src/bin/detect.rs b/pet-detect/src/bin/detect.rs
+index af91762..9459466 100644
+--- a/pet-detect/src/bin/detect.rs
++++ b/pet-detect/src/bin/detect.rs
+@@ -2,7 +2,7 @@
+ //! inference on stdout: `<ts_ms>\t<p>\t<state>`.
+ //!
+ //! ```text
+-//! arecord -D plughw:aic3104,0 -f S16_LE -r 16000 -c 1 -t raw | pet-detect --model <onnx>
++//! arecord -D duck -f S16_LE -r 16000 -c 1 -t raw | pet-detect --model <onnx>
+ //! ```
+ 
+ use std::io::Read;
+diff --git a/pet-detect/src/worker.rs b/pet-detect/src/worker.rs
+index e32fa0e..9093b1c 100644
+--- a/pet-detect/src/worker.rs
++++ b/pet-detect/src/worker.rs
+@@ -210,7 +210,7 @@ impl Default for PetConfig {
+     fn default() -> Self {
+         let lib = PettingDetectorConfig::default();
+         Self {
+-            alsa_device: "plughw:aic3104,0".into(),
++            alsa_device: "duck".into(),
+             model_path: PathBuf::from("/opt/robot/daemon/current/models/pet_detect.onnx"),
+             enter_threshold: lib.enter_threshold,
+             exit_threshold: lib.exit_threshold,
+diff --git a/robotd-params/src/lib.rs b/robotd-params/src/lib.rs
+index 2e00c71..42ee98f 100644
+--- a/robotd-params/src/lib.rs
++++ b/robotd-params/src/lib.rs
+@@ -1121,7 +1121,10 @@ impl Default for AudioParams {
+     fn default() -> Self {
+         Self {
+             enabled: true,
+-            device: "plughw:aic3104".to_owned(),
++            // The duck-brain duck (P20): no aic3104 codec, a MAX98357A and an ICS-43434 on one
++            // I2S clock, card `duck-i2s3` — shared through duck-brain's /etc/asound.conf, whose
++            // `duck` PCM is dmix/dsnoop at the card's one format (48 kHz, S32_LE, 2 channels).
++            device: "duck".to_owned(),
+             bank: PathBuf::from("/var/lib/robot/sounds"),
+             greet: true,
+             pet_detect: None,
+@@ -1148,8 +1151,11 @@ impl AudioParams {
+     /// in `robotd.toml` is the default and needs it, but the equally natural full spec
+     /// `plughw:aic3104,0` would otherwise become `plughw:aic3104,0,0`, which no card
+     /// answers to. That lands the worker in its restart loop for the life of the daemon.
++    ///
++    /// A plain PCM name from an asound.conf (`duck`, duck-brain P20) is used as written: ALSA reads
++    /// `duck,0` as an unknown PCM, not as `duck` with a subdevice.
+     pub fn capture_device(&self) -> String {
+-        if self.device.contains(',') {
++        if self.device.contains(',') || !self.device.contains(':') {
+             self.device.clone()
+         } else {
+             format!("{},0", self.device)
+@@ -3801,6 +3807,9 @@ mod tests {
+             ..AudioParams::default()
+         };
+         assert_eq!(spelled_out.capture_device(), "plughw:aic3104,0");
++
++        // A PCM of the board's asound.conf (P20) takes no subdevice.
++        assert_eq!(AudioParams::default().capture_device(), "duck");
+     }
+ 
+     /// A board without the configured card plays and records on ALSA's `default`, which the
+@@ -3815,7 +3824,10 @@ mod tests {
+         ));
+         assert_eq!(beta, ["rockchiprk809", "facemic"]);
+ 
+-        let params = AudioParams::default();
++        let params = AudioParams {
++            device: "plughw:aic3104".to_owned(),
++            ..AudioParams::default()
++        };
+         let resolved = params.resolve_devices(&beta);
+         assert_eq!(resolved.playback, "default");
+         assert_eq!(resolved.capture, "default");
+diff --git a/robotd/src/journal.rs b/robotd/src/journal.rs
+index 4241e86..3cf41df 100644
+--- a/robotd/src/journal.rs
++++ b/robotd/src/journal.rs
+@@ -27,6 +27,12 @@ const QUEUE: usize = 512;
+ /// emulator run measured.
+ pub const BUFFER: usize = 16 << 20;
+ 
++/// The most a journal grows to (duck-brain P20): on the duck it lives in `/tmp`, which is RAM —
++/// no robot program writes to the SD card — and 2 GB of it is all there is. ~35 minutes at the
++/// ~124 kB/s measured [calculation]. Past it no more ticks are written: a `full` line marks where
++/// it stopped, and the end line still comes.
++pub const MAX_BYTES: usize = 256 << 20;
++
+ /// The default batch period.
+ pub const FLUSH_EVERY: std::time::Duration = std::time::Duration::from_secs(180);
+ 
+@@ -56,15 +62,33 @@ impl Journal {
+             .spawn(move || {
+                 use std::sync::mpsc::RecvTimeoutError;
+                 let mut due = std::time::Instant::now() + flush_every;
++                let mut bytes = 0usize;
++                let mut full = false;
+                 loop {
+                     let wait = due.saturating_duration_since(std::time::Instant::now());
+                     match rx.recv_timeout(wait) {
+-                        Ok(line) => {
++                        // The end line always goes in, so the counts survive a full journal.
++                        Ok(line)
++                            if bytes + line.len() < MAX_BYTES || line.starts_with("{\"end\"") =>
++                        {
+                             // A full buffer goes to the file by itself (BufWriter); the
+                             // fdatasync waits for the batch's time.
++                            bytes += line.len() + 1;
+                             out.write_all(line.as_bytes())?;
+                             out.write_all(b"\n")?;
+                         }
++                        Ok(_) => {
++                            if !full {
++                                full = true;
++                                tracing::warn!(
++                                    max_bytes = MAX_BYTES,
++                                    "tick journal full; later ticks are not written"
++                                );
++                                out.write_all(
++                                    format!("{{\"full\":{{\"bytes\":{bytes}}}}}\n").as_bytes(),
++                                )?;
++                            }
++                        }
+                         Err(RecvTimeoutError::Timeout) => {}
+                         Err(RecvTimeoutError::Disconnected) => break,
+                     }
+diff --git a/robotd/src/sound.rs b/robotd/src/sound.rs
+index 4ae5a83..be28f40 100644
+--- a/robotd/src/sound.rs
++++ b/robotd/src/sound.rs
+@@ -175,6 +175,11 @@ pub struct Sound {
+     bank: PathBuf,
+     device: String,
+     child: Option<Child>,
++    /// Set to fade out the wav the child is playing, when it is one fed by [`feed_wav`]
++    /// (duck-brain P20): cutting it then means fading, not killing.
++    fade: Option<Arc<AtomicBool>>,
++    /// Wavs told to fade, still playing their last ~150 ms; reaped as they finish.
++    draining: Vec<(Child, Instant)>,
+     /// The child is a `robot.say` phrase (duck-brain P8): what a hush may stop.
+     phrase: bool,
+     /// The wheee rider loops while this is true. Shared with the writer thread; clearing
+@@ -204,6 +209,8 @@ impl Sound {
+             bank,
+             device,
+             child: None,
++            fade: None,
++            draining: Vec::new(),
+             phrase: false,
+             wheee_held: Arc::new(AtomicBool::new(false)),
+             ride: Ride::Off,
+@@ -247,12 +254,38 @@ impl Sound {
+         self.singing = None;
+         self.ride = Ride::Off;
+         self.phrase = false;
++        // A wav fed by `feed_wav` is faded and left to drain (P20): the amplifier must hear the
++        // sound end in zeros, not stop mid-wave. On the `duck` dmix the next sound opens beside it.
++        let fade = self.fade.take();
+         if let Some(mut child) = self.child.take()
+             && let Ok(None) = child.try_wait()
+         {
+-            let _ = child.kill();
+-            let _ = child.wait();
++            match fade {
++                Some(fade) => {
++                    fade.store(true, Ordering::Relaxed);
++                    self.draining.push((child, Instant::now()));
++                }
++                None => {
++                    let _ = child.kill();
++                    let _ = child.wait();
++                }
++            }
+         }
++        self.reap_draining();
++    }
++
++    /// Forget the faded wavs that have finished; one that has not after a second is killed.
++    fn reap_draining(&mut self) {
++        self.draining
++            .retain_mut(|(child, since)| match child.try_wait() {
++                Ok(None) if since.elapsed() < DRAIN_MAX => true,
++                Ok(None) => {
++                    let _ = child.kill();
++                    let _ = child.wait();
++                    false
++                }
++                _ => false,
++            });
+     }
+ 
+     /// The ride's *other* exit: let the writer out of its loop but leave the pipe open, so
+@@ -330,7 +363,37 @@ impl Sound {
+         }
+     }
+ 
++    /// Play `wav` (duck-brain P20). A 16-bit PCM file — every bank sound and every `duck-say`
++    /// phrase — is fed to `aplay` by [`feed_wav`]: with 50 ms of silence first, because the
++    /// duck's amplifier is switched on only once the stream runs and the first ~30 ms are lost,
++    /// and ending in zeros, faded when cut. Anything else goes to `aplay` as a file, as before.
+     fn spawn_wav(&mut self, wav: &Path, blocking: bool, tag: &str) {
++        self.reap_draining();
++        if let Some(pcm) = read_wav16(wav) {
++            let child = Command::new("aplay")
++                .args(["-q", "-D", &self.device, "-t", "raw", "-f", "S16_LE"])
++                .args(["-r", &pcm.rate.to_string(), "-c", &pcm.channels.to_string()])
++                .stdin(Stdio::piped())
++                .stdout(Stdio::null())
++                .stderr(Stdio::null())
++                .spawn();
++            match child {
++                Ok(mut c) => {
++                    let stdin = c.stdin.take().expect("piped");
++                    let fade = Arc::new(AtomicBool::new(false));
++                    let writer_fade = Arc::clone(&fade);
++                    std::thread::spawn(move || feed_wav(stdin, &pcm, &writer_fade));
++                    if blocking {
++                        wait_bounded(&mut c, BLOCKING_PLAY_MAX);
++                    } else {
++                        self.child = Some(c);
++                        self.fade = Some(fade);
++                    }
++                }
++                Err(e) => tracing::debug!(error = %e, tag, "aplay failed"),
++            }
++            return;
++        }
+         let child = Command::new("aplay")
+             .args(["-q", "-D", &self.device])
+             .arg(wav)
+@@ -871,6 +934,122 @@ fn wait_bounded(child: &mut Child, timeout: Duration) {
+     let _ = child.wait();
+ }
+ 
++/// Silence before every wav (P20): the amplifier's enable follows the stream with ~30 ms delay.
++const LEAD_SILENCE: Duration = Duration::from_millis(50);
++/// Zeros after every wav, and after the fade of one cut short.
++const TAIL_SILENCE: Duration = Duration::from_millis(30);
++/// How long a cut wav fades.
++const CUT_FADE: Duration = Duration::from_millis(20);
++/// How far ahead of real time the feeder writes: what a cut still plays before its fade.
++const FEED_AHEAD: Duration = Duration::from_millis(100);
++/// A faded wav still running after this is killed.
++const DRAIN_MAX: Duration = Duration::from_secs(1);
++
++/// A 16-bit PCM wav, as [`feed_wav`] plays it.
++struct Wav16 {
++    rate: u32,
++    channels: u16,
++    /// Interleaved samples.
++    samples: Vec<i16>,
++}
++
++/// Read a 16-bit PCM wav of any rate and channel count; `None` for anything else.
++fn read_wav16(path: &Path) -> Option<Wav16> {
++    let b = std::fs::read(path).ok()?;
++    if b.len() < 12 || &b[..4] != b"RIFF" || &b[8..12] != b"WAVE" {
++        return None;
++    }
++    let mut fmt: Option<(u16, u16, u32, u16)> = None;
++    let mut pos = 12usize;
++    while pos + 8 <= b.len() {
++        let sz = u32::from_le_bytes(b[pos + 4..pos + 8].try_into().ok()?) as usize;
++        let body = pos + 8;
++        match &b[pos..pos + 4] {
++            b"fmt " if body + 16 <= b.len() => {
++                let u16_at = |i: usize| u16::from_le_bytes([b[body + i], b[body + i + 1]]);
++                let rate = u32::from_le_bytes(b[body + 4..body + 8].try_into().ok()?);
++                fmt = Some((u16_at(0), u16_at(2), rate, u16_at(14)));
++            }
++            b"data" => {
++                let (format, channels, rate, bits) = fmt?;
++                if format != 1 || bits != 16 || channels == 0 || rate == 0 {
++                    return None;
++                }
++                let data = &b[body..(body + sz).min(b.len())];
++                let samples = data
++                    .chunks_exact(2)
++                    .map(|c| i16::from_le_bytes([c[0], c[1]]))
++                    .collect();
++                return Some(Wav16 {
++                    rate,
++                    channels,
++                    samples,
++                });
++            }
++            _ => {}
++        }
++        pos = body + sz + (sz & 1);
++    }
++    None
++}
++
++/// `d` of `wav`, in interleaved samples.
++fn samples_in(wav: &Wav16, d: Duration) -> usize {
++    (d.as_secs_f64() * f64::from(wav.rate)).round() as usize * usize::from(wav.channels)
++}
++
++/// The end of a wav cut at sample `at`: its next [`CUT_FADE`] faded linearly to zero.
++fn faded_from(wav: &Wav16, at: usize) -> Vec<i16> {
++    let fade = samples_in(wav, CUT_FADE).max(1);
++    wav.samples[at.min(wav.samples.len())..]
++        .iter()
++        .take(fade)
++        .enumerate()
++        .map(|(k, &s)| (f64::from(s) * (1.0 - (k + 1) as f64 / fade as f64)).round() as i16)
++        .collect()
++}
++
++/// Write `wav` to `aplay`'s stdin (P20): [`LEAD_SILENCE`] of zeros, the samples in 20 ms chunks
++/// at most [`FEED_AHEAD`] ahead of real time, [`TAIL_SILENCE`] of zeros, then EOF — `aplay`
++/// drains and exits. With `fade` set the rest is replaced by a [`CUT_FADE`] fade, so a cut is
++/// heard within ~100 ms and ends in zeros rather than mid-wave.
++fn feed_wav(mut stdin: std::process::ChildStdin, wav: &Wav16, fade: &AtomicBool) {
++    use std::io::Write;
++    let written = std::cell::Cell::new(0usize);
++    let mut put = |samples: &[i16]| -> bool {
++        written.set(written.get() + samples.len());
++        let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
++        stdin.write_all(&bytes).is_ok()
++    };
++    let per_second = f64::from(wav.rate) * f64::from(wav.channels);
++    let chunk = samples_in(wav, Duration::from_millis(20)).max(1);
++    let started = Instant::now();
++    if !put(&vec![0; samples_in(wav, LEAD_SILENCE)]) {
++        return;
++    }
++    let mut at = 0usize;
++    while at < wav.samples.len() {
++        if fade.load(Ordering::Relaxed) {
++            if !put(&faded_from(wav, at)) {
++                return;
++            }
++            break;
++        }
++        if written.get() as f64 / per_second - started.elapsed().as_secs_f64()
++            > FEED_AHEAD.as_secs_f64()
++        {
++            std::thread::sleep(Duration::from_millis(5));
++            continue;
++        }
++        let end = (at + chunk).min(wav.samples.len());
++        if !put(&wav.samples[at..end]) {
++            return;
++        }
++        at = end;
++    }
++    let _ = put(&vec![0; samples_in(wav, TAIL_SILENCE)]);
++}
++
+ /// Read a PCM wav: (sample_rate, raw S16LE payload). A minimal RIFF chunk walk — enough for
+ /// the mono 16-bit files the voice bank contains.
+ fn read_wav_pcm(path: &Path) -> Option<(u32, Vec<u8>)> {
+@@ -917,6 +1096,63 @@ mod tests {
+         std::fs::remove_dir_all(&dir).ok();
+     }
+ 
++    /// P20: the bank's wavs and duck-say's phrases parse as 16-bit PCM with their rate and channels.
++    #[test]
++    fn read_wav16_reads_what_sounds_writes() {
++        let dir = std::env::temp_dir().join(format!("sound16-test-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("t.wav");
++        let buf: Vec<f32> = (0..480).map(|i| (i as f32 / 48.0).sin() * 0.5).collect();
++        sounds::to_wav(&buf, &path).unwrap();
++        let wav = read_wav16(&path).expect("16-bit PCM");
++        assert_eq!(
++            (wav.rate, wav.channels, wav.samples.len()),
++            (sounds::SR, 1, 480)
++        );
++        std::fs::remove_dir_all(&dir).ok();
++    }
++
++    /// What reaches `aplay`: 50 ms of zeros, the wav, 30 ms of zeros; a cut fades over 20 ms to zero.
++    /// `cat` stands in for `aplay`.
++    #[test]
++    fn a_wav_is_fed_with_silence_around_it_and_a_cut_fades() {
++        let wav = Wav16 {
++            rate: 1000,
++            channels: 1,
++            samples: vec![10_000; 1000],
++        };
++        let run = |cut: bool| -> Vec<i16> {
++            let mut cat = Command::new("cat")
++                .stdin(Stdio::piped())
++                .stdout(Stdio::piped())
++                .spawn()
++                .unwrap();
++            let stdin = cat.stdin.take().unwrap();
++            let fade = AtomicBool::new(cut);
++            feed_wav(stdin, &wav, &fade);
++            let out = cat.wait_with_output().unwrap().stdout;
++            out.chunks_exact(2)
++                .map(|c| i16::from_le_bytes([c[0], c[1]]))
++                .collect()
++        };
++        let whole = run(false);
++        assert_eq!(whole.len(), 50 + 1000 + 30);
++        assert!(whole[..50].iter().all(|&s| s == 0) && whole[1050..].iter().all(|&s| s == 0));
++        assert!(whole[50..1050].iter().all(|&s| s == 10_000));
++        let cut = run(true);
++        assert_eq!(
++            cut.len(),
++            50 + 20 + 30,
++            "cut before the first chunk: lead, fade, tail"
++        );
++        let fade = &cut[50..70];
++        assert!(
++            fade.windows(2).all(|w| w[1] <= w[0]) && fade[19] == 0,
++            "{fade:?}"
++        );
++        assert!(cut[70..].iter().all(|&s| s == 0));
++    }
++
+     /// A missing bank must degrade to silence, not errors — robots without a codec walk on.
+     #[test]
+     fn a_missing_bank_is_silent_not_fatal() {
+diff --git a/sounds/src/main.rs b/sounds/src/main.rs
+index 7f34546..df5d47d 100644
+--- a/sounds/src/main.rs
++++ b/sounds/src/main.rs
+@@ -54,7 +54,7 @@ enum Cmd {
+         #[arg(long, default_value_t = 0)]
+         variant: u32,
+         /// ALSA device; the robot's codec by default.
+-        #[arg(long, default_value = "plughw:aic3104")]
++        #[arg(long, default_value = "duck")]
+         device: String,
+     },
+     /// Audition the live theremin voice: a scripted hand sweep through the streaming synth.
+@@ -72,7 +72,7 @@ enum Cmd {
+         #[arg(long, default_value_t = 0)]
+         variant: u32,
+         /// ALSA device; the robot's codec by default.
+-        #[arg(long, default_value = "plughw:aic3104")]
++        #[arg(long, default_value = "duck")]
+         device: String,
+     },
+     /// The duck chorale, on a laptop: several ducks singing one piece in four parts.
+@@ -110,7 +110,7 @@ enum Cmd {
+         #[arg(long, default_value_t = 300.0)]
+         rolloff: f64,
+         /// ALSA device; the robot's codec by default.
+-        #[arg(long, default_value = "plughw:aic3104")]
++        #[arg(long, default_value = "duck")]
+         device: String,
+     },
+     /// Make sure this robot's voice bank exists and is current — render it if not.
+diff --git a/tof/src/link.rs b/tof/src/link.rs
+index 8a3bd80..c3adab5 100644
+--- a/tof/src/link.rs
++++ b/tof/src/link.rs
+@@ -15,12 +15,11 @@ use robotd_params::board::Board;
+ 
+ /// I²C buses to try when none was named, in order.
+ ///
+-/// `/dev/i2c-pihat` is the udev symlink `setup-board.sh` installs, which follows
+-/// the HAT bus; `/dev/i2c-3` is what the `i2c3-pihat` overlay creates and is the
+-/// answer on a board provisioned before that rule existed. Trying both means a
+-/// board that predates the rule still finds its sensor, and the log says which
+-/// path answered.
+-pub const BUS_CANDIDATES: [&str; 2] = ["/dev/i2c-pihat", "/dev/i2c-3"];
++/// The duck-brain duck (duck-brain P20, Alex's board of 04.11.2026) has its ToF on I2C5-M0, header
++/// pins 29/31: `/dev/i2c-5`, enabled by its own overlay. Pollen's `/dev/i2c-pihat` (a udev link to
++/// i2c3) and `/dev/i2c-3` are not tried: i2c3 carries the body IMU, polled at 200 Hz, and the
++/// kernel-bound fusb302.
++pub const BUS_CANDIDATES: [&str; 1] = ["/dev/i2c-5"];
+ 
+ /// I²C addresses to try when none was named.
+ ///
+@@ -110,11 +109,11 @@ mod tests {
+     #[test]
+     fn a_zero3_sweeps_its_i2c_buses_and_addresses() {
+         let links = candidates(Board::Zero3, None, None, None);
+-        assert_eq!(links.len(), 4);
++        assert_eq!(links.len(), 2);
+         assert_eq!(
+             links[0],
+             Link::I2c {
+-                bus: "/dev/i2c-pihat".into(),
++                bus: "/dev/i2c-5".into(),
+                 address: 0x29
+             }
+         );
+-- 
+2.43.0
+

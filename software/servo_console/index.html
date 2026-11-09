@@ -1,0 +1,955 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title data-i18n="title">Duck servo console</title>
+<style>
+  :root { --bg:#0f1412; --panel:#161d1a; --line:#243029; --text:#e6ede9; --muted:#8fa098; --acc:#3df0a3; --warn:#f0b43d; --bad:#f05a5a; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 "IBM Plex Mono","Consolas","PingFang SC","Microsoft YaHei",monospace; }
+  header { display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; padding:8px 14px; border-bottom:1px solid var(--line); background:var(--panel); position:sticky; top:0; z-index:5; }
+  header h1 { font-size:16px; margin:0 8px 0 0; font-weight:600; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--bad); margin-right:6px; }
+  .dot.on { background:var(--acc); }
+  button { background:#1f2a25; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:6px 11px; cursor:pointer; font:inherit; }
+  button:hover { border-color:var(--acc); }
+  button.danger { border-color:var(--bad); color:var(--bad); }
+  button.ok { border-color:var(--acc); color:var(--acc); }
+  #langBox { display:inline-flex; align-items:center; gap:2px; color:var(--muted); }
+  #langBox button { padding:3px 8px; font-size:12px; }
+  #langBox button.on { border-color:var(--acc); color:var(--acc); }
+  input[type=number], input[type=text], select { width:80px; background:#0c110f; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:5px 7px; font:inherit; }
+  select { width:auto; }
+  .layout { display:grid; grid-template-columns:minmax(320px,1fr) minmax(340px,1.1fr); gap:12px; padding:12px 14px; }
+  @media (max-width:900px) { .layout { grid-template-columns:1fr; } }
+  #viewWrap { position:sticky; top:calc(var(--headH,46px) + 6px); height:calc(100vh - var(--headH,46px) - 18px); min-height:360px; background:var(--panel); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  @media (max-width:900px) { #viewWrap { position:relative; top:0; height:52vw; min-height:300px; } }
+  #view { width:100%; height:100%; display:block; }
+  #viewTop { position:absolute; left:10px; right:10px; top:8px; display:flex; justify-content:space-between; align-items:flex-start; gap:10px; pointer-events:none; }
+  #viewTopLeft { flex:1; min-width:0; display:flex; flex-direction:column; align-items:flex-start; gap:6px; }
+  #viewHud { font-size:12px; color:var(--muted); overflow-wrap:anywhere; }
+  #viewBtns { flex:none; max-width:60%; display:flex; flex-wrap:wrap; justify-content:flex-end; gap:6px; pointer-events:auto; }
+  #viewBottom { position:absolute; left:10px; right:10px; bottom:10px; display:flex; flex-direction:column; gap:6px; pointer-events:none; }
+  #hint { padding:8px 12px; border-radius:8px; background:#393520; border:1px solid var(--warn); color:var(--warn); font-size:13px; overflow-wrap:anywhere; display:none; }
+  #hint.show { display:block; }
+  .col { display:flex; flex-direction:column; gap:12px; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; }
+  section h2 { font-size:13px; margin:0 0 8px; color:var(--muted); font-weight:600; letter-spacing:.04em; display:flex; align-items:center; gap:10px; }
+  .servo { display:grid; grid-template-columns:30px 1fr 60px 22px 22px; gap:8px; align-items:center; padding:5px 0; border-top:1px dashed var(--line); }
+  .servo:first-of-type { border-top:0; }
+  .servo .id { color:var(--acc); font-weight:600; }
+  .servo .name { font-size:11px; color:var(--muted); grid-column:2/6; margin-top:-5px; display:flex; gap:10px; flex-wrap:wrap; }
+  .servo.off .id { color:var(--bad); }
+  .track { position:relative; height:26px; }
+  .track input[type=range] { width:100%; margin:0; position:absolute; top:4px; left:0; }
+  .track .mark { position:absolute; top:0; width:2px; height:26px; background:var(--warn); pointer-events:none; transform:translateX(-1px); }
+  .track .mid { position:absolute; top:9px; width:1px; height:8px; left:50%; background:var(--muted); pointer-events:none; }
+  .val { text-align:right; }
+  .tq { width:18px; height:18px; accent-color:var(--acc); }
+  .dir { width:22px; height:22px; padding:0; font-size:11px; line-height:20px; text-align:center; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:6px 0; }
+  .log { height:240px; overflow:auto; background:#0c110f; border:1px solid var(--line); border-radius:6px; padding:6px 8px; font-size:12px; white-space:pre-wrap; word-break:break-all; }
+  .ll { padding:1px 0; } .ll .lt { color:var(--muted); } .ll .lc { color:#7fb2ff; }
+  .ll.warn { color:var(--warn); } .ll.error { color:var(--bad); } .ll.warn .lc, .ll.error .lc { color:inherit; }
+  .badge { font-size:11px; font-weight:400; padding:1px 7px; border-radius:9px; border:1px solid currentColor; }
+  #opId, #oldId, #newId { max-width:200px; } #wAddr { max-width:260px; }
+  table { border-collapse:collapse; width:100%; font-size:12px; }
+  td, th { border-bottom:1px solid var(--line); padding:3px 6px; text-align:left; }
+  td.n { text-align:right; }
+  .area-EEPROM { color:var(--warn); } .area-SRAM { color:var(--acc); } .area-state { color:var(--muted); }
+  .bad { color:var(--bad); } .muted { color:var(--muted); }
+  #dumpWrap { max-height:420px; overflow:auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span data-i18n="h1">🦆 Servo console</span> <span class="muted" id="ver" style="font-size:11px;font-weight:400"></span></h1>
+  <span><span class="dot" id="dot"></span><span id="conn"></span></span>
+  <span style="display:flex;gap:14px;font-size:13px"><span><span data-i18n="st.online">online</span> <b id="stOnline">–</b></span><span><span data-i18n="st.poll">poll</span> <b id="stHz">–</b></span><span><span data-i18n="st.volt">voltage</span> <b id="stVolt">–</b></span></span>
+  <span class="muted" id="busInfo" style="font-size:12px"></span>
+  <span id="portBox" style="display:none">
+    <select id="portSel" data-i18n-title="portSel.title"></select>
+    <button onclick="reconnect()" data-i18n="btn.connect" data-i18n-title="btn.connect.title">Connect</button>
+  </span>
+  <button class="ok" onclick="torqueAll(1)" data-i18n="btn.torqueOn">Torque on (all)</button>
+  <button class="danger" onclick="torqueAll(0)" data-i18n="btn.torqueOff">Torque off (all)</button>
+  <button onclick="syncSliders()" data-i18n="btn.sync" data-i18n-title="btn.sync.title">Sliders = current positions</button>
+  <button onclick="centerAll()" data-i18n="btn.zero" data-i18n-title="btn.zero.title">All to zero (2048)</button>
+  <button id="idleBtn" onclick="toggleIdle()" data-i18n-title="btn.idle.title"></button>
+  <button onclick="send({op:'scan'})" data-i18n="btn.rescan">Rescan</button>
+  <label class="muted"><span data-i18n="live">move while dragging</span> <input type="checkbox" id="live" checked></label>
+  <span id="langBox"><button id="langEn" onclick="setLang('en')">EN</button>|<button id="langRu" onclick="setLang('ru')">RU</button></span>
+</header>
+
+<div class="layout">
+  <div id="viewWrap">
+    <canvas id="view"></canvas>
+    <div id="viewTop">
+      <div id="viewTopLeft">
+        <div id="viewHud"></div>
+      </div>
+      <div id="viewBtns">
+        <button onclick="resetCam()" data-i18n="btn.resetView">Reset view</button>
+        <label class="muted" style="font-size:12px;background:var(--panel);padding:4px 8px;border-radius:6px">
+          <span data-i18n="show">Show</span> <select id="showWhat" onchange="setShowWhat()"><option value="present" data-i18n="show.present">current position</option><option value="goal" data-i18n="show.goal">slider goal</option></select>
+        </label>
+      </div>
+    </div>
+    <div id="viewBottom"><div id="hint"></div></div>
+  </div>
+
+  <div class="col">
+    <section id="simPanel" hidden>
+      <h2><span data-i18n="sim.h">Simulation</span> <span class="badge" style="color:var(--warn)" data-i18n="sim.badge">port not connected</span></h2>
+      <div class="muted" style="font-size:12px;line-height:1.6" data-i18n-html="sim.text"></div>
+    </section>
+    <section><h2><span data-i18n="sec.left">Left leg 20–24</span> <span class="muted" style="font-weight:400" data-i18n="sec.leftNote"></span> <button onclick="copyRobotdDirs()" style="font-size:12px;padding:3px 8px" data-i18n="btn.copyDirs">Copy robotd directions table</button></h2><div id="g20"></div></section>
+    <section><h2 data-i18n="sec.head">Neck / head / beak 30–34</h2><div id="g30"></div></section>
+    <section><h2 data-i18n="sec.right">Right leg 10–14</h2><div id="g10"></div></section>
+    <section id="other" style="display:none"><h2 data-i18n="sec.other">Other IDs</h2><div id="gx"></div></section>
+
+    <section>
+      <h2 data-i18n="motion.h">Motion</h2>
+      <div class="row"><span data-i18n="motion.ramp">Transition time</span> <input type="number" id="rampSec" value="2" min="0" max="20" step="0.5" style="width:60px"> <span data-i18n="unit.s">s</span>
+        <span data-i18n="motion.mode">Mode</span> <select id="moveMode"><option value="profile" data-i18n="mode.profile"></option><option value="stream" data-i18n="mode.stream"></option></select>
+        <span data-i18n="motion.acc">Acceleration</span> <input type="number" id="accReg" value="30" min="1" max="254" style="width:56px" data-i18n-title="acc.title">
+        <button class="danger" onclick="stopRamp()" data-i18n="btn.stop">Stop</button></div>
+    </section>
+
+    <section>
+      <h2><span data-i18n="cal.h">Zero calibration</span> <span class="muted" style="font-weight:400" data-i18n="cal.note"></span></h2>
+      <div class="muted" style="font-size:12px;line-height:1.7" data-i18n-html="cal.text"></div>
+      <div class="row">
+        <span data-i18n="cal.ids">Which IDs</span> <input type="text" id="calibIds" value="20-24,30-34,10-14" style="width:170px">
+        <button class="danger" onclick="calibAll()" data-i18n="btn.calAll" data-i18n-title="btn.calAll.title">Calibrate selected</button>
+        <button onclick="if(confirm(t('cal.undoQ')))send({op:'calib_undo'})" data-i18n="btn.calUndo">Undo last</button>
+      </div>
+    </section>
+
+    <section>
+      <h2 data-i18n="one.h">One servo</h2>
+      <div class="row"><span data-i18n="one.servo">Servo</span> <select id="opId"></select>
+        <button onclick="send({op:'dump', id:v('opId')})" data-i18n="btn.dump">Dump registers 0–86</button>
+        <button onclick="if(confirm(t('one.rebootQ', {id: v('opId')})))send({op:'reboot', id:v('opId')})" data-i18n="btn.reboot">Reboot 0x08</button>
+        <button class="danger" onclick="calibOne()" data-i18n="btn.calOne" data-i18n-title="btn.calOne.title">Calibrate this one</button>
+      </div>
+      <div class="row"><span data-i18n="one.setId">Change ID:</span> <select id="oldId" data-i18n-title="oldId.title"></select> → <select id="newId"></select>
+        <button class="danger" onclick="setIdClick()" data-i18n="btn.writeId">Write ID</button>
+      </div>
+      <div class="row"><span data-i18n="one.reg">Register</span> <select id="wAddr" onchange="regChanged()"><option value="41">41</option></select> <span data-i18n="one.bytes">bytes</span> <select id="wSize"><option value="1">1</option><option value="2">2</option></select>
+        <span data-i18n="one.value">value</span> <input type="number" id="wVal" value="0">
+        <label class="muted"><input type="checkbox" id="wUnlock"> <span data-i18n="one.unlock">with unlock (EEPROM write)</span></label>
+        <button onclick="send({op:'write_reg', id:v('opId'), addr:v('wAddr'), size:v('wSize'), value:v('wVal'), unlock:document.getElementById('wUnlock').checked})" data-i18n="btn.write">Write</button>
+      </div>
+      <div class="row">
+        <button onclick="send({op:'timing', n:200})" data-i18n="btn.timing">sync_read test ×200</button>
+        <button onclick="if(confirm(t('one.scanAllQ')))send({op:'scan_all'})" data-i18n="btn.scanAll">Scan 0–253</button>
+        <button onclick="send({op:'scan', ids:prompt(t('one.idList'),'20-24,30-34,10-14')})" data-i18n="btn.scanIds">Scan IDs…</button>
+      </div>
+      <div id="timing" class="muted"></div>
+    </section>
+
+    <section>
+      <h2><span data-i18n="log.h">Journal</span> <span id="logWarn" class="badge" style="color:var(--warn);display:none"></span><span id="logErr" class="badge" style="color:var(--bad);display:none"></span></h2>
+      <div class="row">
+        <span data-i18n="log.cat">Category</span> <select id="logCat" onchange="renderLog()"><option value="" data-i18n="log.all">all</option></select>
+        <label class="muted"><input type="checkbox" id="logBad" onchange="renderLog()"> <span data-i18n="log.bad">warnings and errors only</span></label>
+        <button onclick="copyLog()" data-i18n="btn.copy" data-i18n-title="btn.copy.title">Copy</button>
+        <button onclick="clearLog()" data-i18n="btn.clear" data-i18n-title="btn.clear.title">Clear</button>
+        <a href="/api/logfile" target="_blank" class="muted" style="font-size:12px" data-i18n="log.file" data-i18n-title="log.file.title">Today's journal file</a>
+      </div>
+      <div class="log" id="log"></div>
+    </section>
+
+    <section id="dumpSec" hidden>
+      <h2><span data-i18n="dump.h">Registers</span> <span id="dumpId"></span> <button onclick="downloadDump()" data-i18n="btn.dlJson">Download JSON</button> <button onclick="copyDumpMd()" data-i18n="btn.copyMd">Copy Markdown table</button></h2>
+      <div id="dumpWrap"><table id="dumpTbl"></table></div>
+    </section>
+  </div>
+</div>
+
+<script>
+// ---- 语言：EN 默认，RU 可选；页面上所有文字都走这本字典。服务端发来的文字是 {en, ru}，按当前语言取 ----
+const I18N = {
+en: {
+  'title': 'Duck servo console', 'h1': '🦆 Servo console',
+  'conn.connecting': 'connecting…', 'conn.on': 'connected', 'conn.lost': 'connection lost, retry in 3 s',
+  'st.online': 'online', 'st.poll': 'poll', 'st.volt': 'voltage',
+  'portSel.title': 'Serial ports the system sees; the port name may change after re-plugging USB',
+  'btn.connect': 'Connect', 'btn.connect.title': 'Open the selected port and rescan the servos (no server restart needed)',
+  'btn.torqueOn': 'Torque on (all)', 'btn.torqueOff': 'Torque off (all)',
+  'btn.sync': 'Sliders = current positions', 'btn.sync.title': 'Press before enabling torque: otherwise the servos will move to the old slider goals',
+  'btn.zero': 'All to zero (2048)', 'btn.zero.title': 'Zero = legs straight, feet vertical, head straight, beak closed; per Pollen every servo reads 2048 here',
+  'btn.idle': '🦆 Animate head', 'btn.idleStop': '⏹ Stop head',
+  'btn.idle.title': 'Random small head motions: tilts, turns, nods, beak. The center is the head position at the moment of pressing; only 30–34 move',
+  'btn.rescan': 'Rescan', 'live': 'move while dragging',
+  'btn.resetView': 'Reset view', 'show': 'Show', 'show.present': 'current position', 'show.goal': 'slider goal',
+  'hud.loading': 'Loading model…', 'hud.model': 'Model: {src} (joints driven by servos: {n}{notes})', 'hud.fail': 'Model not loaded: {msg} (the model/ folder is missing)',
+  'sim.h': 'Simulation', 'sim.badge': 'port not connected',
+  'sim.text': 'The servos are virtual: they move to the goal along a trapezoid with the speed and acceleration from the registers, like real ones; sliders, “All to zero” and “animate head” show in 3D at real speed. Torque is on by default.\n        There is no gravity: with torque off a servo stays where it is and the duck does not fall (the COM projection is still computed). To switch to real servos — plug in USB, pick the port at the top and press “Connect”.',
+  'sec.left': 'Left leg 20–24', 'sec.leftNote': '±: joint sign, stored in directions.json; affects 3D and “animate”; does not touch the servo',
+  'btn.copyDirs': 'Copy robotd directions table',
+  'sec.head': 'Neck / head / beak 30–34', 'sec.right': 'Right leg 10–14', 'sec.other': 'Other IDs',
+  'motion.h': 'Motion', 'motion.ramp': 'Transition time', 'unit.s': 's', 'motion.mode': 'Mode',
+  'mode.profile': 'smooth (the servo follows a trapezoid itself)', 'mode.stream': 'stream (the PC sends points at 20 Hz, jerky)',
+  'motion.acc': 'Acceleration', 'acc.title': 'Register 41, unit 8.7°/s²; lower is softer', 'btn.stop': 'Stop',
+  'cal.h': 'Zero calibration', 'cal.note': 'the official zero = 2048 on every servo, always',
+  'cal.text': 'Put the duck in the zero position and press the button: the current position of each servo is written as 2048 (command 0x0B, the servo stores the offset itself); the joints do not move.<br>\n        With torque on, use the sliders to set the legs straight, feet vertical, neck vertical, head straight, beak closed; hold the duck and press.<br>\n        After pressing — a confirmation window with a “now → will be, difference in °” list for each servo. A difference above 30° is asked again: it means the horn was mounted half a turn (or a few teeth) off — that is fine, calibrate.',
+  'cal.ids': 'Which IDs',
+  'btn.calAll': 'Calibrate selected', 'btn.calAll.title': 'Write the current position of the selected servos as 2048',
+  'btn.calUndo': 'Undo last', 'cal.undoQ': 'Write back into the servos the offsets they had before the last calibration?',
+  'one.h': 'One servo', 'one.servo': 'Servo', 'btn.dump': 'Dump registers 0–86', 'btn.reboot': 'Reboot 0x08', 'one.rebootQ': 'Reboot ID {id}? Torque will be switched off',
+  'btn.calOne': 'Calibrate this one', 'btn.calOne.title': 'Zero calibration (2048), this servo only',
+  'one.setId': 'Change ID:', 'oldId.title': 'Only servos on the line; a new servo usually has factory ID 1 — find it first with “Scan 0–253”', 'btn.writeId': 'Write ID',
+  'one.reg': 'Register', 'one.bytes': 'bytes', 'one.value': 'value', 'one.unlock': 'with unlock (EEPROM write)', 'btn.write': 'Write',
+  'btn.timing': 'sync_read test ×200', 'btn.scanAll': 'Scan 0–253', 'one.scanAllQ': 'Scan all IDs 0–253, about 6 s?', 'btn.scanIds': 'Scan IDs…', 'one.idList': 'ID list',
+  'log.h': 'Journal', 'log.cat': 'Category', 'log.all': 'all', 'log.bad': 'warnings and errors only',
+  'btn.copy': 'Copy', 'btn.copy.title': 'Copy the filtered journal to send it', 'btn.clear': 'Clear', 'btn.clear.title': 'Clears only the window, the journal file is not touched',
+  'log.file': 'Today’s journal file', 'log.file.title': 'logs/servo-web-<date>.log on the server: all entries, errors with traceback',
+  'log.warnN': 'warnings {n}', 'log.errN': 'errors {n}', 'level.warn': 'warning', 'level.error': 'error',
+  'cat.system': 'system', 'cat.bus': 'bus', 'cat.motion': 'motion', 'cat.calibration': 'calibration', 'cat.registers': 'registers','cat.direction': 'direction', 'cat.page': 'page',
+  'dump.h': 'Registers', 'btn.dlJson': 'Download JSON', 'btn.copyMd': 'Copy Markdown table',
+  'd.addr': 'address', 'd.name': 'name', 'd.area': 'area', 'd.bytes': 'bytes', 'd.value': 'value',
+  'area.read-only': 'read-only', 'area.EEPROM': 'EEPROM', 'area.SRAM': 'SRAM', 'area.state': 'state', 'area.factory': 'factory',
+  'ver.old': 'old', 'ver.mismatch': 'page v{p} · server v{s} do not match', 'ver.okTitle': 'Page and server versions match',
+  'ver.badTitle': 'The browser has an old page or the server was not restarted: restart server.py, then Ctrl+F5',
+  'hint.ver': 'Page v{p} and server v{s} do not match: restart server.py and press Ctrl+F5',
+  'log.lost': 'Connection to the server lost, retry in 3 s',
+  'hint.notGot': 'ID {ids} did not get the goal (packet loss on the bus), send again', 'log.goalAttempt': 'Goal write: got through only on attempt {n}',
+  'timing.line': 'n={n} ids={ids} min {min} ms · avg {avg} ms · p99 {p99} ms · max {max} ms · errors {fails}',
+  'hint.err': 'Error: {msg} (details in the journal)',
+  'bus.sim': 'Simulation: port not connected, the servos are virtual', 'bus.port': 'port {port}', 'bus.stats': 'timeouts {t} · CRC errors {c}',
+  'ports.none': 'no ports found: plug in USB and press again',
+  'hint.plugFirst': 'Plug in USB first, then press again', 'hint.opening': 'Opening {port}…',
+  'hint.copied': 'Journal lines copied: {n}', 'hint.noCopy': 'The browser does not allow copying — open “Today’s journal file”',
+  'j.20': 'L hip yaw', 'j.21': 'L hip roll', 'j.22': 'L hip pitch', 'j.23': 'L knee', 'j.24': 'L ankle', 'j.30': 'neck pitch', 'j.31': 'head pitch', 'j.32': 'head yaw', 'j.33': 'head roll', 'j.34': 'beak',
+  'j.10': 'R hip yaw', 'j.11': 'R hip roll', 'j.12': 'R hip pitch', 'j.13': 'R knee', 'j.14': 'R ankle',
+  'id.nonstd': 'non-standard ID', 'id.offline': ' (not on the line)', 'id.taken': ' (taken)',
+  'hint.noServos': 'No servos on the bus, scan first', 'hint.sameId': 'The old and new ID are the same',
+  'setid.clash': '\n\n⚠️ ID {n} is already on the bus: after the change two servos will share one ID!',
+  'setid.q': 'Change ID {o} → {n} ({name})?\nBetter have only this servo on the bus. Written to EEPROM.',
+  'reg.opt': '{a} · {name} ({size} bytes, {area})',
+  'r.title': 'limited by the model joint range', 't.title': 'torque', 'd.title': 'Flip the joint sign (3D; the servo is not touched)',
+  'hint.torqueOff': 'ID {id}: torque is off, the servo will not move. Tick the torque box on the right or switch “Show” in 3D to “slider goal”',
+  's.noReply': 'no reply', 's.status': 'status: {s}', 's.load': 'load', 's.moving': 'moving',
+  'stbit.0': 'voltage', 'stbit.1': 'encoder', 'stbit.2': 'temperature', 'stbit.3': 'current', 'stbit.5': 'load',
+  'cal.zeroText': 'zero (legs straight, feet vertical, head straight, beak closed)',
+  'hint.noneOnLine': 'None of the listed servos is on the line',
+  'c.notInRef': '{nm}  not in the reference, skipped', 'c.unread': '{nm}  position unreadable (target {t})',
+  'c.onlyOne': 'Only servo {id} ({name})', 'c.head': 'Calibration: {n} servos',
+  'c.tailSim': '\n\nSimulation: only virtual servos change, the backup goes to a temporary folder, calib/ is not touched.',
+  'c.tail': '\n\nWritten to the servos’ EEPROM; the previous offsets go to a backup, can be undone.',
+  'c.q': '{head}\n\nIs the duck already placed in {text}?\n\nNow → will be (difference):\n{lines}{tail}',
+  'c.big': 'Difference above {deg}° on {n} servos:\n{list}\n\nThe horn was mounted half a turn (or a few teeth) off: that is fine, calibration fixes exactly that.\n\nCalibrate as is?',
+  'hint.calFail': 'Failed: {n} servos ({ids}); see the journal, category “calibration” — at which step',
+  'hint.calOk': 'Done: {n} servos', 'hint.calBig': '; {ids} differ by more than 30° — the horn was mounted half a turn or a few teeth off, calibration fixes that (see the journal)',
+  'hint.torqueBad': '{ids}: torque not enabled — {why} (details in the journal)',
+  'center.q': 'All to 2048 (zero), transition {sec} s? Servos with torque on will move', 'log.zero': 'Zero ({sec} s)',
+  'log.mdCopied': 'Markdown table copied', 'log.copied': 'Copied: {line}', 'log.stop': 'Stop: goal = current position',
+  'hint.noHead': 'The head servos are not on the line', 'idle.q': 'Torque is not on for all head servos. Enable it?',
+  'log.idleStart': 'Animate head: start, center {c}', 'log.idleStop': 'Animate head: stop, head centered',
+  'com.text': 'Model COM projection {where} the feet rectangle · margin +X/−X/+Y/−Y {a}/{b}/{c}/{d} mm (model {g} g; not an estimate of real balance)',
+  'com.in': 'inside', 'com.out': 'outside',
+},
+ru: {
+  'title': 'Пульт серв утки', 'h1': '🦆 Пульт серв',
+  'conn.connecting': 'подключение…', 'conn.on': 'на связи', 'conn.lost': 'связь потеряна, повтор через 3 с',
+  'st.online': 'на линии', 'st.poll': 'опрос', 'st.volt': 'напряжение',
+  'portSel.title': 'COM-порты, которые видит система; после переподключения USB номер может смениться',
+  'btn.connect': 'Подключить', 'btn.connect.title': 'Открыть выбранный порт и пересканировать сервы (сервер не перезапускать)',
+  'btn.torqueOn': 'Момент всем вкл', 'btn.torqueOff': 'Момент всем выкл',
+  'btn.sync': 'Слайдеры = текущие положения', 'btn.sync.title': 'Нажать до включения момента: иначе сервы поедут к старым целям слайдеров',
+  'btn.zero': 'Все в ноль (2048)', 'btn.zero.title': 'Ноль = ноги прямые, стопы вертикально, голова прямо, клюв закрыт; по Pollen у каждой сервы здесь 2048',
+  'btn.idle': '🦆 Оживить голову', 'btn.idleStop': '⏹ Стоп голова',
+  'btn.idle.title': 'Случайные мелкие движения головы: наклоны, повороты, кивки, клюв. Центр — положение головы в момент нажатия; двигаются только 30–34',
+  'btn.rescan': 'Пересканировать', 'live': 'двигать при перетаскивании',
+  'btn.resetView': 'Сбросить вид', 'show': 'Показывать', 'show.present': 'текущее положение', 'show.goal': 'цель слайдера',
+  'hud.loading': 'Модель загружается…', 'hud.model': 'Модель: {src} (суставов по сервам: {n}{notes})', 'hud.fail': 'Модель не загружена: {msg} (нет папки model/)',
+  'sim.h': 'Симуляция', 'sim.badge': 'порт не подключён',
+  'sim.text': 'Сервы виртуальные: идут к цели по трапеции со скоростью и ускорением из регистров, как настоящие; слайдеры, «Все в ноль» и «оживить голову» видны в 3D с реальной скоростью. Момент по умолчанию включён.\n        Гравитации нет: при выключенном моменте серва стоит на месте, утка не падает (проекция ЦМ всё равно считается). Чтобы перейти на настоящие сервы — вставить USB, выбрать порт вверху и нажать «Подключить».',
+  'sec.left': 'Левая нога 20–24', 'sec.leftNote': '±: знак сустава, хранится в directions.json; влияет на 3D и «оживить»; серву не трогает',
+  'btn.copyDirs': 'Скопировать таблицу направлений robotd',
+  'sec.head': 'Шея / голова / клюв 30–34', 'sec.right': 'Правая нога 10–14', 'sec.other': 'Другие ID',
+  'motion.h': 'Движение', 'motion.ramp': 'Время перехода', 'unit.s': 'с', 'motion.mode': 'Режим',
+  'mode.profile': 'плавно (серва сама идёт по трапеции)', 'mode.stream': 'поток (ПК шлёт точки 20 Гц, дёргается)',
+  'motion.acc': 'Ускорение', 'acc.title': 'Регистр 41, единица 8.7°/с²; меньше — мягче', 'btn.stop': 'Стоп',
+  'cal.h': 'Калибровка нуля', 'cal.note': 'официальный ноль = 2048 на каждой серве, всегда',
+  'cal.text': 'Поставить утку в положение нуля и нажать кнопку: текущее положение каждой сервы записывается как 2048 (команда 0x0B, серва сама хранит смещение), суставы не двигаются.<br>\n        При включённом моменте слайдерами выставить ноги прямо, стопы вертикально, шею вертикально, голову прямо, клюв закрыт; придержать и нажать.<br>\n        После нажатия — окно подтверждения со списком «сейчас → станет, разница в °» по каждой серве. Разница больше 30° переспрашивается: значит, качалка посажена с поворотом на полоборота (или на несколько зубьев) — нормально, калибровать.',
+  'cal.ids': 'Какие ID',
+  'btn.calAll': 'Калибровать выбранные', 'btn.calAll.title': 'Текущее положение выбранных серв записать как 2048',
+  'btn.calUndo': 'Отменить последнюю', 'cal.undoQ': 'Вернуть в сервы смещения, какие были до последней калибровки?',
+  'one.h': 'Одна серва', 'one.servo': 'Серва', 'btn.dump': 'Выгрузить регистры 0–86', 'btn.reboot': 'Перезагрузка 0x08', 'one.rebootQ': 'Перезагрузить ID {id}? Момент будет выключен',
+  'btn.calOne': 'Калибровать эту', 'btn.calOne.title': 'Калибровка нуля (2048), только эта серва',
+  'one.setId': 'Сменить ID:', 'oldId.title': 'Только сервы на линии; у новой сервы заводской ID обычно 1 — сначала найти её кнопкой «Сканировать 0–253»', 'btn.writeId': 'Записать ID',
+  'one.reg': 'Регистр', 'one.bytes': 'байт', 'one.value': 'значение', 'one.unlock': 'с разблокировкой (запись в EEPROM)', 'btn.write': 'Записать',
+  'btn.timing': 'Тест sync_read ×200', 'btn.scanAll': 'Сканировать 0–253', 'one.scanAllQ': 'Сканировать все ID 0–253, около 6 с?', 'btn.scanIds': 'Сканировать ID…', 'one.idList': 'Список ID',
+  'log.h': 'Журнал', 'log.cat': 'Категория', 'log.all': 'все', 'log.bad': 'только предупреждения и ошибки',
+  'btn.copy': 'Копировать', 'btn.copy.title': 'Скопировать отфильтрованный журнал, чтобы отправить', 'btn.clear': 'Очистить', 'btn.clear.title': 'Очищает только окно, файл журнала не трогает',
+  'log.file': 'Файл журнала за сегодня', 'log.file.title': 'logs/servo-web-дата.log на сервере: все записи, ошибки с traceback',
+  'log.warnN': 'предупреждений {n}', 'log.errN': 'ошибок {n}', 'level.warn': 'предупреждение', 'level.error': 'ошибка',
+  'cat.system': 'система', 'cat.bus': 'шина', 'cat.motion': 'движение', 'cat.calibration': 'калибровка', 'cat.registers': 'регистры','cat.direction': 'направление', 'cat.page': 'страница',
+  'dump.h': 'Регистры', 'btn.dlJson': 'Скачать JSON', 'btn.copyMd': 'Копировать таблицу Markdown',
+  'd.addr': 'адрес', 'd.name': 'имя', 'd.area': 'область', 'd.bytes': 'байт', 'd.value': 'значение',
+  'area.read-only': 'только-чтение', 'area.EEPROM': 'EEPROM', 'area.SRAM': 'SRAM', 'area.state': 'состояние', 'area.factory': 'заводские',
+  'ver.old': 'старая', 'ver.mismatch': 'страница v{p} · сервер v{s} не совпадают', 'ver.okTitle': 'Версии страницы и сервера совпадают',
+  'ver.badTitle': 'В браузере старая страница или сервер не перезапущен: перезапустить server.py, затем Ctrl+F5',
+  'hint.ver': 'Страница v{p} и сервер v{s} не совпадают: перезапустить server.py и нажать Ctrl+F5',
+  'log.lost': 'Связь с сервером потеряна, повтор через 3 с',
+  'hint.notGot': 'ID {ids} не получили цель (потеря пакетов на шине), отправить ещё раз', 'log.goalAttempt': 'Запись цели: дошло только с {n}-й попытки',
+  'timing.line': 'n={n} ids={ids} min {min} ms · avg {avg} ms · p99 {p99} ms · max {max} ms · ошибок {fails}',
+  'hint.err': 'Ошибка: {msg} (подробности в журнале)',
+  'bus.sim': 'Симуляция: порт не подключён, сервы виртуальные', 'bus.port': 'порт {port}', 'bus.stats': 'таймаутов {t} · ошибок CRC {c}',
+  'ports.none': 'портов не найдено: вставить USB и нажать ещё раз',
+  'hint.plugFirst': 'Сначала вставить USB, потом нажать ещё раз', 'hint.opening': 'Открываю {port}…',
+  'hint.copied': 'Скопировано строк журнала: {n}', 'hint.noCopy': 'Браузер не даёт копировать — открыть «Файл журнала за сегодня»',
+  'j.20': 'лев. бедро yaw', 'j.21': 'лев. бедро roll', 'j.22': 'лев. бедро pitch', 'j.23': 'лев. колено', 'j.24': 'лев. голеностоп', 'j.30': 'шея pitch', 'j.31': 'голова pitch', 'j.32': 'голова yaw', 'j.33': 'голова roll', 'j.34': 'клюв',
+  'j.10': 'прав. бедро yaw', 'j.11': 'прав. бедро roll', 'j.12': 'прав. бедро pitch', 'j.13': 'прав. колено', 'j.14': 'прав. голеностоп',
+  'id.nonstd': 'нестандартный ID', 'id.offline': ' (не на линии)', 'id.taken': ' (занят)',
+  'hint.noServos': 'На шине нет серв, сначала сканировать', 'hint.sameId': 'Старый и новый ID совпадают',
+  'setid.clash': '\n\n⚠️ На шине уже есть ID {n}: после смены две сервы будут с одним ID!',
+  'setid.q': 'Сменить ID {o} → {n} ({name})?\nЛучше, чтобы на шине была только эта серва. Пишется в EEPROM.',
+  'reg.opt': '{a} · {name} ({size} байт, {area})',
+  'r.title': 'предел по range сустава модели', 't.title': 'момент', 'd.title': 'Сменить знак сустава (3D; серву не трогает)',
+  'hint.torqueOff': 'ID {id}: момент выключен, серва не поедет. Поставить галочку момента справа или переключить «Показывать» в 3D на «цель слайдера»',
+  's.noReply': 'нет ответа', 's.status': 'статус: {s}', 's.load': 'нагрузка', 's.moving': 'движется',
+  'stbit.0': 'напряжение', 'stbit.1': 'энкодер', 'stbit.2': 'температура', 'stbit.3': 'ток', 'stbit.5': 'нагрузка',
+  'cal.zeroText': 'ноль (ноги прямые, стопы вертикально, голова прямо, клюв закрыт)',
+  'hint.noneOnLine': 'В списке нет серв на линии',
+  'c.notInRef': '{nm}  нет в базе, пропуск', 'c.unread': '{nm}  положение не читается (цель {t})',
+  'c.onlyOne': 'Только серва {id} ({name})', 'c.head': 'Калибровка: серв {n}',
+  'c.tailSim': '\n\nСимуляция: меняются только виртуальные сервы, резерв во временной папке, calib/ не трогается.',
+  'c.tail': '\n\nЗапись в EEPROM серв; прежние смещения сохраняются в резерв, можно отменить.',
+  'c.q': '{head}\n\nУтка уже поставлена в {text}?\n\nСейчас → станет (разница):\n{lines}{tail}',
+  'c.big': 'Разница больше {deg}° у {n} серв:\n{list}\n\nКачалка посажена с поворотом на полоборота (или на несколько зубьев): нормально, калибровка это и исправляет.\n\nКалибровать как есть?',
+  'hint.calFail': 'Не удалось: {n} серв ({ids}); в журнале категория «калибровка» — на каком шаге',
+  'hint.calOk': 'Готово: {n} серв', 'hint.calBig': '; у {ids} разница больше 30° — качалка посажена с поворотом на полоборота или на несколько зубьев, калибровка это исправляет (пояснение в журнале)',
+  'hint.torqueBad': '{ids}: момент не включён — {why} (подробности в журнале)',
+  'center.q': 'Все в 2048 (ноль), переход {sec} с? Сервы с включённым моментом поедут', 'log.zero': 'Ноль ({sec} с)',
+  'log.mdCopied': 'Таблица Markdown скопирована', 'log.copied': 'Скопировано: {line}', 'log.stop': 'Стоп: цель = текущее положение',
+  'hint.noHead': 'Сервы головы не на линии', 'idle.q': 'Момент на голове включён не у всех серв. Включить?',
+  'log.idleStart': 'Оживить голову: старт, центр {c}', 'log.idleStop': 'Оживить голову: стоп, голова в центре',
+  'com.text': 'Проекция ЦМ модели {where} прямоугольника стоп · запас +X/−X/+Y/−Y {a}/{b}/{c}/{d} мм (модель {g} г; не оценка реального равновесия)',
+  'com.in': 'внутри', 'com.out': 'вне',
+},
+};
+let LANG = 'en';
+try { const l = localStorage.getItem('servoConsoleLang'); if (l === 'en' || l === 'ru') LANG = l; } catch (e) {}
+// 参数可以是 {en, ru}：按语言取；字典里没有的键退回英文，再退回键名
+function fmtLang(lang, key, p) {
+  const s = (I18N[lang] && I18N[lang][key]) ?? I18N.en[key] ?? key;
+  return s.replace(/\{(\w+)\}/g, (m, k) => { if (!p || p[k] === undefined) return m; const x = p[k]; return x && typeof x === 'object' ? (x[lang] ?? x.en ?? '') : x; });
+}
+const t = (key, p) => fmtLang(LANG, key, p);
+const TT = (key, p) => ({ en: fmtLang('en', key, p), ru: fmtLang('ru', key, p) });   // 两种语言都要：发给服务端记日志
+const L = m => m && typeof m === 'object' ? (m[LANG] ?? m.en ?? '') : String(m ?? '');   // 服务端的 {en, ru} → 当前语言
+function applyI18n() {
+  document.documentElement.lang = LANG;
+  document.querySelectorAll('[data-i18n]').forEach(el => { el.textContent = t(el.dataset.i18n); });
+  document.querySelectorAll('[data-i18n-html]').forEach(el => { el.innerHTML = t(el.dataset.i18nHtml); });
+  document.querySelectorAll('[data-i18n-title]').forEach(el => { el.title = t(el.dataset.i18nTitle); });
+  $('langEn').classList.toggle('on', LANG === 'en'); $('langRu').classList.toggle('on', LANG === 'ru');
+}
+// 切语言：静态文字 + 所有动态生成的部分重画一遍（不重建滑块行，免得丢掉扭矩勾选）
+function setLang(l) {
+  LANG = l === 'ru' ? 'ru' : 'en';
+  try { localStorage.setItem('servoConsoleLang', LANG); } catch (e) {}
+  applyI18n(); renderConn(); renderVer(); renderIdleBtn(); renderHud();
+  if (lastPortsMsg) showPorts(lastPortsMsg);
+  relabelRows(); fillIdSelects(); fillRegSelect(); fillLogCats(logCats); showLogBadges(); renderLog();
+  renderTiming();
+  if (lastDump) showDump(lastDump, true);
+  if (window.duckRedraw) window.duckRedraw();
+}
+let connKey = 'conn.connecting', verInfo = null, lastPortsMsg = null, logCats = [], lastTiming = null;
+let hudText = () => t('hud.loading');
+function renderConn() { $('conn').textContent = t(connKey); }
+function renderHud() { $('viewHud').textContent = hudText(); }
+function renderIdleBtn() { $('idleBtn').textContent = t(idleRunning ? 'btn.idleStop' : 'btn.idle'); }
+function renderVer() {
+  if (!verInfo) return;
+  const { sv, same } = verInfo;
+  $('ver').textContent = same ? `v${PAGE_VERSION}` : t('ver.mismatch', { p: PAGE_VERSION, s: sv });
+  $('ver').style.color = same ? '' : 'var(--bad)';
+  $('ver').title = same ? t('ver.okTitle') : t('ver.badTitle');
+}
+function renderTiming() {
+  const m = lastTiming; if (!m) return;
+  $('timing').textContent = t('timing.line', { n: m.n, ids: m.ids, min: m.min_ms, avg: m.avg_ms, p99: m.p99_ms, max: m.max_ms, fails: m.fails });
+}
+
+// 跟 server.py 的 VERSION 一起改。连上后比对，不一致说明浏览器拿的是旧页面
+const PAGE_VERSION = "0.15.9";
+const $ = id => document.getElementById(id);
+const v = id => Number($(id).value);
+let ws, names = {}, present = [], ids = [], lastDump = null, sendTimer = {}, lastSent = {};
+const rawPos = {}, goalPos = {};
+let dirs = {};   // 每颗 +1 / -1，来自服务端 directions.json，所有页面共用
+let JOINT_RANGE = {};   // id → [lo, hi] rad from model/model.json (joint range of the export): limits of sliders and goals
+const COUNT_LIMIT = { 34: [1693, 2062] };   // beak: measured raw counts (2062 closed, 1693 open), independent of the ± direction
+function sliderLimits(id) {
+  if (COUNT_LIMIT[id]) return { min: COUNT_LIMIT[id][0], max: COUNT_LIMIT[id][1] };
+  const r = JOINT_RANGE[id]; if (!r) return { min: 0, max: 4095 };
+  const d = dirs[id] || 1, k = 4096 / (2 * Math.PI);
+  const a = Math.round(2048 + d * r[0] * k), b = Math.round(2048 + d * r[1] * k);
+  return { min: Math.min(a, b), max: Math.max(a, b) };
+}
+// the slider scale is symmetric around 2048 so that zero sits in the middle; the limit is enforced by sliderLimits
+function sliderSpan(id) {
+  if (COUNT_LIMIT[id]) return sliderLimits(id);
+  const l = sliderLimits(id), half = Math.max(2048 - l.min, l.max - 2048);
+  return { min: 2048 - half, max: 2048 + half };
+}
+function applyLimits() {
+  for (const id of Object.keys(JOINT_RANGE)) {
+    const r = $('r' + id); if (!r) continue;
+    const l = sliderLimits(+id), m = sliderSpan(+id); r.min = m.min; r.max = m.max;
+    if (+r.value < l.min || +r.value > l.max) { r.value = Math.min(Math.max(+r.value, l.min), l.max); }
+  }
+}
+let isServoDemo = false;
+
+function connect() {
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  ws.onopen = () => { $('dot').classList.add('on'); connKey = 'conn.on'; renderConn(); };
+  ws.onclose = () => { $('dot').classList.remove('on'); connKey = 'conn.lost'; renderConn(); pushLog({ t: new Date().toTimeString().slice(0, 8), cat: 'page', level: 'warn', msg: TT('log.lost') }); setTimeout(connect, 3000); };
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'hello') {
+      const sv = m.version || t('ver.old'), same = sv === PAGE_VERSION;
+      verInfo = { sv, same }; renderVer();
+      if (!same) hint(t('hint.ver', { p: PAGE_VERSION, s: sv }));
+      dirs = {}; for (const [k, v] of Object.entries(m.dirs || {})) dirs[k] = v; names = m.names; ids = m.ids; present = m.present;  REGS = (m.regs || []).filter(r => r[3] === 'EEPROM' || r[3] === 'SRAM'); REG_RU = {}; (m.regs || []).forEach(r => { if (r[4]) REG_RU[r[0]] = r[4]; }); showPorts(m); fillLogCats(m.cats || []); build(); fillRegSelect(); (m.logs || []).forEach(pushLog); }
+    else if (m.type === 'ports') showPorts(m);
+    else if (m.type === 'reconnect') {
+      showPorts(m);
+      present = m.present || []; build(); hint(L(m.msg));
+    }
+    else if (m.type === 'dirs') { dirs = {}; for (const [k, v] of Object.entries(m.dirs || {})) dirs[k] = v; }
+    else if (m.type === 'calib_result') showCalibResult(m);
+    else if (m.type === 'calib_plan') confirmCalib(m);
+    else if (m.type === 'torque') showTorqueResult(m);
+    else if (m.type === 'goals_verify') { if (m.missing.length) hint(t('hint.notGot', { ids: m.missing.join(',') })); else if (m.attempts > 1) addLog(TT('log.goalAttempt', { n: m.attempts }), 'motion', 'warn'); }
+    else if (m.type === 'state') update(m.states, m.stats);
+    else if (m.type === 'scan') { present = m.present; build(); }
+    else if (m.type === 'dump') showDump(m);
+    else if (m.type === 'timing') { lastTiming = m; renderTiming(); }
+    else if (m.type === 'logs') m.items.forEach(pushLog);
+    else if (m.type === 'error') hint(t('hint.err', { msg: L(m.msg) }));
+  };
+}
+function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+// 串口：没连上时顶栏出现下拉 + 「连接」；连上了只显示口号。拔插 USB 后口号会变，点一下就能重连
+function showPorts(m) {
+  if (m.fake === undefined) return;
+  lastPortsMsg = { fake: m.fake, port: m.port, ports: m.ports || (lastPortsMsg && lastPortsMsg.ports) };
+  isServoDemo = m.fake === true;
+  const box = $('portBox'), sel = $('portSel');
+  $('simPanel').hidden = !m.fake;
+  $('busInfo').textContent = m.fake ? t('bus.sim') : t('bus.port', { port: m.port });
+  $('busInfo').style.color = m.fake ? 'var(--warn)' : '';
+  box.style.display = '';
+  if (m.ports) {
+    const keep = sel.value; sel.innerHTML = '';
+    (m.ports.length ? m.ports : [{ device: '', desc: t('ports.none') }]).forEach(p => {
+      const o = document.createElement('option'); o.value = p.device;
+      o.textContent = p.device + (p.desc ? ` · ${p.desc}` : ''); sel.appendChild(o);
+    });
+    const opts = [...sel.options].map(o => o.value);
+    if (opts.includes(keep)) sel.value = keep; else if (m.port && opts.includes(m.port)) sel.value = m.port;
+  }
+}
+function reconnect() {
+  const port = $('portSel').value;
+  if (!port) { send({ op: 'ports' }); hint(t('hint.plugFirst')); return; }
+  hint(t('hint.opening', { port }));
+  send({ op: 'reconnect', port });
+}
+let hintTimer;
+function hint(text) { const h = $('hint'); h.textContent = text; h.classList.add('show'); clearTimeout(hintTimer); hintTimer = setTimeout(() => h.classList.remove('show'), 5000); }
+// ---- 日志 ----
+// 服务端每条日志带 {n, t, cat, level, msg}，msg 是 {en, ru}，按 n 去重；页面自己的日志（回零、灵动…）两种语言一起发给服务端记进文件再推回来，
+// 这样日志文件里是完整的时间线。连接断了才只显示在本地。
+const LOG_ITEMS = []; let logLastN = 0, logWarnN = 0, logErrN = 0;
+const levelTxt = lv => lv === 'warn' || lv === 'error' ? t('level.' + lv) : '';
+const catTxt = c => I18N.en['cat.' + c] ? t('cat.' + c) : c;
+function addLog(msg, cat = 'page', level = 'info') {
+  if (ws && ws.readyState === 1) send({ op: 'page_log', msg, cat, level });
+  else pushLog({ t: new Date().toTimeString().slice(0, 8), cat, level, msg });
+}
+function pushLog(e) {
+  if (e.n) { if (e.n <= logLastN) return; logLastN = e.n; }
+  LOG_ITEMS.push(e); if (LOG_ITEMS.length > 1000) LOG_ITEMS.shift();
+  if (e.level === 'warn') logWarnN++; if (e.level === 'error') logErrN++;
+  showLogBadges();
+  if (logMatch(e)) { const l = $('log'), atEnd = l.scrollHeight - l.scrollTop - l.clientHeight < 30; l.appendChild(logLine(e)); if (atEnd) l.scrollTop = l.scrollHeight; }
+}
+function showLogBadges() {
+  $('logWarn').style.display = logWarnN ? '' : 'none'; $('logWarn').textContent = t('log.warnN', { n: logWarnN });
+  $('logErr').style.display = logErrN ? '' : 'none'; $('logErr').textContent = t('log.errN', { n: logErrN });
+}
+function logMatch(e) {
+  const c = $('logCat').value;
+  return (!c || e.cat === c) && (!$('logBad').checked || e.level === 'warn' || e.level === 'error');
+}
+function logText(e) { return `${e.t} [${catTxt(e.cat)}]${levelTxt(e.level) ? '[' + levelTxt(e.level) + ']' : ''} ${L(e.msg)}`; }
+function logLine(e) {
+  const d = document.createElement('div'); d.className = 'll ' + (e.level || 'info');
+  const tm = document.createElement('span'); tm.className = 'lt'; tm.textContent = e.t + ' ';
+  const c = document.createElement('span'); c.className = 'lc'; c.textContent = `[${catTxt(e.cat)}]` + (levelTxt(e.level) ? `[${levelTxt(e.level)}]` : '') + ' ';
+  d.append(tm, c, document.createTextNode(L(e.msg))); return d;
+}
+function renderLog() { const l = $('log'); l.innerHTML = ''; LOG_ITEMS.filter(logMatch).forEach(e => l.appendChild(logLine(e))); l.scrollTop = l.scrollHeight; }
+function clearLog() { LOG_ITEMS.length = 0; logWarnN = logErrN = 0; showLogBadges(); renderLog(); }
+function copyLog() {
+  const text = LOG_ITEMS.filter(logMatch).map(logText).join('\n');
+  navigator.clipboard.writeText(text).then(() => hint(t('hint.copied', { n: text ? text.split('\n').length : 0 })), () => hint(t('hint.noCopy')));
+}
+function fillLogCats(cats) {
+  logCats = cats;
+  const sel = $('logCat'), keep = sel.value; sel.innerHTML = '';
+  const all = document.createElement('option'); all.value = ''; all.textContent = t('log.all'); sel.appendChild(all);
+  [...cats, 'page'].forEach(c => { const o = document.createElement('option'); o.value = c; o.textContent = catTxt(c); sel.appendChild(o); });
+  sel.value = keep;
+}
+
+// ---- 单颗操作的下拉 ----
+const jn = id => I18N.en['j.' + id] ? t('j.' + id) : '';   // 关节的显示名
+const jnT = id => I18N.en['j.' + id] ? TT('j.' + id) : '';
+const ORDER = [20, 21, 22, 23, 24, 30, 31, 32, 33, 34, 10, 11, 12, 13, 14];
+let REGS = [];   // [[地址, 名字, 字节数, 区, 俄文名]]，hello 里来，只留 EEPROM 和 SRAM（能写的）
+let REG_RU = {};   // 地址 → 俄文名，导出表用
+function regName(a, name) { return LANG === 'ru' && REG_RU[a] ? REG_RU[a] : name; }
+function idLabel(id) { return `${id} · ${jn(id) || t('id.nonstd')}${present.includes(id) ? '' : t('id.offline')}`; }
+function fillSelect(sel, list, label, prefer) {
+  const keep = sel.value; sel.innerHTML = '';
+  list.forEach(id => { const o = document.createElement('option'); o.value = id; o.textContent = label(id); sel.appendChild(o); });
+  const opts = [...sel.options].map(o => o.value);
+  if (opts.includes(keep)) sel.value = keep; else if (prefer !== undefined && opts.includes(String(prefer))) sel.value = String(prefer);
+}
+function fillIdSelects() {
+  const extra = present.filter(id => !ORDER.includes(id)).sort((a, b) => a - b);
+  fillSelect($('opId'), [...ORDER.filter(id => ids.includes(id) || present.includes(id)), ...extra], idLabel);
+  // 改 ID：旧 ID 只列在线的，非标准的排前面（新舵机出厂 ID 1 一般在这）；新 ID 列 15 个标准位，占用的标出来，默认第一个空位
+  fillSelect($('oldId'), [...extra, ...ORDER.filter(id => present.includes(id))], idLabel);
+  fillSelect($('newId'), ORDER, id => `${id} · ${jn(id)}${present.includes(id) ? t('id.taken') : ''}`, ORDER.find(id => !present.includes(id)));
+}
+function setIdClick() {
+  const o = $('oldId').value, n = $('newId').value;
+  if (!o) { hint(t('hint.noServos')); return; }
+  if (o === n) { hint(t('hint.sameId')); return; }
+  const clash = present.includes(Number(n)) ? t('setid.clash', { n }) : '';
+  if (confirm(t('setid.q', { o, n, name: jn(n) }) + clash)) send({ op: 'set_id', old: Number(o), new: Number(n) });
+}
+function fillRegSelect() {
+  const sel = $('wAddr'), keep = sel.value || '41'; sel.innerHTML = '';
+  REGS.forEach(([a, name, size, area]) => { const o = document.createElement('option'); o.value = a; o.textContent = t('reg.opt', { a, name: regName(a, name), size, area: t('area.' + area) }); sel.appendChild(o); });
+  if ([...sel.options].some(o => o.value === keep)) sel.value = keep;
+  regChanged();
+}
+function regChanged() {
+  const r = REGS.find(x => String(x[0]) === $('wAddr').value); if (!r) return;
+  $('wSize').value = String(r[2]); $('wUnlock').checked = r[3] === 'EEPROM';
+}
+
+function build() {
+  ['g20', 'g30', 'g10', 'gx'].forEach(g => $(g).innerHTML = '');
+  const all = [...new Set([...ids, ...present])].sort((a, b) => a - b);
+  let other = false;
+  all.forEach(id => {
+    const g = id >= 20 && id <= 24 ? 'g20' : id >= 30 && id <= 34 ? 'g30' : id >= 10 && id <= 14 ? 'g10' : (other = true, 'gx');
+    const on = present.includes(id);
+    const d = document.createElement('div');
+    d.className = 'servo' + (on ? '' : ' off'); d.id = 's' + id;
+    d.innerHTML = `<div class="id">${id}</div>
+      <div class="track"><div class="mid"></div><div class="mark" id="m${id}" style="left:50%"></div>
+        <input type="range" min="${sliderSpan(id).min}" max="${sliderSpan(id).max}" value="${goalPos[id] ?? 2048}" id="r${id}" ${on ? '' : 'disabled'}></div>
+      <div class="val" id="p${id}">–</div>
+      <input type="checkbox" class="tq" id="t${id}" ${on ? '' : 'disabled'}>
+      <button class="dir" id="d${id}">${(dirs[id] || 1) > 0 ? '+' : '−'}</button>
+      <div class="name"><span>${names[id] || ''}</span><span id="i${id}"></span></div>`;
+    $(g).appendChild(d);
+    const r = $('r' + id);
+    r.oninput = () => { const l = sliderLimits(id); r.value = Math.max(l.min, Math.min(l.max, +r.value)); goalPos[id] = +r.value; $('p' + id).textContent = r.value; if ($('live').checked) throttledGoal(id, +r.value); if (!$('t' + id).checked) hint(t('hint.torqueOff', { id })); };
+    r.onchange = () => sendGoal(id, +r.value);
+    $('t' + id).onchange = e => send({ op: 'torque', id, on: e.target.checked ? 1 : 0 });
+    $('d' + id).onclick = () => { const d = -(dirs[id] || 1); dirs[id] = d; $('d' + id).textContent = d > 0 ? '+' : '−'; send({ op: 'set_dir', id, dir: d }); applyLimits(); };
+  });
+  $('other').style.display = other ? '' : 'none';
+  relabelRows();
+  fillIdSelects();
+}
+// 滑块行的提示文字（切语言时只改这些，不重建行）
+function relabelRows() {
+  document.querySelectorAll('.servo').forEach(el => {
+    const id = el.id.slice(1);
+    $('r' + id).title = t('r.title'); $('t' + id).title = t('t.title'); $('d' + id).title = t('d.title');
+  });
+}
+function throttledGoal(id, pos) {
+  const now = Date.now();
+  if (!lastSent[id] || now - lastSent[id] > 50) { sendGoal(id, pos); }
+  else { clearTimeout(sendTimer[id]); sendTimer[id] = setTimeout(() => sendGoal(id, pos), 60); }
+}
+function sendGoal(id, pos) { lastSent[id] = Date.now(); send({ op: 'goal', id, pos }); }
+
+// 状态位的名字按页面语言给（服务端的 status_text 是英文）
+function statusText(s) { return [0, 1, 2, 3, 5].filter(b => s.status >> b & 1).map(b => t('stbit.' + b)).join(', ') || s.status; }
+function update(states, stats) {
+  for (const [id, s] of Object.entries(states)) {
+    const el = $('s' + id); if (!el) continue;
+    if (!s) { $('i' + id).innerHTML = `<span class="bad">${t('s.noReply')}</span>`; continue; }
+    rawPos[id] = s.pos;
+    const pos = Math.max(0, Math.min(4095, s.pos));
+    const m = sliderSpan(+id);
+    $('m' + id).style.left = `calc(8px + ${Math.max(0, Math.min(1, (pos - m.min) / (m.max - m.min)))} * (100% - 16px))`;
+    if (document.activeElement !== $('r' + id)) $('p' + id).textContent = s.pos;
+    const st = s.status ? `<span class="bad">${t('s.status', { s: statusText(s) })}</span>` : '';
+    const deg = (dirs[id] || 1) * (s.pos - 2048) * 360 / 4096;
+    $('i' + id).innerHTML = `<b style="color:var(--text)">${deg >= 0 ? '+' : ''}${deg.toFixed(1)}°</b> ${s.volt.toFixed(1)}V ${s.temp}°C ${t('s.load')} ${s.load / 10}% ${s.current_ma.toFixed(0)}mA ${s.moving ? t('s.moving') : ''} ${st}`;
+  }
+  if (stats && !isServoDemo) $('busInfo').textContent = t('bus.stats', { t: stats.timeout, c: stats.bad_checksum });
+  const live = Object.values(states).filter(Boolean);
+  $('stOnline').textContent = `${live.length}/${ids.length}`;
+  $('stOnline').style.color = live.length === ids.length ? 'var(--acc)' : 'var(--warn)';
+  const now = performance.now(); frameTimes.push(now); while (frameTimes.length && now - frameTimes[0] > 2000) frameTimes.shift();
+  if (frameTimes.length > 1) $('stHz').textContent = ((frameTimes.length - 1) / ((now - frameTimes[0]) / 1000)).toFixed(1) + ' Hz';
+  if (live.length) $('stVolt').textContent = (live.reduce((a, x) => a + x.volt, 0) / live.length).toFixed(1) + ' V';
+}
+let frameTimes = [];
+function parseIdList(text) {
+  const out = [];
+  for (const part of text.split(',')) {
+    const p = part.trim(); if (!p) continue;
+    if (p.includes('-')) { const [a, b] = p.split('-').map(Number); for (let i = a; i <= b; i++) out.push(i); } else out.push(Number(p));
+  }
+  return out.filter(id => present.includes(id));
+}
+// 目标都是 2048；每颗写成多少由服务端算（calib_plan），跟真校准用同一份，页面不再各算各的
+let calibPending = null;   // 点了校准、等服务端回预览
+function calibAll() {
+  const list = parseIdList($('calibIds').value);
+  if (!list.length) { hint(t('hint.noneOnLine')); return; }
+  calibPending = { for: 'all', ids: list };
+  send({ op: 'calib_plan', ids: list, for: 'all' });
+}
+function calibOne() {
+  const id = v('opId');
+  calibPending = { for: 'one', id, ids: [id] };
+  send({ op: 'calib_plan', ids: [id], for: 'one', id });
+}
+// 服务端回来的预览：逐颗「现在 → 写成、差几度」。差得多的不拦，再确认一次（装的时候转了半圈 vs 方向 ± 设反了）
+function confirmCalib(m) {
+  const p = calibPending; calibPending = null;
+  if (!p || p.for !== m.for) return;
+  const deg = d => (d >= 0 ? '+' : '') + d.toFixed(1) + '°';
+  const nm = id => `#${id} ${jn(id)}`;
+  const big = m.rows.filter(r => r.diff_deg !== null && Math.abs(r.diff_deg) > m.big_deg);
+  const lines = m.rows.map(r => r.target === null ? t('c.notInRef', { nm: nm(r.id) })
+    : r.pos === null ? t('c.unread', { nm: nm(r.id), t: r.target })
+    : `${nm(r.id)}  ${r.pos} → ${r.target}  Δ ${deg(r.diff_deg)}${Math.abs(r.diff_deg) > m.big_deg ? '  ⚠️' : ''}`);
+  const head = p.for === 'one' ? t('c.onlyOne', { id: p.id, name: jn(p.id) }) : t('c.head', { n: m.rows.length });
+  const tail = m.fake ? t('c.tailSim') : t('c.tail');
+  if (!confirm(t('c.q', { head, text: t('cal.zeroText'), lines: lines.join('\n'), tail }))) return;
+  if (big.length && !confirm(t('c.big', { deg: m.big_deg, n: big.length, list: big.map(r => `${nm(r.id)}  Δ ${deg(r.diff_deg)}`).join('\n') }))) return;
+  if (p.for === 'one') send({ op: 'calibrate', id: p.id });
+  else send({ op: 'calib_mid_all', ids: p.ids });
+}
+function showCalibResult(m) {
+  const bad = Object.entries(m.bad || {}), big = Object.keys(m.big || {});
+  // 每颗的过程服务端已经逐行记了，这里只弹提示
+  if (bad.length) hint(t('hint.calFail', { n: bad.length, ids: bad.map(([k]) => k).join(' ') }));
+  else if (m.ok.length) hint(t('hint.calOk', { n: m.ok.length }) + (big.length ? t('hint.calBig', { ids: big.join(' ') }) : ''));
+  setTimeout(syncSliders, 300);
+}
+// 开扭矩的回包：服务端先把目标对准了当前位置，滑块跟过去；没开成的把勾去掉
+function showTorqueResult(m) {
+  for (const [id, p] of Object.entries(m.aligned || {})) {
+    if (!$('r' + id)) continue;
+    const c = Math.max(0, Math.min(4095, p)); $('r' + id).value = c; goalPos[id] = c; $('p' + id).textContent = p;
+  }
+  const bad = Object.entries(m.bad || {});
+  bad.forEach(([id]) => { const tq = $('t' + id); if (tq) tq.checked = false; });
+  if (bad.length) hint(t('hint.torqueBad', { ids: bad.map(([k]) => k).join(' '), why: L(bad[0][1]) }));
+}
+function torqueAll(on) { send({ op: 'torque', on }); present.forEach(id => { const tq = $('t' + id); if (tq) tq.checked = !!on; }); }
+function syncSliders() { present.forEach(id => { const p = rawPos[id]; if (p !== undefined) { const c = Math.max(0, Math.min(4095, p)); $('r' + id).value = c; goalPos[id] = c; } }); }
+function centerAll() { const sec = Number($('rampSec').value) || 0; if (!confirm(t('center.q', { sec }))) return; const goals = {}; present.forEach(id => { goals[id] = 2048; }); addLog(TT('log.zero', { sec }), 'motion'); rampTo(goals, sec); }
+
+function showDump(m, noScroll) {
+  lastDump = m; $('dumpSec').hidden = false; $('dumpId').textContent = 'ID ' + m.id;
+  const tb = $('dumpTbl');
+  tb.innerHTML = `<tr><th>${t('d.addr')}</th><th>${t('d.name')}</th><th>${t('d.area')}</th><th>${t('d.bytes')}</th><th>${t('d.value')}</th><th>hex</th></tr>` +
+    m.rows.map(r => `<tr><td class="n">${r.addr}</td><td>${regName(r.addr, r.name)}</td><td class="area-${r.area}">${t('area.' + r.area)}</td><td class="n">${r.size}</td><td class="n">${r.value}</td><td class="n muted">0x${r.value.toString(16).toUpperCase().padStart(r.size * 2, '0')}</td></tr>`).join('');
+  if (!noScroll) $('dumpSec').scrollIntoView({ behavior: 'smooth' });
+}
+function downloadDump() {
+  if (!lastDump) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(lastDump, null, 1)], { type: 'application/json' }));
+  a.download = `HD-1910-id${lastDump.id}-regs-${new Date().toISOString().slice(0, 10)}.json`; a.click();
+}
+function copyDumpMd() {
+  if (!lastDump) return;
+  const md = [`| ${t('d.addr')} | ${t('d.name')} | ${t('d.area')} | ${t('d.value')} |`, '|---|---|---|---|', ...lastDump.rows.map(r => `| ${r.addr} | ${regName(r.addr, r.name)} | ${t('area.' + r.area)} | ${r.value} |`)].join('\n');
+  navigator.clipboard.writeText(md).then(() => addLog(TT('log.mdCopied')));
+}
+// robotd.toml 的 [bus.feetech] directions：关节顺序是左腿 20–24、颈头嘴 30–34、右腿 10–14
+function copyRobotdDirs() {
+  const order = [20, 21, 22, 23, 24, 30, 31, 32, 33, 34, 10, 11, 12, 13, 14];
+  const line = 'directions = [' + order.map(id => (dirs[id] || 1) < 0 ? -1 : 1).join(', ') + ']';
+  navigator.clipboard.writeText(line).then(() => addLog(TT('log.copied', { line })), () => addLog(line));
+}
+let rampTimer = null;
+function stopRamp() {
+  if (rampTimer) { clearInterval(rampTimer); clearTimeout(rampTimer); rampTimer = null; }
+  // 平滑模式下舵机已经拿到终点在自己走，把"现在的位置"当新目标发过去，让它停在原地
+  const g = {}; present.forEach(id => { if (rawPos[id] !== undefined) g[id] = Math.max(0, Math.min(4095, rawPos[id])); });
+  if (Object.keys(g).length) send({ op: 'goals_verify', goals: g });
+  addLog(TT('log.stop'), 'motion');
+}
+// 从当前实际位置线性插到 goals，20 Hz 发 sync_write；返回 Promise
+function rampTo(goals, seconds) {
+  return new Promise(resolve => {
+    if (rampTimer) { clearInterval(rampTimer); rampTimer = null; }
+    const ids = Object.keys(goals).filter(id => present.includes(+id) && !(idleRunning && idleCenter && idleCenter[id] !== undefined));   // 灵动开着时头归灵动管
+    if (!ids.length) { resolve(); return; }
+    if (($('moveMode').value === 'profile') && seconds > 0) {
+      // 平滑：一次把终点+速度+加速度发给舵机，舵机自己走；后端等它走完再回 goals_verify
+      const g = {}; ids.forEach(id => { g[id] = goals[id]; const c = Math.max(0, Math.min(4095, goals[id])); $('r' + id).value = c; goalPos[id] = c; $('p' + id).textContent = c; });
+      send({ op: 'goals_profile', goals: g, seconds, acc: Number($('accReg').value) || 30 });
+      rampTimer = setTimeout(() => { rampTimer = null; send({ op: 'goals_verify', goals: g }); send({ op: 'release', ids: ids.map(Number) }); resolve(); }, seconds * 1000 + 400);
+      return;
+    }
+    const start = {}; ids.forEach(id => { start[id] = rawPos[id] !== undefined ? rawPos[id] : (goalPos[id] ?? 2048); });
+    const t0 = performance.now();   // 按墙钟算进度：浏览器切到后台把定时器降到 1 Hz 也能按时到终点
+    const tick = () => {
+      const tt = seconds <= 0 ? 1 : Math.min(1, (performance.now() - t0) / (seconds * 1000)); const g = {};
+      ids.forEach(id => { g[id] = Math.round(start[id] + (goals[id] - start[id]) * tt); const c = Math.max(0, Math.min(4095, g[id])); $('r' + id).value = c; goalPos[id] = c; $('p' + id).textContent = c; });
+      if (tt >= 1) { send({ op: 'goals_verify', goals: g }); send({ op: 'stream_end', goals: g, ids: ids.map(Number) }); clearInterval(rampTimer); rampTimer = null; resolve(); }
+      else send({ op: 'goals_stream', goals: g, dt: 0.05 });
+    };
+    if (seconds <= 0) tick(); else rampTimer = setInterval(tick, 50);
+  });
+}
+// ── 灵动：头部小动作 ──────────────────────────────────────────────
+// 每个动作是一条平滑指令（舵机自己走梯形曲线），动作之间不空等、下一条紧接着发，靠舵机的加速度自然衔接。
+// 幅度故意大一点：这批 320:1 减速箱的舵机在几十步/秒的低速下会粘滑，小幅慢动反而顿。
+let idleRunning = false, idleCenter = null;
+const D = 4096 / 360;   // 1° 的步数
+const rnd = (a, b) => a + Math.random() * (b - a);
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+const wait = ms => new Promise(r => setTimeout(r, ms));
+function moveHead(deltaDeg, sec, acc) {
+  const goals = {};
+  for (const [id, deg] of Object.entries(deltaDeg)) {
+    if (!present.includes(+id) || !idleCenter || idleCenter[id] === undefined) continue;
+    const raw = Math.round(idleCenter[id] + deg * D * (dirs[id] || 1));
+    goals[id] = Math.max(0, Math.min(4095, raw)); $('r' + id).value = goals[id]; goalPos[id] = goals[id]; $('p' + id).textContent = goals[id];
+  }
+  if (Object.keys(goals).length) send({ op: 'goals_profile', goals, seconds: sec, acc: acc || 35 });
+  return wait(sec * 1000 + 60);   // 只比走的时间多等 60 ms，下一条紧接着发
+}
+// 每个动作：[相对中心的度数, 秒]。32 yaw、33 roll、31 头 pitch、30 颈 pitch、34 嘴（正 = 张）。{} = 停住不动
+const GESTURES = [
+  { w: 3, steps: () => { const s = pick([-1, 1]); return [[{ 33: 14 * s, 32: 8 * s }, 0.5], [{}, rnd(0.6, 1.4)], [{ 33: 0, 32: 0 }, 0.6]]; } },            // 歪头
+  { w: 3, steps: () => { const s = pick([-1, 1]); return [[{ 32: 30 * s, 33: -5 * s, 31: 4 }, 0.6], [{}, rnd(0.8, 1.8)], [{ 32: 0, 33: 0, 31: 0 }, 0.7]]; } }, // 看一边
+  { w: 2, steps: () => [[{ 32: -20 }, 0.3], [{ 32: 20 }, 0.38], [{ 32: -12 }, 0.32], [{ 32: 0 }, 0.35]] },                                            // 摇头
+  { w: 2, steps: () => [[{ 31: 12 }, 0.3], [{ 31: -7 }, 0.34], [{ 31: 6 }, 0.3], [{ 31: 0 }, 0.35]] },                                               // 点头
+  { w: 2, steps: () => [[{ 34: 16 }, 0.22], [{ 34: 0 }, 0.26], [{ 34: 13 }, 0.22], [{ 34: 0 }, 0.28]] },                                             // 嘎嘎两下
+  { w: 2, steps: () => { const s = pick([-1, 1]); return [[{ 33: 12 * s, 31: -8, 34: 9 }, 0.55], [{}, rnd(0.5, 1.0)], [{ 34: 0 }, 0.25], [{ 33: 0, 31: 0 }, 0.6]]; } }, // 好奇
+  { w: 2, steps: () => { const s = pick([-1, 1]); return [[{ 32: 18 * s, 31: 6 }, 0.45], [{ 32: -18 * s, 31: 6 }, 0.7], [{ 32: 0, 31: 0 }, 0.5]]; } },   // 扫视
+  { w: 1, steps: () => [[{ 33: 7, 32: 6 }, 0.18], [{ 33: -7, 32: -6 }, 0.2], [{ 33: 0, 32: 0 }, 0.25]] },                                            // 抖一下
+];
+async function toggleIdle() {
+  if (idleRunning) { idleRunning = false; renderIdleBtn(); return; }
+  const headIds = [30, 31, 32, 33, 34].filter(id => present.includes(id));
+  if (headIds.length < 3) { hint(t('hint.noHead')); return; }
+  if (!headIds.every(id => $('t' + id).checked) && !confirm(t('idle.q'))) return;
+  send({ op: 'torque', on: 1, ids: headIds }); headIds.forEach(id => { $('t' + id).checked = true; });
+  idleCenter = {}; headIds.forEach(id => { idleCenter[id] = rawPos[id] !== undefined ? rawPos[id] : 2048; });
+  idleRunning = true; renderIdleBtn(); addLog(TT('log.idleStart', { c: JSON.stringify(idleCenter) }), 'motion');
+  const bag = GESTURES.flatMap(g => Array(g.w).fill(g));
+  let last = null;
+  while (idleRunning) {
+    let g = pick(bag); if (g === last) g = pick(bag); last = g;
+    for (const [delta, sec] of g.steps()) {
+      if (!idleRunning) break;
+      if (Object.keys(delta).length) await moveHead(delta, sec); else await wait(sec * 1000);
+    }
+    if (idleRunning) await wait(rnd(300, 1500));
+  }
+  await moveHead({ 30: 0, 31: 0, 32: 0, 33: 0, 34: 0 }, 0.7);
+  send({ op: 'release', ids: Object.keys(idleCenter).map(Number) });
+  addLog(TT('log.idleStop'), 'motion'); idleCenter = null;
+}
+let showWhat = 'present';
+function setShowWhat() { showWhat = $('showWhat').value; }
+function resetCam() { if (window.duckResetCam) window.duckResetCam(); }
+applyI18n(); renderConn(); renderIdleBtn(); renderHud(); fillLogCats([]);
+connect();
+</script>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+               "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const canvas = document.getElementById('view');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0f1412);
+const camera = new THREE.PerspectiveCamera(40, 1, 0.01, 10);
+camera.up.set(0, 0, 1);
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+function homeCam() { camera.position.set(0.62, -0.52, 0.34); controls.target.set(0, 0, 0.1); controls.update(); }
+homeCam();
+window.duckResetCam = homeCam;
+scene.add(new THREE.HemisphereLight(0xdfe8e2, 0x1a221e, 1.1));
+const key = new THREE.DirectionalLight(0xffffff, 1.4); key.position.set(0.5, -0.6, 0.9); scene.add(key);
+const fill = new THREE.DirectionalLight(0x8fb8ff, 0.5); fill.position.set(-0.6, 0.4, 0.3); scene.add(fill);
+const grid = new THREE.GridHelper(0.6, 12, 0x2c3a33, 0x1e2925); grid.rotation.x = Math.PI / 2; scene.add(grid);
+// A parent at the trunk origin holds the whole kinematic tree. Joint pivots stay independent.
+const trunkAttitude = new THREE.Group(), robotContent = new THREE.Group();
+trunkAttitude.name = 'trunk'; trunkAttitude.add(robotContent); scene.add(trunkAttitude);
+
+const joints = {};   // servo id -> {pivot, axis, dir}
+const massInfo = [], soleInfo = [];   // 重心：每个 body 的质量/质心；脚底：sole 网格包围盒角点（踝体系）
+let comMark = null, comLine = null, comRing = null, soleLoops = [], supportBox = null, comText = document.createElement('div');
+comText.style.cssText = 'font-size:12px;color:#8fa098;background:rgba(22,29,26,.85);padding:6px 10px;border-radius:6px;pointer-events:none';
+document.getElementById('viewBottom').appendChild(comText);
+new ResizeObserver(e => document.documentElement.style.setProperty('--headH', e[0].target.offsetHeight + 'px')).observe(document.querySelector('header'));
+function buildComMarkers() {
+  if (!massInfo.length) return;
+  comMark = new THREE.Mesh(new THREE.SphereGeometry(0.005, 16, 12), new THREE.MeshBasicMaterial({ color: 0x3df0a3 })); scene.add(comMark);
+  comLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]), new THREE.LineDashedMaterial({ color: 0x3df0a3, dashSize: 0.006, gapSize: 0.004 })); scene.add(comLine);
+  comRing = new THREE.Mesh(new THREE.RingGeometry(0.004, 0.007, 24), new THREE.MeshBasicMaterial({ color: 0x3df0a3, side: THREE.DoubleSide })); scene.add(comRing);
+  soleInfo.forEach(() => { const l = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints([0, 1, 2, 3].map(() => new THREE.Vector3())), new THREE.LineBasicMaterial({ color: 0xf0b43d })); scene.add(l); soleLoops.push(l); });
+  supportBox = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints([0, 1, 2, 3].map(() => new THREE.Vector3())), new THREE.LineBasicMaterial({ color: 0x8fa098, transparent: true, opacity: 0.6 })); scene.add(supportBox);
+}
+const _v = new THREE.Vector3();
+function updateCom() {
+  if (!comMark) return;
+  let total = 0; const c = new THREE.Vector3();
+  massInfo.forEach(m => { _v.copy(m.com); m.inner.localToWorld(_v); c.addScaledVector(_v, m.mass); total += m.mass; });
+  c.divideScalar(total);
+  // All masses and sole corners are in world coordinates.
+  // This is a model AABB projection, not measured foot contact or a physical stability test.
+  let gz = Infinity, xmin = Infinity, xmax = -Infinity, ymin = Infinity, ymax = -Infinity;
+  soleInfo.forEach((s, i) => {
+    const pts = s.corners.map(p => { const w = p.clone(); s.inner.localToWorld(w); return w; });
+    pts.forEach(p => { gz = Math.min(gz, p.z); });
+    const fx = pts.map(p => p.x), fy = pts.map(p => p.y);
+    const a = Math.min(...fx), b = Math.max(...fx), c2 = Math.min(...fy), d = Math.max(...fy);
+    xmin = Math.min(xmin, a); xmax = Math.max(xmax, b); ymin = Math.min(ymin, c2); ymax = Math.max(ymax, d);
+    soleLoops[i].userData = { a, b, c2, d };
+  });
+  soleLoops.forEach(l => { const u = l.userData; l.geometry.setFromPoints([new THREE.Vector3(u.a, u.c2, gz + 0.0005), new THREE.Vector3(u.b, u.c2, gz + 0.0005), new THREE.Vector3(u.b, u.d, gz + 0.0005), new THREE.Vector3(u.a, u.d, gz + 0.0005)]); });
+  supportBox.geometry.setFromPoints([new THREE.Vector3(xmin, ymin, gz + 0.0003), new THREE.Vector3(xmax, ymin, gz + 0.0003), new THREE.Vector3(xmax, ymax, gz + 0.0003), new THREE.Vector3(xmin, ymax, gz + 0.0003)]);
+  const inside = c.x >= xmin && c.x <= xmax && c.y >= ymin && c.y <= ymax;
+  const col = inside ? 0x3df0a3 : 0xf05a5a;
+  comMark.material.color.setHex(col); comRing.material.color.setHex(col); comLine.material.color.setHex(col);
+  comMark.position.copy(c); comRing.position.set(c.x, c.y, gz + 0.001);
+  comLine.geometry.setFromPoints([c, new THREE.Vector3(c.x, c.y, gz)]); comLine.computeLineDistances();
+  const toe = (xmax - c.x) * 1000, heel = (c.x - xmin) * 1000, left = (ymax - c.y) * 1000, right = (c.y - ymin) * 1000;
+  comText.textContent = t('com.text', { where: t(inside ? 'com.in' : 'com.out'), a: toe.toFixed(0), b: heel.toFixed(0), c: left.toFixed(0), d: right.toFixed(0), g: (total * 1000).toFixed(0) });
+  comText.style.color = inside ? '#8fa098' : '#f05a5a';
+}
+
+async function loadModel() {
+  const mj = await (await fetch('model/model.json', {cache: 'no-cache'})).json();
+  JOINT_RANGE = {}; for (const b of mj.bodies) if (b.joint && b.joint.id != null) JOINT_RANGE[b.joint.id] = b.joint.range; applyLimits();
+  const bin = await (await fetch('model/meshes.bin', {cache: 'no-cache'})).arrayBuffer();
+  const geoms = {};
+  for (const [name, m] of Object.entries(mj.meshes)) {
+    const q = new Int16Array(bin, m.voff, m.nverts * 3);
+    const pos = new Float32Array(m.nverts * 3);
+    for (let i = 0; i < m.nverts; i++) for (let k = 0; k < 3; k++) {
+      const span = m.bbox_max[k] - m.bbox_min[k] || 1;
+      pos[i * 3 + k] = m.bbox_min[k] + (q[i * 3 + k] + 32768) / 65535 * span;
+    }
+    const idx = m.index_bytes === 2 ? new Uint16Array(bin, m.ioff, m.ntris * 3) : new Uint32Array(bin, m.ioff, m.ntris * 3);
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    g.setIndex(new THREE.BufferAttribute(idx, 1));
+    g.computeVertexNormals();
+    geoms[name] = g;
+  }
+  const objs = [];
+  const rootBody = mj.bodies.find(b => b.parent < 0);
+  if (rootBody) {
+    trunkAttitude.position.set(...rootBody.pos);
+    robotContent.position.copy(trunkAttitude.position).negate();
+  }
+  const mjq = q => new THREE.Quaternion(q[1], q[2], q[3], q[0]);  // MuJoCo w x y z
+  mj.bodies.forEach((b, i) => {
+    const node = new THREE.Group(); node.name = b.name;
+    node.position.set(...b.pos); node.quaternion.copy(mjq(b.quat));
+    let inner = node;
+    if (b.joint) {
+      const pivot = new THREE.Group(); pivot.name = 'joint:' + b.joint.name; node.add(pivot); inner = pivot;
+      if (b.joint.id != null) joints[b.joint.id] = { pivot, axis: new THREE.Vector3(...b.joint.axis).normalize(), name: b.joint.name };
+    }
+    for (const g of b.geoms) {
+      const mat = new THREE.MeshStandardMaterial({ color: new THREE.Color(g.rgba[0], g.rgba[1], g.rgba[2]), roughness: 0.6, metalness: 0.05, flatShading: true,
+        transparent: g.rgba[3] < 1, opacity: g.rgba[3] });
+      const mesh = new THREE.Mesh(geoms[g.mesh], mat);
+      mesh.position.set(...g.pos); mesh.quaternion.copy(mjq(g.quat)); inner.add(mesh);
+    }
+    objs.push({ node, inner });
+    if (b.parent < 0) robotContent.add(node); else objs[b.parent].inner.add(node);
+    if (b.mass) massInfo.push({ inner, mass: b.mass, com: new THREE.Vector3(...b.com) });
+    if (b.sole) {
+      const mb = mj.meshes[b.sole.mesh], lo = mb.bbox_min, hi = mb.bbox_max, R = mjq(b.sole.quat), P = new THREE.Vector3(...b.sole.pos);
+      const corners = [];
+      for (const x of [lo[0], hi[0]]) for (const y of [lo[1], hi[1]]) for (const z of [lo[2], hi[2]]) corners.push(new THREE.Vector3(x, y, z).applyQuaternion(R).add(P));
+      soleInfo.push({ inner, corners });
+    }
+  });
+  buildComMarkers();
+  needRender = true;
+  hudText = () => t('hud.model', { src: mj.source, n: Object.keys(joints).length, notes: (mj.notes || []).length ? '; ' + mj.notes.map(L).join('; ') : '' });
+  renderHud();
+}
+loadModel().catch(e => { hudText = () => t('hud.fail', { msg: e.message }); renderHud(); });
+
+const RAD = 2 * Math.PI / 4096;
+// 有变化才画：模型 40 多万个三角面，一直按 60 帧画会把显卡和主线程占满（点按钮半天才弹确认框）。
+// 关节角、躯干姿态、视角、窗口大小有一样变了才重画；静止时每帧只比一下签名
+let lastPoseSig = '', lastTrunkSig = '', needRender = true;
+window.duckRedraw = () => { needRender = true; };   // 切语言后重写重心说明
+controls.addEventListener('change', () => { needRender = true; });
+function pose() {
+  let sig = showWhat;
+  for (const [id, j] of Object.entries(joints)) {
+    const src = showWhat === 'goal' ? goalPos : rawPos;
+    const raw = src[id]; if (raw === undefined) continue;
+    const ang = (raw - 2048) * RAD * (dirs[id] || 1);
+    j.pivot.quaternion.setFromAxisAngle(j.axis, ang);
+    sig += ',' + raw + (dirs[id] || 1);
+  }
+  if (sig === lastPoseSig) return false;
+  lastPoseSig = sig; return true;
+}
+function resize() {
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== w * renderer.getPixelRatio() || canvas.height !== h * renderer.getPixelRatio()) { renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix(); needRender = true; }
+}
+function frame() {
+  resize();
+  let dirty = pose();
+  const q = trunkAttitude.quaternion, qsig = `${q.x.toFixed(5)},${q.y.toFixed(5)},${q.z.toFixed(5)},${q.w.toFixed(5)}`;
+  if (qsig !== lastTrunkSig) { lastTrunkSig = qsig; dirty = true; }
+  if (controls.update()) dirty = true;          // 阻尼还在滑的时候返回 true
+  if (dirty || needRender) { scene.updateMatrixWorld(true); updateCom(); renderer.render(scene, camera); needRender = false; }
+  requestAnimationFrame(frame);
+}
+frame();
+</script>
+</body>
+</html>

@@ -1,0 +1,53 @@
+NOTICE — sources and authors
+
+kryakva is a replica of the Pollen Robotics Microduck, redesigned for Feetech HD-1910 servos.
+Code: Apache License 2.0 (LICENSE). 3D models (cad/, print/): CC BY-NC-SA 4.0.
+
+1. Pollen Robotics — Microduck
+   https://github.com/pollen-robotics/microduck (robot), https://github.com/pollen-robotics/microduck_rl (training)
+   Code: Apache License 2.0. 3D models: CC BY-NC-SA.
+   Used: joint names, standing pose and sensor sites of the robot; the training recipes of microduck_rl, which
+   training/patches modifies (upstream commit cb70b79). The printed parts here are our own design; no Pollen model
+   files are included.
+   software/robotd: robotd, robotctl and padd are built from pollen-robotics/microduck (commit 95a7e91) with our
+   patches in software/robotd/src; models/pickup_detector.onnx is Pollen's pickup detector.
+
+2. fanhao375 — microduck-replica
+   https://github.com/fanhao375/microduck-replica — Apache License 2.0.
+   Used: the servo console (software/servo_console) is derived from their tools/servo-web 0.15.4.
+
+3. JoyandAI — OpenMicroDuck
+   https://github.com/JoyandAI/OpenMicroDuck — Apache License 2.0.
+   Used: the HD-1910 firmware control law for BAM (training/patches/files/.../actuator/feetech_bam.py, class
+   HD1910Actuator from their vendor/bam/bam/feetech/actuator.py); the load-friction terms of
+   training/actuators/hd1910_bam_bench1019_D0.json come from their m5 actuator fit.
+
+4. Rhoban — BAM (Better Actuator Models), Marc Duclusaud & Grégoire Passault
+   https://github.com/Rhoban/bam — Apache License 2.0.
+   feetech_bam.py is built on its base classes (VoltageControlledActuator, Parameter, Pendulum).
+
+5. STMicroelectronics / STM32duino — VL53L8CX ULD driver
+   https://github.com/stm32duino/VL53L8CX — BSD 3-Clause License (software/zero/uld/LICENSE).
+   software/zero/uld comes from it; tof_check.c uses it.
+
+6. Linux kernel — hid-playstation driver (Sony Interactive Entertainment), from armbian/linux-rockchip
+   https://github.com/armbian/linux-rockchip — GPL-2.0-or-later.
+   software/zero/hid-playstation-dkms packages it as a DKMS module for the 6.1.115 vendor kernel.
+
+7. Rockchip — camera_engine_rkaiq v6.0x9.0, from TaishanPi-Rockchip/linux.external.camera_engine_rkaiq (commit 216ab11)
+   https://github.com/TaishanPi-Rockchip/linux.external.camera_engine_rkaiq — Apache License 2.0.
+   software/zero/camera/rkaiq_3A_server and librkaiq.so are built from it with rkaiq-sched-other.patch (our change).
+   The camera IQ file is not included: setup_camera.sh downloads it from the Radxa package rockchip-iqfiles-rk356x.
+
+8. Microsoft — ONNX Runtime 1.28.2
+   https://github.com/microsoft/onnxruntime — MIT License.
+   software/robotd/hear/libonnxruntime.so is its aarch64 build, redistributed unchanged (licence: hear/LICENSE-onnxruntime).
+
+Manufacturer documents in docs/datasheets, redistributed as is (rights belong to their owners):
+- Radxa — Zero 3W STEP/DXF, Camera 8M 219 product brief (dl.radxa.com);
+- STMicroelectronics — VL53L8CX datasheet;
+- Fashion Star — UC-01 schematic v1.6 (fashionstar.com.hk/wiki);
+- Feetech — HD-1910 specification and drawing (obtained from JoyandAI/OpenMicroDuck).
+
+Documentation, tooling and training patches were written with the help of an AI assistant (Anthropic Claude),
+directed and reviewed by the author.

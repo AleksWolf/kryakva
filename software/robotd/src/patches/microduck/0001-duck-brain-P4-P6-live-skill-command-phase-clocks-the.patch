@@ -1,0 +1,894 @@
+From 3d57cf547751c1890c4c18732964a04b61080675 Mon Sep 17 00:00:00 2001
+From: duck-brain <duck-brain@localhost>
+Date: Sat, 3 Oct 2026 19:25:14 +0000
+Subject: [PATCH 1/4] duck-brain P4-P6: live skill command, phase clocks, the
+ policy's HOME and action scale
+
+P4 - a skill with live = true is fed the client's twist (after the
+deadman, before cmd_alpha) instead of its constant command: the roller
+stride and Fish are steered while they run.
+
+P5 - a network may read a clock after its 61 inputs (63): which one is
+in its observation_names metadata - swizzle_phase (ride v2, crouch v2:
+phi += 2 pi f dt, f = min(|cmd0| / 0.615, 1.5) Hz, 0 at |cmd0| <= 0.05,
+x (1 - u/0.3) for the crouch depth u = cmd1) or fish_phase (phi =
+2 pi t / phase_period_s from the start of the skill). The 61 blocks are
+checked against observation_names at load; a fish network needs its
+period, nothing else may have one.
+
+P6 - observation and targets are relative to the network's own HOME
+(default_joint_pos) and scaled by its action_scale when its metadata
+says them; bring-up, holds and the limp-fall pose go to the walking
+policy's HOME. A skill's params.action_scale still wins.
+---
+ duck-control/src/policy.rs | 264 ++++++++++++++++++++++++++++++++++++-
+ robotctl/src/main.rs       |   1 +
+ robotd-params/src/lib.rs   |  19 +++
+ robotd/src/control.rs      | 171 +++++++++++++++++++++++-
+ robotd/src/main.rs         |  62 +++++++--
+ 5 files changed, 490 insertions(+), 27 deletions(-)
+
+diff --git a/duck-control/src/policy.rs b/duck-control/src/policy.rs
+index 17a5a97..5a3472f 100644
+--- a/duck-control/src/policy.rs
++++ b/duck-control/src/policy.rs
+@@ -22,7 +22,57 @@ use ort::tensor::TensorElementType;
+ use ort::value::{Tensor, Value, ValueType};
+ use sha2::{Digest, Sha256};
+ 
+-use crate::obs::{ACTION_LEN, OBS_LEN, Observation};
++use crate::model::{DEFAULT_POSITION, MOUTH_INDEX, NUM_JOINTS};
++use crate::obs::{ACTION_LEN, OBS_JOINTS, OBS_LEN, Observation};
++
++/// The observation's blocks, in order, as training exports name them in the ONNX metadata
++/// (`observation_names`). A network that names its inputs is checked against this at load, so a
++/// policy trained on another layout is refused rather than fed the wrong numbers (duck-brain P5).
++pub const OBSERVATION_NAMES: [&str; 8] = [
++    "base_ang_vel",
++    "projected_gravity",
++    "joint_pos",
++    "joint_vel",
++    "actions",
++    "command",
++    "head_command",
++    "body_command",
++];
++
++/// A clock some networks read after the 61 inputs: `sin φ, cos φ`.
++pub const PHASE_LEN: usize = 2;
++
++/// The step the clocks advance by — the 50 Hz the policies were trained at.
++pub const CONTROL_DT: f64 = 0.02;
++
++/// Where the twist sits in the observation: after gyro, gravity and three joint blocks.
++const COMMAND_AT: usize = 3 + 3 + 3 * OBS_JOINTS;
++
++/// Which clock, if any, a network observes after the 61 inputs, from its last `observation_names`
++/// entry (duck-brain P5).
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub enum Clock {
++    /// 61 inputs.
++    None,
++    /// `swizzle_phase` — the roller ride and crouch: φ += 2π·f·dt every step, f from the commanded
++    /// speed ([`swizzle_hz`]); φ stands while the duck is not asked to move.
++    Swizzle,
++    /// `fish_phase` — the Fish slalom: φ = 2π·t/period, t from the start of the episode. The
++    /// period is the skill's (`phase_period_s`), not in the network.
++    Fish,
++}
++
++/// The swizzle clock's frequency, Hz, as training drives it (duck-brain docs/skills.md, from
++/// `SwizzleClockCommand` in Alex's microduck_rl): f = min(|v| / (4.1 · 0.15), 1.5), zero at
++/// |v| ≤ 0.05 m/s, and × (1 − u/0.3) for the crouch depth u = cmd[1] in [0, 0.3] — which is zero
++/// for the plain ride, so one formula serves both.
++pub fn swizzle_hz(speed: f64, depth: f64) -> f64 {
++    if speed.abs() <= 0.05 {
++        return 0.0;
++    }
++    let u = depth.clamp(0.0, 0.3);
++    (speed.abs() / (4.1 * 0.15)).min(1.5) * (1.0 - u / 0.3)
++}
+ 
+ /// Below this velocity magnitude the standing policy takes over. The prototype's value.
+ pub const DEFAULT_STANDING_THRESHOLD: f64 = 0.05;
+@@ -232,6 +282,10 @@ pub struct PolicyPaths {
+     /// selected only by an explicit request, so an empty list is a robot with no tricks rather
+     /// than a robot missing something.
+     pub skills: Vec<PathBuf>,
++    /// The period of each skill's Fish clock (`phase_period_s`), beside `skills`; missing or
++    /// `None` for a skill without one. A `fish_phase` network needs one, and nothing else may
++    /// have one — checked at load (duck-brain P5).
++    pub skill_periods: Vec<Option<f64>>,
+ }
+ 
+ /// The loaded networks.
+@@ -269,8 +323,9 @@ impl Policy {
+             // It also proves ONNX Runtime is actually present and usable, which with
+             // `load-dynamic` is not known until something is run.
+             let zero = Observation::zeroed();
+-            fn open_warm(path: &Path, zero: &Observation) -> Result<Network, PolicyError> {
++            fn open_warm(path: &Path, zero: &Observation, period: Option<f64>) -> Result<Network, PolicyError> {
+                 let mut network = open(path)?;
++                network.set_period(period)?;
+                 network.run(zero)?;
+                 network.reset();
+                 Ok(network)
+@@ -279,18 +334,19 @@ impl Policy {
+                 path: &Option<PathBuf>,
+                 zero: &Observation,
+             ) -> Result<Option<Network>, PolicyError> {
+-                path.as_deref().map(|p| open_warm(p, zero)).transpose()
++                path.as_deref().map(|p| open_warm(p, zero, None)).transpose()
+             }
+ 
+             Ok(Self {
+-                walk: open_warm(&paths.walk, &zero)?,
++                walk: open_warm(&paths.walk, &zero, None)?,
+                 stand: open_opt(&paths.stand, &zero)?,
+                 sitstand: open_opt(&paths.sitstand, &zero)?,
+                 ground_pick: open_opt(&paths.ground_pick, &zero)?,
+                 skills: paths
+                     .skills
+                     .iter()
+-                    .map(|path| open_warm(path, &zero))
++                    .enumerate()
++                    .map(|(i, path)| open_warm(path, &zero, paths.skill_periods.get(i).copied().flatten()))
+                     .collect::<Result<Vec<_>, _>>()?,
+                 standing_threshold,
+                 active: None,
+@@ -327,6 +383,38 @@ impl Policy {
+         self.ground_pick.is_some()
+     }
+ 
++    fn network(&self, net: Net) -> &Network {
++        match net {
++            Net::Stand => self.stand.as_ref().unwrap_or(&self.walk),
++            Net::SitStand => self.sitstand.as_ref().unwrap_or(&self.walk),
++            Net::GroundPick => self.ground_pick.as_ref().unwrap_or(&self.walk),
++            Net::Skill(i) => self.skills.get(i).unwrap_or(&self.walk),
++            Net::Walk => &self.walk,
++        }
++    }
++
++    /// The pose this network was trained to act around — its `default_joint_pos` — or `None`
++    /// for one that does not say, which then runs around the compiled [`DEFAULT_POSITION`]
++    /// (duck-brain P6). Observation and targets are both relative to it.
++    pub fn home(&self, net: Net) -> Option<[f64; NUM_JOINTS]> {
++        self.network(net).home
++    }
++
++    /// The action scale this network was trained at (`action_scale` in its metadata).
++    pub fn action_scale(&self, net: Net) -> Option<f64> {
++        self.network(net).action_scale
++    }
++
++    /// The clock this network observes.
++    pub fn clock(&self, net: Net) -> Clock {
++        self.network(net).clock
++    }
++
++    /// What this network was fed last, the full input row — for checking the layout from outside.
++    pub fn last_input(&self, net: Net) -> &[f32] {
++        &self.network(net).last_input
++    }
++
+     /// How many one-shot skills are loaded. A caller's index is valid below this.
+     pub fn skill_count(&self) -> usize {
+         self.skills.len()
+@@ -396,6 +484,7 @@ impl Policy {
+         if let (Some(target), Some(source)) = (target, source)
+             && target.digest == source.digest
+         {
++            target.phase = source.phase;
+             if let (Some(dst), Some(src)) = (&mut target.state, &source.state) {
+                 dst.h
+                     .try_extract_tensor_mut::<f32>()
+@@ -462,6 +551,15 @@ struct Network {
+     action_name: String,
+     path: PathBuf,
+     digest: [u8; 32],
++    /// The clock after the 61 inputs, and where it is: φ in radians for swizzle, t in seconds
++    /// for Fish (whose period is `period`).
++    clock: Clock,
++    phase: f64,
++    period: Option<f64>,
++    /// From the metadata (P6): the HOME the actions are offsets from, and their scale.
++    home: Option<[f64; NUM_JOINTS]>,
++    action_scale: Option<f64>,
++    last_input: Vec<f32>,
+ }
+ 
+ struct LstmState {
+@@ -470,7 +568,23 @@ struct LstmState {
+ }
+ 
+ impl Network {
++    /// A Fish clock needs its period, and only a Fish clock may have one.
++    fn set_period(&mut self, period: Option<f64>) -> Result<(), PolicyError> {
++        match (self.clock, period) {
++            (Clock::Fish, Some(p)) if p.is_finite() && p > 0.0 => self.period = Some(p),
++            (Clock::Fish, _) => {
++                return Err(shape_error(&self.path, "phase clock", "fish_phase with phase_period_s > 0", "no period".into()));
++            }
++            (_, None) => {}
++            (clock, Some(_)) => {
++                return Err(shape_error(&self.path, "phase clock", "phase_period_s only for a fish_phase network", format!("{clock:?}")));
++            }
++        }
++        Ok(())
++    }
++
+     fn reset(&mut self) {
++        self.phase = 0.0;
+         if let Some(state) = &mut self.state {
+             state.h.try_extract_tensor_mut::<f32>().unwrap().1.fill(0.0);
+             state.c.try_extract_tensor_mut::<f32>().unwrap().1.fill(0.0);
+@@ -482,7 +596,30 @@ impl Network {
+         if !observation.as_slice().iter().all(|v| v.is_finite()) {
+             return Err(fail("non-finite observation".into()));
+         }
+-        let input = Value::from_array(([1usize, OBS_LEN], observation.as_slice().to_vec()))
++        // The clock, read before it advances: the first step of an episode sees φ = 0
++        // [assumption, as `SwizzleClockCommand` is described — check against its code].
++        let obs = observation.as_slice();
++        self.last_input.clear();
++        self.last_input.extend_from_slice(obs);
++        let angle = match self.clock {
++            Clock::None => None,
++            Clock::Swizzle => {
++                let a = self.phase;
++                let hz = swizzle_hz(obs[COMMAND_AT] as f64, obs[COMMAND_AT + 1] as f64);
++                self.phase = (self.phase + std::f64::consts::TAU * hz * CONTROL_DT) % std::f64::consts::TAU;
++                Some(a)
++            }
++            Clock::Fish => {
++                let a = std::f64::consts::TAU * self.phase / self.period.unwrap_or(1.0);
++                self.phase += CONTROL_DT;
++                Some(a)
++            }
++        };
++        if let Some(a) = angle {
++            self.last_input.extend_from_slice(&[a.sin() as f32, a.cos() as f32]);
++        }
++        let width = self.last_input.len();
++        let input = Value::from_array(([1usize, width], self.last_input.clone()))
+             .map_err(|e| fail(format!("building input: {e}")))?;
+         let outputs = match &self.state {
+             Some(state) => self.session.run(ort::inputs![
+@@ -600,9 +737,19 @@ fn open(path: &Path) -> Result<Network, PolicyError> {
+             source,
+         })?;
+ 
++    let (clock, home, action_scale) = {
++        let meta = session.metadata().ok();
++        // An empty value is no value (Pollen's own test fixture carries empty keys).
++        let custom = |key: &str| meta.as_ref().and_then(|m| m.custom(key)).filter(|v| !v.trim().is_empty());
++        let clock = layout(path, custom("observation_names").as_deref())?;
++        let (home, scale) = trained_pose(path, custom("joint_names").as_deref(),
++            custom("default_joint_pos").as_deref(), custom("action_scale").as_deref())?;
++        (clock, home, scale)
++    };
+     let inputs = session.inputs();
+     let outputs = session.outputs();
+-    check_matrix(path, outlet(path, inputs, "obs")?, OBS_LEN)?;
++    let width = if clock == Clock::None { OBS_LEN } else { OBS_LEN + PHASE_LEN };
++    check_matrix(path, outlet(path, inputs, "obs")?, width)?;
+     let recurrent = match (inputs.len(), outputs.len()) {
+         (1, 1) => false,
+         (3, 3) => true,
+@@ -688,9 +835,75 @@ fn open(path: &Path) -> Result<Network, PolicyError> {
+         action_name,
+         path: path.to_owned(),
+         digest,
++        clock,
++        phase: 0.0,
++        period: None,
++        home,
++        action_scale,
++        last_input: Vec::with_capacity(OBS_LEN + PHASE_LEN),
+     })
+ }
+ 
++/// The clock a network reads, from its `observation_names`: the 61 blocks of
++/// [`OBSERVATION_NAMES`], in order, optionally followed by `swizzle_phase` or `fish_phase`. A network
++/// that does not name its inputs is taken to be the 61 (every policy before P5).
++pub fn layout(path: &Path, names: Option<&str>) -> Result<Clock, PolicyError> {
++    let Some(names) = names else { return Ok(Clock::None) };
++    let names: Vec<&str> = names.split(',').map(str::trim).collect();
++    let bad = || shape_error(path, "observation_names",
++        &format!("{} [+ swizzle_phase | fish_phase]", OBSERVATION_NAMES.join(",")), names.join(","));
++    if names.len() < OBSERVATION_NAMES.len() || names[..OBSERVATION_NAMES.len()] != OBSERVATION_NAMES {
++        return Err(bad());
++    }
++    match &names[OBSERVATION_NAMES.len()..] {
++        [] => Ok(Clock::None),
++        ["swizzle_phase"] => Ok(Clock::Swizzle),
++        ["fish_phase"] => Ok(Clock::Fish),
++        _ => Err(bad()),
++    }
++}
++
++/// HOME and action scale from the metadata (duck-brain P6). `default_joint_pos` is in the policy's
++/// joint order — the 14 without the mouth, which `joint_names` must confirm when present; the
++/// mouth keeps the compiled default.
++pub fn trained_pose(
++    path: &Path,
++    joint_names: Option<&str>,
++    default_pos: Option<&str>,
++    scale: Option<&str>,
++) -> Result<(Option<[f64; NUM_JOINTS]>, Option<f64>), PolicyError> {
++    if let Some(names) = joint_names {
++        let want: Vec<&str> = crate::model::JOINT_NAMES.iter().copied().filter(|n| *n != "mouth").collect();
++        let got: Vec<&str> = names.split(',').map(str::trim).collect();
++        if got != want {
++            return Err(shape_error(path, "joint_names", &want.join(","), got.join(",")));
++        }
++    }
++    let home = match default_pos {
++        None => None,
++        Some(text) => {
++            let v: Vec<f64> = text.split(',').map(|x| x.trim().parse::<f64>()).collect::<Result<_, _>>()
++                .map_err(|_| shape_error(path, "default_joint_pos", "14 numbers", text.to_owned()))?;
++            if v.len() != OBS_JOINTS || !v.iter().all(|x| x.is_finite() && x.abs() < 3.2) {
++                return Err(shape_error(path, "default_joint_pos", "14 finite angles", text.to_owned()));
++            }
++            let mut pose = DEFAULT_POSITION;
++            for (slot, value) in v.iter().enumerate() {
++                pose[if slot < MOUTH_INDEX { slot } else { slot + 1 }] = *value;
++            }
++            Some(pose)
++        }
++    };
++    let scale = match scale {
++        None => None,
++        Some(text) => match text.trim().parse::<f64>() {
++            Ok(x) if x.is_finite() && x > 0.0 && x <= 2.0 => Some(x),
++            _ => return Err(shape_error(path, "action_scale", "a number in (0, 2]", text.to_owned())),
++        },
++    };
++    Ok((home, scale))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -813,4 +1026,41 @@ mod tests {
+             "point somewhere useful: {detail:?}"
+         );
+     }
++
++    #[test]
++    fn layouts_are_read_from_observation_names() {
++        let p = Path::new("x.onnx");
++        let base = OBSERVATION_NAMES.join(",");
++        assert_eq!(layout(p, None).unwrap(), Clock::None);
++        assert_eq!(layout(p, Some(&base)).unwrap(), Clock::None);
++        assert_eq!(layout(p, Some(&format!("{base},swizzle_phase"))).unwrap(), Clock::Swizzle);
++        assert_eq!(layout(p, Some(&format!("{base},fish_phase"))).unwrap(), Clock::Fish);
++        assert!(layout(p, Some(&format!("{base},stride_phase"))).is_err());
++        let swapped = base.replace("joint_pos,joint_vel", "joint_vel,joint_pos");
++        assert!(layout(p, Some(&swapped)).is_err(), "the order is checked, not just the names");
++    }
++
++    #[test]
++    fn the_swizzle_clock_follows_the_speed_and_the_crouch() {
++        assert_eq!(swizzle_hz(0.04, 0.0), 0.0, "stands still below 0.05 m/s");
++        assert!((swizzle_hz(0.3, 0.0) - 0.3 / 0.615).abs() < 1e-12, "0.3 m/s → 0.49 Hz");
++        assert_eq!(swizzle_hz(-2.0, 0.0), 1.5, "capped, either direction");
++        assert!((swizzle_hz(0.3, 0.15) - 0.5 * 0.3 / 0.615).abs() < 1e-12, "half depth, half the beat");
++        assert_eq!(swizzle_hz(0.3, 0.3), 0.0);
++    }
++
++    #[test]
++    fn home_and_scale_come_from_the_metadata_in_policy_order() {
++        let p = Path::new("x.onnx");
++        let names = "left_hip_yaw,left_hip_roll,left_hip_pitch,left_knee,left_ankle,neck_pitch,head_pitch,head_yaw,head_roll,right_hip_yaw,right_hip_roll,right_hip_pitch,right_knee,right_ankle";
++        let ours = "0.000,-0.087,-0.371,-0.005,0.366,0.349,0.349,0.000,0.000,0.000,0.087,0.371,0.005,-0.366";
++        let (home, scale) = trained_pose(p, Some(names), Some(ours), Some("0.3")).unwrap();
++        let home = home.unwrap();
++        assert_eq!((home[2], home[4], home[MOUTH_INDEX], home[12], home[14]), (-0.371, 0.366, DEFAULT_POSITION[MOUTH_INDEX], 0.371, -0.366));
++        assert_eq!(scale, Some(0.3));
++        assert_eq!(trained_pose(p, None, None, None).unwrap(), (None, None));
++        assert!(trained_pose(p, Some("left_hip_roll,left_hip_yaw"), Some(ours), None).is_err());
++        assert!(trained_pose(p, None, Some("0.1,0.2"), None).is_err());
++        assert!(trained_pose(p, None, None, Some("0")).is_err());
++    }
+ }
+diff --git a/robotctl/src/main.rs b/robotctl/src/main.rs
+index 4b25b58..0493a49 100644
+--- a/robotctl/src/main.rs
++++ b/robotctl/src/main.rs
+@@ -4213,6 +4213,7 @@ fn run_policy_skill(
+             action_scale: from_manifest.as_ref().and_then(|m| m.action_scale),
+             ..Default::default()
+         },
++        ..robotd_params::SkillDef::default()
+     };
+ 
+     robotd_params::edit::set_skill(config, &skill).map_err(|e| Failure::new(exit::FAILED, e))?;
+diff --git a/robotd-params/src/lib.rs b/robotd-params/src/lib.rs
+index 41dcdfc..bdb0ac4 100644
+--- a/robotd-params/src/lib.rs
++++ b/robotd-params/src/lib.rs
+@@ -1297,6 +1297,23 @@ pub struct SkillDef {
+     /// What this skill changes about the robot while it runs, and only while it runs.
+     #[serde(default)]
+     pub params: SkillOverrides,
++
++    /// Feed the network the client's live twist instead of `command` while it holds
++    /// (duck-brain P4).
++    ///
++    /// For a skill steered while it runs — the roller stride reads which skate is up and a
++    /// course error, both changing every second — where a constant command cannot say it. The
++    /// twist is the client's `robot.move` after the deadman and **before** `cmd_alpha`: a side
++    /// flag flipping ±1 must not be smoothed into a glide through zero. `unwind` stays constant.
++    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
++    pub live: bool,
++
++    /// Seconds per cycle of the Fish clock the network observes after its 61 inputs:
++    /// `sin φ, cos φ`, φ = 2π·t/period, t from the start of the skill (duck-brain P5). Required by a
++    /// network whose metadata ends its `observation_names` with `fish_phase`, refused by any other
++    /// — checked at load.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub phase_period_s: Option<f64>,
+ }
+ 
+ /// Parameters a skill changes for its duration, restored when it ends.
+@@ -1650,6 +1667,7 @@ fn fallback_skills() -> Vec<SkillDef> {
+         unwind: [0.0; 3],
+         unwind_s: 0.0,
+         params: SkillOverrides::default(),
++        ..SkillDef::default()
+     };
+     vec![
+         // Order is priority, replacing the hardcoded `roulade > kick` precedence.
+@@ -1664,6 +1682,7 @@ fn fallback_skills() -> Vec<SkillDef> {
+             unwind: [0.0; 3],
+             unwind_s: 0.0,
+             params: SkillOverrides::default(),
++            ..SkillDef::default()
+         },
+         kick("kick_left", "ball_kick_left.onnx"),
+         kick("kick_right", "ball_kick_right.onnx"),
+diff --git a/robotd/src/control.rs b/robotd/src/control.rs
+index 62c39c1..e42cef2 100644
+--- a/robotd/src/control.rs
++++ b/robotd/src/control.rs
+@@ -241,6 +241,9 @@ pub struct Controller {
+     auto_rise: bool,
+     /// The network the last [`Self::step`] ran. `None` before the first.
+     last_net: Option<Net>,
++    /// The client's twist as it arrived — deadman applied, not smoothed — for a `live` skill
++    /// (duck-brain P4). Set by the loop before each step.
++    live_twist: [f64; 3],
+ }
+ 
+ impl Controller {
+@@ -257,9 +260,27 @@ impl Controller {
+             sit_settle: 0.0,
+             auto_rise: false,
+             last_net: None,
++            live_twist: [0.0; 3],
+         }
+     }
+ 
++    /// The client's raw twist this tick, for a `live` skill (duck-brain P4).
++    pub fn set_live_twist(&mut self, twist: [f64; 3]) {
++        self.live_twist = twist;
++    }
++
++    /// The pose this robot stands at: the walking policy's trained HOME when it says one, else
++    /// the compiled default (duck-brain P6). Bring-up ramps here and the stops hold here.
++    pub fn home(&self) -> [f64; NUM_JOINTS] {
++        self.policy.home(Net::Walk).unwrap_or(DEFAULT_POSITION)
++    }
++
++    /// The loaded networks — what the tests inspect (the input each was fed).
++    #[cfg(test)]
++    pub fn policy(&self) -> &Policy {
++        &self.policy
++    }
++
+     /// The network that drove on the last step, or `None` before there was one.
+     pub fn driving(&self) -> Option<Driving> {
+         Some(match self.last_net? {
+@@ -599,6 +620,7 @@ impl Controller {
+             // what made the kick and roulade arms the same arm.
+             let def = self.skills.skills.get(active.index);
+             let twist = def.map_or([0.0; 3], |d| match active.phase {
++                SkillPhase::Holding if d.live => self.live_twist,
+                 SkillPhase::Holding => d.command,
+                 SkillPhase::Unwinding => d.unwind,
+             });
+@@ -652,11 +674,14 @@ impl Controller {
+ 
+         self.last_net = Some(net);
+ 
++        // The network's own HOME (duck-brain P6): what it observes joints relative to and what its
++        // actions are offsets from. Networks without one keep the compiled default.
++        let home = self.policy.home(net).unwrap_or(DEFAULT_POSITION);
+         let observation = Observation::build(
+             &sensors.imu,
+             &sensors.positions,
+             &sensors.velocities,
+-            &DEFAULT_POSITION,
++            &home,
+             &self.last_action,
+             &effective,
+         );
+@@ -671,6 +696,9 @@ impl Controller {
+         let standing_tuned = matches!(net, Net::Stand)
+             || (matches!(net, Net::Skill(_) | Net::SitStand)
+                 && self.policy.will_stand(effective.twist_magnitude()));
++        // The scale the network was trained at, when it says (duck-brain P6), wins over the
++        // config's — except a skill's own `params.action_scale`, which is deliberate per move.
++        let trained = self.policy.action_scale(net);
+         let (scale, gain) = match net {
+             // A skill's own overrides, falling back to the gait's — which is how a kick keeps
+             // running at the standing tuning it was tuned against while a roulade can ask for
+@@ -679,6 +707,7 @@ impl Controller {
+                 let overrides = self.skills.skills.get(index).map(|d| &d.params);
+                 let scale = overrides
+                     .and_then(|o| o.action_scale)
++                    .or(trained)
+                     .unwrap_or(if standing_tuned {
+                         self.tuning.standing_action_scale
+                     } else {
+@@ -694,13 +723,13 @@ impl Controller {
+                 (scale, (self.tuning.gain as f64 * ratio).round() as u16)
+             }
+             Net::GroundPick => (
+-                self.skills.ground_pick_action_scale,
++                trained.unwrap_or(self.skills.ground_pick_action_scale),
+                 (self.tuning.gain as f64 * self.skills.ground_pick_gain_ratio).round() as u16,
+             ),
+             Net::SitStand => (
+                 // The prototype's `start_sit_toggle` pins the scale at 1.0 for the whole
+-                // sit/rise cycle.
+-                1.0,
++                // sit/rise cycle — for a network that does not say what it was trained at.
++                trained.unwrap_or(1.0),
+                 if standing_tuned {
+                     (self.tuning.gain as f64 * self.tuning.standing_gain_ratio).round() as u16
+                 } else {
+@@ -708,17 +737,17 @@ impl Controller {
+                 },
+             ),
+             _ if standing_tuned => (
+-                self.tuning.standing_action_scale,
++                trained.unwrap_or(self.tuning.standing_action_scale),
+                 (self.tuning.gain as f64 * self.tuning.standing_gain_ratio).round() as u16,
+             ),
+-            _ => (self.tuning.action_scale, self.tuning.gain),
++            _ => (trained.unwrap_or(self.tuning.action_scale), self.tuning.gain),
+         };
+         let scale = scale * scale_mult;
+ 
+         let offsets = Observation::scatter_action(&action);
+         let mut targets = [0.0; NUM_JOINTS];
+         for joint in 0..NUM_JOINTS {
+-            targets[joint] = DEFAULT_POSITION[joint] + scale * offsets[joint];
++            targets[joint] = home[joint] + scale * offsets[joint];
+         }
+ 
+         if let Some(previous) = self.previous {
+@@ -768,6 +797,134 @@ impl Controller {
+ mod tests {
+     use super::*;
+ 
++    /// duck-brain's policies, for the P4–P6 tests: `DUCK_BRAIN_POLICIES=<duck-brain>/policies
++    /// cargo test -p robotd -- --ignored duck_brain`.
++    fn duck_brain(file: &str) -> std::path::PathBuf {
++        std::path::Path::new(&std::env::var("DUCK_BRAIN_POLICIES").expect("DUCK_BRAIN_POLICIES")).join(file)
++    }
++
++    const RIDE: &str = "rollers_hd1910_v2_iter3498_home5.onnx";
++    const FISH: &str = "fish_hd1910_v4_iter3500_home5.onnx";
++    const STRIDE: &str = "stride_hd1910_v4_iter4498_home5.onnx";
++
++    fn skill(name: &str, file: &str, live: bool, period: Option<f64>) -> robotd_params::SkillDef {
++        robotd_params::SkillDef {
++            name: name.into(),
++            path: Some(duck_brain(file)),
++            duration: 30.0,
++            live,
++            phase_period_s: period,
++            ..Default::default()
++        }
++    }
++
++    fn ride_with_tricks() -> Controller {
++        let skills = vec![skill("fish", FISH, true, Some(8.0)), skill("stride", STRIDE, true, None)];
++        let policy = Policy::load(
++            &duck_control::policy::PolicyPaths {
++                walk: duck_brain(RIDE),
++                skills: skills.iter().map(|s| s.path.clone().unwrap()).collect(),
++                skill_periods: skills.iter().map(|s| s.phase_period_s).collect(),
++                ..Default::default()
++            },
++            0.05,
++        )
++        .unwrap();
++        let tuning = Tuning { head_lowpass: None, legs_lowpass: None, ..Tuning::default() };
++        Controller::new(policy, tuning, SkillTuning { skills, ..SkillTuning::default() })
++    }
++
++    /// P5 + P6 on the roller ride v2: 63 inputs ending with the swizzle clock, which runs at
++    /// f = |v| / 0.615 Hz and stands at zero speed; joints observed from the policy's HOME, and
++    /// targets = HOME + 0.3 · action.
++    #[test]
++    #[ignore = "requires ONNX Runtime >= 1.23 and DUCK_BRAIN_POLICIES"]
++    fn duck_brain_ride_sees_its_clock_and_its_home() {
++        let mut c = ride_with_tricks();
++        let home = c.home();
++        assert_eq!((home[2], home[4], home[12]), (-0.371, 0.366, 0.371), "HOME from default_joint_pos");
++        assert_eq!(c.policy().action_scale(Net::Walk), Some(0.3));
++        let sensors = duck_control::Sensors::default();
++        let go = Command { twist: [0.3, 0.0, 0.0], ..Command::default() };
++
++        let first = c.step(&sensors, &go, false, 0.02, 1.0).unwrap();
++        let input = c.policy().last_input(Net::Walk).to_vec();
++        assert_eq!(input.len(), 63);
++        assert_eq!((input[61], input[62]), (0.0, 1.0), "φ = 0 on the first step");
++        // Joint positions are relative to the policy's HOME: a robot at all-zero angles reads
++        // −HOME (left hip pitch +0.371, not Pollen's +0.458).
++        assert!((input[3 + 3 + 2] - 0.371).abs() < 1e-6, "{}", input[8]);
++        // Targets are HOME + scale · action: the same input through a second copy of the network.
++        let mut twin = Policy::load(&duck_control::policy::PolicyPaths { walk: duck_brain(RIDE), ..Default::default() }, 0.05).unwrap();
++        let obs: [f32; duck_control::OBS_LEN] = input[..61].try_into().unwrap();
++        let action = twin.infer(&Observation::from(obs), Net::Walk).unwrap();
++        let offsets = Observation::scatter_action(&action);
++        for j in 0..NUM_JOINTS {
++            assert!((first.targets[j] - (home[j] + 0.3 * offsets[j])).abs() < 1e-5, "joint {j}");
++        }
++
++        for _ in 1..50 {
++            c.step(&sensors, &go, false, 0.02, 1.0).unwrap();
++        }
++        let phi = std::f64::consts::TAU * (0.3 / 0.615) * 0.02 * 49.0;
++        let input = c.policy().last_input(Net::Walk);
++        assert!((input[61] as f64 - phi.sin()).abs() < 1e-5 && (input[62] as f64 - phi.cos()).abs() < 1e-5);
++        let stop = Command::default();
++        c.step(&sensors, &stop, false, 0.02, 1.0).unwrap();
++        let a = c.policy().last_input(Net::Walk)[61..].to_vec();
++        c.step(&sensors, &stop, false, 0.02, 1.0).unwrap();
++        assert_eq!(a, c.policy().last_input(Net::Walk)[61..].to_vec(), "the clock stands at zero speed");
++    }
++
++    /// P4 + P5: Fish reads the client's live twist, not `command`, and a clock of 8 s from its
++    /// start; the stride (61 inputs) reads the live twist too.
++    #[test]
++    #[ignore = "requires ONNX Runtime >= 1.23 and DUCK_BRAIN_POLICIES"]
++    fn duck_brain_fish_is_steered_live_on_its_clock() {
++        let mut c = ride_with_tricks();
++        let sensors = duck_control::Sensors::default();
++        let nothing = Command::default();
++        assert!(c.start_skill(0).unwrap());
++        for _ in 0..101 {
++            c.set_live_twist([0.3, 0.0, 0.1]);
++            c.step(&sensors, &nothing, false, 0.02, 1.0).unwrap();
++        }
++        let input = c.policy().last_input(Net::Skill(0));
++        assert_eq!(input.len(), 63);
++        assert_eq!((input[48], input[49], input[50]), (0.3, 0.0, 0.1), "the live twist, not the zero command");
++        let phi = std::f64::consts::TAU * 0.02 * 100.0 / 8.0;
++        assert!((input[61] as f64 - phi.sin()).abs() < 1e-5 && (input[62] as f64 - phi.cos()).abs() < 1e-5);
++
++        let mut c = ride_with_tricks();
++        assert!(c.start_skill(1).unwrap());
++        c.set_live_twist([0.35, -1.0, 0.05]);
++        c.step(&sensors, &nothing, false, 0.02, 1.0).unwrap();
++        let input = c.policy().last_input(Net::Skill(1));
++        assert_eq!(input.len(), 61);
++        assert_eq!((input[48], input[49], input[50]), (0.35, -1.0, 0.05));
++    }
++
++    /// A Fish network without its period, or a period on a network without a clock, is refused
++    /// at load rather than run on a guessed clock.
++    #[test]
++    #[ignore = "requires ONNX Runtime >= 1.23 and DUCK_BRAIN_POLICIES"]
++    fn duck_brain_a_fish_without_its_period_is_refused() {
++        let load = |file: &str, period| {
++            Policy::load(
++                &duck_control::policy::PolicyPaths {
++                    walk: duck_brain(RIDE),
++                    skills: vec![duck_brain(file)],
++                    skill_periods: vec![period],
++                    ..Default::default()
++                },
++                0.05,
++            )
++        };
++        assert!(load(FISH, None).is_err());
++        assert!(load(STRIDE, Some(8.0)).is_err());
++        assert!(load(FISH, Some(8.0)).is_ok());
++    }
++
+     #[test]
+     #[ignore = "requires ONNX Runtime >= 1.23"]
+     fn recurrent_memory_resets_with_controller_feedback() {
+diff --git a/robotd/src/main.rs b/robotd/src/main.rs
+index 21e2f06..3c979b8 100644
+--- a/robotd/src/main.rs
++++ b/robotd/src/main.rs
+@@ -213,7 +213,13 @@ impl LimpFall {
+     /// purpose: that ramp is bring-up from limp at the policy gain over a fixed two
+     /// seconds, this one is a landed robot being put back into shape, and both its
+     /// duration and its gain are tunable because both depend on how the robot lands.
++    #[cfg(test)]
+     fn pose_target(&self, now: Instant, over: Duration) -> Option<[f64; NUM_JOINTS]> {
++        self.pose_target_to(&DEFAULT_POSITION, now, over)
++    }
++
++    /// Toward `home`: the running policy's (duck-brain P6).
++    fn pose_target_to(&self, home: &[f64; NUM_JOINTS], now: Instant, over: Duration) -> Option<[f64; NUM_JOINTS]> {
+         let LimpFall::Posing { from, since } = self else {
+             return None;
+         };
+@@ -223,7 +229,7 @@ impl LimpFall {
+         }
+         let mut target = [0.0; NUM_JOINTS];
+         for (i, slot) in target.iter_mut().enumerate() {
+-            *slot = from[i] + (DEFAULT_POSITION[i] - from[i]) * t;
++            *slot = from[i] + (home[i] - from[i]) * t;
+         }
+         Some(target)
+     }
+@@ -1965,6 +1971,12 @@ fn try_controller(
+                 .iter()
+                 .filter_map(|skill| skill.resolved_path())
+                 .collect(),
++            skill_periods: policy_cfg
++                .skills
++                .iter()
++                .filter(|skill| skill.resolved_path().is_some())
++                .map(|skill| skill.phase_period_s)
++                .collect(),
+         };
+         match Policy::load(&paths, DEFAULT_STANDING_THRESHOLD) {
+             Ok(mut policy) => {
+@@ -1985,6 +1997,21 @@ fn try_controller(
+                     limp_fall,
+                     "policy loaded"
+                 );
++                // What each network was trained on, as its metadata says (duck-brain P5, P6).
++                let describe = |net: duck_control::policy::Net| {
++                    let clock = policy.clock(net);
++                    let inputs = duck_control::OBS_LEN
++                        + if clock == duck_control::policy::Clock::None { 0 } else { duck_control::policy::PHASE_LEN };
++                    format!(
++                        "{inputs} inputs, clock {clock:?}, home hip pitch {}, scale {}",
++                        policy.home(net).map_or("compiled".into(), |h| format!("{:.3}", h[2])),
++                        policy.action_scale(net).map_or("config".into(), |s| s.to_string()),
++                    )
++                };
++                tracing::warn!(walk = %describe(duck_control::policy::Net::Walk), "network layout");
++                for (i, skill) in skills.skills.iter().take(policy.skill_count()).enumerate() {
++                    tracing::warn!(skill = %skill.name, layout = %describe(duck_control::policy::Net::Skill(i)), "network layout");
++                }
+                 Ok(Some(Controller::new(policy, tuning, skills)))
+             }
+             Err(e) => Err(e),
+@@ -2359,6 +2386,9 @@ async fn control_loop<T: RobotIo>(
+     while !state.shutdown.load(Ordering::Relaxed) {
+         ticker.tick().await;
+         let tick_start = Instant::now();
++        // The pose this tick ramps to and holds: the walking policy's trained HOME (duck-brain
++        // P6), which follows the controller across a policy swap or a mode switch.
++        let home = controller.as_ref().map_or(DEFAULT_POSITION, Controller::home);
+ 
+         let read_at = proto::clock::monotonic_ns();
+         let fresh = match safety.read() {
+@@ -2475,7 +2505,7 @@ async fn control_loop<T: RobotIo>(
+                     bringup = Bringup::Homing {
+                         from: sensors.positions,
+                         since: tick_start,
+-                        to: DEFAULT_POSITION,
++                        to: home,
+                     };
+                 }
+                 // Mid-ramp, or no sample to ramp from: nothing to do, and saying so beats
+@@ -2740,7 +2770,7 @@ async fn control_loop<T: RobotIo>(
+                             bringup = Bringup::Homing {
+                                 from: sensors.positions,
+                                 since: tick_start,
+-                                to: DEFAULT_POSITION,
++                                to: home,
+                             };
+                         }
+                     }
+@@ -2818,7 +2848,7 @@ async fn control_loop<T: RobotIo>(
+                                 bringup = Bringup::Homing {
+                                     from: sensors.positions,
+                                     since: tick_start,
+-                                    to: DEFAULT_POSITION,
++                                    to: home,
+                                 };
+                             }
+                         } else {
+@@ -3058,7 +3088,7 @@ async fn control_loop<T: RobotIo>(
+                         tracing::warn!("posed — handing back to the standing policy");
+                         limp_fall = LimpFall::Idle;
+                         falling.reset();
+-                        hold = DEFAULT_POSITION;
++                        hold = home;
+                         // Hand back to the policy, and let it choose. The twist has been
+                         // held at zero through the whole sequence, so with nobody driving
+                         // the standing network is what command magnitude selects — which
+@@ -3243,7 +3273,7 @@ async fn control_loop<T: RobotIo>(
+                 .as_ref()
+                 .is_some_and(|p| p.disturbs && !p.ready())
+         {
+-            hold = DEFAULT_POSITION;
++            hold = home;
+         } else if let Bringup::Homing { .. } = bringup
+             && bringup.homing_target(tick_start).is_none()
+         {
+@@ -3504,8 +3534,9 @@ async fn control_loop<T: RobotIo>(
+                     // A deliberate stop returns to the home pose — the prototype's Start-off
+                     // ("policy DISABLED - returning to default pose"). Commanded directly, no
+                     // ramp: the servos do the travel at their own speed, and the robot is
+-                    // standing at home when Start next hands it to the policy.
+-                    DEFAULT_POSITION
++                    // standing at home when Start next hands it to the policy. The walking
++                    // policy's trained HOME (duck-brain P6).
++                    home
+                 };
+             } else {
+                 // Any other stop — IMU cooling, a blind bus, the armed fall gate — freezes
+@@ -3555,8 +3586,8 @@ async fn control_loop<T: RobotIo>(
+                     // machine above clears `Posing` on the same tick, so this is the one
+                     // frame where the two can disagree.
+                     limp_fall
+-                        .pose_target(tick_start, limp_fall_pose)
+-                        .unwrap_or(DEFAULT_POSITION),
++                        .pose_target_to(&home, tick_start, limp_fall_pose)
++                        .unwrap_or(home),
+                     params.safety.limp_fall_pose_gain,
+                     true,
+                     "limp_pose".into(),
+@@ -3586,6 +3617,8 @@ async fn control_loop<T: RobotIo>(
+             }
+             (true, Some(sensors)) => {
+                 let controller = controller.as_mut().expect("driving implies a controller");
++                // A `live` skill reads the client's twist as it came, unsmoothed (duck-brain P4).
++                controller.set_live_twist(twist_target);
+                 match controller.step(sensors, &command, snapshot.pose.active, dt, scale_mult) {
+                     Ok(step) => (
+                         step.targets,
+@@ -4741,6 +4774,7 @@ fn set_skill_request(
+                 .gain_ratio
+                 .or(existing.as_ref().and_then(|s| s.params.gain_ratio)),
+         },
++        ..Default::default()
+     };
+ 
+     if let Err(e) = params::edit::set_skill(&state.config_path, &skill) {
+@@ -4808,19 +4842,21 @@ fn ramp_target(
+     imu_ready: bool,
+     controller: Option<&mut Controller>,
+ ) -> [f64; NUM_JOINTS] {
++    // Home is the HOME the walking policy was trained around (duck-brain P6).
++    let home = controller.as_deref().map_or(DEFAULT_POSITION, Controller::home);
+     let Some(controller) = controller.filter(|c| c.has_sitstand()) else {
+-        return DEFAULT_POSITION;
++        return home;
+     };
+     if !imu_ready {
+         tracing::warn!("posture: the IMU has not converged — ramping to home without a check");
+-        return DEFAULT_POSITION;
++        return home;
+     }
+     let reading = posture::classify(&sensors.positions, sensors.imu.quat);
+     let height = format!("{:.0}%", 100.0 * reading.height_ratio);
+     let tilt = format!("{:.0}°", reading.tilt_deg);
+     if reading.posture != posture::Posture::Seated {
+         tracing::info!(%height, %tilt, posture = ?reading.posture, "posture at torque on");
+-        return DEFAULT_POSITION;
++        return home;
+     }
+     tracing::warn!(%height, %tilt, "posture: seated at torque on — ramping to the seat");
+     controller.enter_seat();
+-- 
+2.43.0
+

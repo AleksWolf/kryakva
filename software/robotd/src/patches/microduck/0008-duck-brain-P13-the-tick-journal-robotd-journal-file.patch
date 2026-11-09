@@ -1,0 +1,559 @@
+From 4772dc7c8b69e545be5fa131e0a008b81da4c4ce Mon Sep 17 00:00:00 2001
+From: duck-brain <duck-brain@localhost>
+Date: Sat, 17 Oct 2026 00:14:40 +0000
+Subject: [PATCH 8/8] duck-brain P13: the tick journal (`robotd --journal
+ <file>`)
+
+One JSON line per control tick, for replaying a run through the same
+network on a PC and comparing bit for bit (duck-brain
+scripts/replay_journal.py):
+
+- header: robotd version, rate, joint names and ids, [bus], [feetech],
+  [body_imu] and [policy] as loaded;
+- per tick: time, the label, the network that drove (slot, file, the
+  exact input row fed to it, its action, the scale multiplier and its
+  targets), the targets handed to safety, the gain, the positions,
+  velocities and IMU sample read, and the bus's own view
+  (RobotIo::journal; on the Feetech bus: position and voltage registers
+  per servo with null for a missed answer, goal registers sent,
+  smoothed V and the error factor, read time, observation age, IMU
+  sample number and age);
+- an end line with lines written and dropped.
+
+Floats are written as the shortest decimal of their f64 value, an f32
+widened exactly first, so narrowing a value read back gives the bits the
+policy saw. Lines go through a bounded queue to a writer thread: the
+control thread never waits on the disk, and a full queue drops and
+counts.
+---
+ duck-control/src/feetech.rs |  76 ++++++++++++++++++++++
+ duck-control/src/io.rs      |   6 ++
+ duck-control/src/policy.rs  |   6 ++
+ duck-control/src/safety.rs  |   5 ++
+ robotd/src/control.rs       |  14 +++++
+ robotd/src/journal.rs       | 121 ++++++++++++++++++++++++++++++++++++
+ robotd/src/main.rs          |  97 ++++++++++++++++++++++++++---
+ 7 files changed, 318 insertions(+), 7 deletions(-)
+ create mode 100644 robotd/src/journal.rs
+
+diff --git a/duck-control/src/feetech.rs b/duck-control/src/feetech.rs
+index b30dbf1..167bda0 100644
+--- a/duck-control/src/feetech.rs
++++ b/duck-control/src/feetech.rs
+@@ -246,6 +246,26 @@ impl FeetechShared {
+     }
+ }
+ 
++/// One tick as the bus saw it, for the tick journal (duck-brain P13).
++#[derive(Debug, Clone, Default, serde::Serialize)]
++pub struct BusTick {
++    /// Position register per joint as read this tick; `null` for a servo that did not answer.
++    pub pos_raw: Vec<Option<u16>>,
++    /// Voltage register per joint, 0.1 V; `null` for a servo that did not answer.
++    pub volt_raw: Vec<Option<u8>>,
++    /// Goal register per joint as sent.
++    pub goal_raw: Vec<u16>,
++    /// The smoothed lowest voltage, and the factor the errors were multiplied by.
++    pub v_smoothed: Option<f64>,
++    pub adapt: f64,
++    /// How long the read took, and from its start to the goal write, µs.
++    pub read_us: u64,
++    pub obs_age_us: u64,
++    /// The IMU sample this tick used: its number and its age at the start of the read, µs.
++    pub imu_seq: Option<u64>,
++    pub imu_age_us: Option<u64>,
++}
++
+ pub struct FeetechIo<P: Port = SerialPort> {
+     bus: Bus<P>,
+     cfg: FeetechConfig,
+@@ -265,6 +285,7 @@ pub struct FeetechIo<P: Port = SerialPort> {
+     imu_seq: Option<u64>,
+     imu_stale: ImuStale,
+     tick: u64,
++    journal: BusTick,
+ }
+ 
+ impl FeetechIo<SerialPort> {
+@@ -309,6 +330,7 @@ impl<P: Port> FeetechIo<P> {
+             imu_seq: None,
+             imu_stale: ImuStale::default(),
+             tick: 0,
++            journal: BusTick::default(),
+         }
+     }
+ 
+@@ -425,6 +447,8 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+         let mut v_min: Option<f64> = None;
+         let mut answered = 0usize;
+         let mut errors = [0u8; NUM_JOINTS];
++        let mut pos_raw = vec![None; NUM_JOINTS];
++        let mut volt_raw = vec![None; NUM_JOINTS];
+         let mut missed = [false; NUM_JOINTS];
+         for (j, a) in answers.iter().enumerate() {
+             let Some(s) = a else {
+@@ -434,6 +458,8 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+             answered += 1;
+             errors[j] = s.error;
+             let raw = feetech::from_le(&s.params[0..2]);
++            pos_raw[j] = Some(raw);
++            volt_raw[j] = Some(s.params[6]);
+             let sign = self.cfg.sign[j];
+             let p = counts_to_rad(raw, sign);
+             self.velocities[j] = match self.cfg.velocity {
+@@ -527,6 +553,18 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+             }
+         }
+ 
++        self.journal = BusTick {
++            pos_raw,
++            volt_raw,
++            goal_raw: Vec::new(),
++            v_smoothed: self.v_smoothed,
++            adapt: 1.0,
++            read_us: started.elapsed().as_micros() as u64,
++            obs_age_us: 0,
++            imu_seq: sample.map(|s| s.seq),
++            imu_age_us: imu_age.map(|a| a.as_micros() as u64),
++        };
++
+         if answered == 0 {
+             return Err(IoError::ShortRead {
+                 what: "servo answers",
+@@ -552,10 +590,12 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+             _ => 1.0,
+         };
+         let mut bytes = Vec::with_capacity(NUM_JOINTS);
++        let mut goal_raw = Vec::with_capacity(NUM_JOINTS);
+         for (j, &id) in JOINT_IDS.iter().enumerate() {
+             let present = self.positions[j];
+             let goal = present + (targets.positions[j] - present) * k;
+             let raw = rad_to_counts(goal, self.cfg.sign[j]);
++            goal_raw.push(raw);
+             bytes.push((id, raw.to_le_bytes()));
+         }
+         let refs: Vec<(u8, &[u8])> = bytes.iter().map(|(id, b)| (*id, b.as_slice())).collect();
+@@ -568,6 +608,9 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+             s.obs_ages.push(a);
+             s.adapt = k;
+         }
++        self.journal.goal_raw = goal_raw;
++        self.journal.adapt = k;
++        self.journal.obs_age_us = obs_age.map_or(0, |a| a.as_micros() as u64);
+         Ok(())
+     }
+ 
+@@ -679,6 +722,10 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+     fn adapts_voltage(&self) -> bool {
+         self.cfg.voltage_adapt
+     }
++
++    fn journal(&self) -> Option<serde_json::Value> {
++        serde_json::to_value(&self.journal).ok()
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -998,4 +1045,33 @@ mod tests {
+         );
+         assert_eq!(io.shared().snapshot().torque, Some(true));
+     }
++
++    /// The journal's view of a tick: raw positions read (a silent servo as `null`), raw goals sent,
++    /// the voltage factor, and the timings.
++    #[test]
++    fn the_journal_has_what_the_bus_saw_and_sent() {
++        let mut emu = Emulator::new(&JOINT_IDS);
++        emu.servo_mut(JOINT_IDS[1]).unwrap().silent = true;
++        let mut io = FeetechIo::with_port(emu, quick(), Arc::default(), Arc::new(ImuFeed::new()));
++        io.bus_mut()
++            .port_mut()
++            .servo_mut(JOINT_IDS[1])
++            .unwrap()
++            .silent = false;
++        io.census().unwrap();
++        io.bus_mut()
++            .port_mut()
++            .servo_mut(JOINT_IDS[1])
++            .unwrap()
++            .silent = true;
++        let s = io.read().unwrap();
++        io.write(&JointTargets::new(s.positions)).unwrap();
++        let j = io.journal().unwrap();
++        assert_eq!(j["pos_raw"][0], 2048);
++        assert!(j["pos_raw"][1].is_null());
++        assert_eq!(j["goal_raw"].as_array().unwrap().len(), NUM_JOINTS);
++        assert_eq!(j["goal_raw"][0], 2048);
++        assert_eq!(j["adapt"], 1.0);
++        assert!(j["imu_seq"].is_null(), "no IMU sample yet");
++    }
+ }
+diff --git a/duck-control/src/io.rs b/duck-control/src/io.rs
+index f40de07..4c109f1 100644
+--- a/duck-control/src/io.rs
++++ b/duck-control/src/io.rs
+@@ -210,6 +210,12 @@ pub trait RobotIo {
+     fn adapts_voltage(&self) -> bool {
+         false
+     }
++
++    /// What this backend saw and sent on the last tick, for the tick journal (duck-brain P13).
++    /// `None` from a backend with nothing to add to what the loop already knows.
++    fn journal(&self) -> Option<serde_json::Value> {
++        None
++    }
+ }
+ 
+ /// What a servo can say about itself — see [`RobotIo::servo_identity`].
+diff --git a/duck-control/src/policy.rs b/duck-control/src/policy.rs
+index 5a3472f..3c967a8 100644
+--- a/duck-control/src/policy.rs
++++ b/duck-control/src/policy.rs
+@@ -415,6 +415,12 @@ impl Policy {
+         &self.network(net).last_input
+     }
+ 
++    /// The file `net` was loaded from — after fallback, so the one that actually ran. For the tick
++    /// journal (duck-brain P13), whose replay feeds the same file the same input.
++    pub fn path(&self, net: Net) -> &std::path::Path {
++        &self.network(net).path
++    }
++
+     /// How many one-shot skills are loaded. A caller's index is valid below this.
+     pub fn skill_count(&self) -> usize {
+         self.skills.len()
+diff --git a/duck-control/src/safety.rs b/duck-control/src/safety.rs
+index abfa9ce..9aeeaf0 100644
+--- a/duck-control/src/safety.rs
++++ b/duck-control/src/safety.rs
+@@ -456,6 +456,11 @@ impl<T: RobotIo> Safety<T> {
+         self.io.adapts_voltage()
+     }
+ 
++    /// See [`RobotIo::journal`].
++    pub fn journal(&self) -> Option<serde_json::Value> {
++        self.io.journal()
++    }
++
+     /// Borrow the wrapped IO. Test-only, and deliberately not public: handing this out in
+     /// production would defeat the point of safety owning the writer.
+     #[cfg(test)]
+diff --git a/robotd/src/control.rs b/robotd/src/control.rs
+index e42cef2..0219357 100644
+--- a/robotd/src/control.rs
++++ b/robotd/src/control.rs
+@@ -275,6 +275,20 @@ impl Controller {
+         self.policy.home(Net::Walk).unwrap_or(DEFAULT_POSITION)
+     }
+ 
++    /// The network that drove the last step, for the tick journal (duck-brain P13): the input row
++    /// it was fed, the action it gave, the file it was loaded from and its slot's name.
++    pub fn journal_view(&self) -> Option<(&[f32], [f32; ACTION_LEN], &std::path::Path, &'static str)> {
++        let net = self.last_net?;
++        let slot = match net {
++            Net::Walk => "walk",
++            Net::Stand => "stand",
++            Net::SitStand => "sitstand",
++            Net::GroundPick => "ground_pick",
++            Net::Skill(_) => "skill",
++        };
++        Some((self.policy.last_input(net), self.last_action, self.policy.path(net), slot))
++    }
++
+     /// The loaded networks — what the tests inspect (the input each was fed).
+     #[cfg(test)]
+     pub fn policy(&self) -> &Policy {
+diff --git a/robotd/src/journal.rs b/robotd/src/journal.rs
+new file mode 100644
+index 0000000..ceceef5
+--- /dev/null
++++ b/robotd/src/journal.rs
+@@ -0,0 +1,121 @@
++//! The tick journal (duck-brain patch P13): `robotd --journal <file>` writes one JSON line per
++//! control tick — time, the policy's whole input row and its output, the targets, what the servos
++//! reported and what was sent to them — so a run on the robot can be fed back through the same
++//! network on a PC and compared bit for bit (`scripts/replay_journal.py` in duck-brain).
++//!
++//! Floats go out as the shortest decimal that reads back to the same `f64`; an `f32` is widened
++//! first, exactly, so reading a value back as `f64` and narrowing it gives the very bits the
++//! policy saw.
++//!
++//! Written from a thread of its own through a bounded queue: the control thread formats a line
++//! and hands it over, and never waits on a disk. A full queue drops the line and counts it; the
++//! count is written at the end, so a journal with holes says so.
++
++use std::io::Write;
++use std::path::Path;
++use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
++
++/// About ten seconds of ticks at 50 Hz.
++const QUEUE: usize = 512;
++
++pub struct Journal {
++    tx: Option<SyncSender<String>>,
++    thread: Option<std::thread::JoinHandle<std::io::Result<()>>>,
++    pub dropped: u64,
++    pub written: u64,
++}
++
++impl Journal {
++    /// Create `path` (truncating) and write `header` as its first line.
++    pub fn open(path: &Path, header: &serde_json::Value) -> std::io::Result<Self> {
++        let file = std::fs::File::create(path)?;
++        let mut out = std::io::BufWriter::with_capacity(1 << 16, file);
++        serde_json::to_writer(&mut out, header)?;
++        out.write_all(b"\n")?;
++        out.flush()?;
++        let (tx, rx) = sync_channel::<String>(QUEUE);
++        let thread = std::thread::Builder::new()
++            .name("journal".into())
++            .spawn(move || {
++                for (n, line) in rx.iter().enumerate() {
++                    out.write_all(line.as_bytes())?;
++                    out.write_all(b"\n")?;
++                    // Once a second, so a crash loses little and a reader can follow along.
++                    if n % 50 == 49 {
++                        out.flush()?;
++                    }
++                }
++                out.flush()
++            })?;
++        Ok(Self {
++            tx: Some(tx),
++            thread: Some(thread),
++            dropped: 0,
++            written: 0,
++        })
++    }
++
++    /// Queue one record; never blocks.
++    pub fn write(&mut self, record: &serde_json::Value) {
++        let Some(tx) = &self.tx else { return };
++        match tx.try_send(record.to_string()) {
++            Ok(()) => self.written += 1,
++            Err(TrySendError::Full(_)) => self.dropped += 1,
++            Err(TrySendError::Disconnected(_)) => {
++                tracing::error!("tick journal writer stopped; no more lines");
++                self.tx = None;
++            }
++        }
++    }
++}
++
++impl Drop for Journal {
++    fn drop(&mut self) {
++        if let Some(tx) = self.tx.take() {
++            let _ = tx.send(
++                serde_json::json!({ "end": { "written": self.written, "dropped": self.dropped } })
++                    .to_string(),
++            );
++        }
++        if let Some(thread) = self.thread.take() {
++            match thread.join() {
++                Ok(Ok(())) => tracing::info!(
++                    written = self.written,
++                    dropped = self.dropped,
++                    "tick journal closed"
++                ),
++                Ok(Err(e)) => tracing::error!(error = %e, "tick journal write failed"),
++                Err(_) => tracing::error!("tick journal writer panicked"),
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// A header, the records, and an end line with the counts; an f32 reads back to its bits.
++    #[test]
++    fn lines_round_trip_and_the_end_is_counted() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("j.jsonl");
++        let x: f32 = 0.1;
++        {
++            let mut j = Journal::open(&path, &serde_json::json!({ "journal": 1 })).unwrap();
++            j.write(&serde_json::json!({ "obs": [x, -1.0e-7f32, f32::MIN_POSITIVE] }));
++        }
++        let text = std::fs::read_to_string(&path).unwrap();
++        let lines: Vec<serde_json::Value> = text
++            .lines()
++            .map(|l| serde_json::from_str(l).unwrap())
++            .collect();
++        assert_eq!(lines.len(), 3);
++        let back = lines[1]["obs"][0].as_f64().unwrap() as f32;
++        assert_eq!(back.to_bits(), x.to_bits());
++        let tiny = lines[1]["obs"][2].as_f64().unwrap() as f32;
++        assert_eq!(tiny.to_bits(), f32::MIN_POSITIVE.to_bits());
++        assert_eq!(lines[2]["end"]["written"], 1);
++        assert_eq!(lines[2]["end"]["dropped"], 0);
++    }
++}
+diff --git a/robotd/src/main.rs b/robotd/src/main.rs
+index 84a1a8a..a2c341e 100644
+--- a/robotd/src/main.rs
++++ b/robotd/src/main.rs
+@@ -27,6 +27,8 @@ mod feetech_bus;
+ mod head_imu;
+ mod idle_head;
+ mod intents;
++/// duck-brain P13: the tick journal.
++mod journal;
+ mod leds;
+ mod params;
+ mod pickup;
+@@ -301,6 +303,13 @@ struct Args {
+     #[arg(long)]
+     static_imu: bool,
+ 
++    /// Write the tick journal to this file (duck-brain P13): one JSON line per control tick — the
++    /// policy's input and output, the targets, what the servos reported and were sent — for
++    /// replaying a run through the same network on a PC (`scripts/replay_journal.py`). About
++    /// 100 kB/s; for bench runs, not for every day.
++    #[arg(long)]
++    journal: Option<PathBuf>,
++
+     #[command(subcommand)]
+     command: Option<Command>,
+ }
+@@ -639,6 +648,8 @@ struct RobotState {
+     feetech: std::sync::OnceLock<Arc<duck_control::feetech::FeetechShared>>,
+     /// The host-read body IMU's hand-off, on a Feetech robot (duck-brain P11/P12).
+     host_imu: std::sync::OnceLock<Arc<duck_control::host_imu::ImuFeed>>,
++    /// Where the control loop writes its tick journal, when asked (`--journal`, duck-brain P13).
++    journal_path: std::sync::OnceLock<PathBuf>,
+     /// Why the policy is not loaded, if it is not. Set once at startup; the loop keeps
+     /// running and holds the pose, so a broken bundle is a rollback rather than a crash.
+     policy_error: ArcSwapOption<String>,
+@@ -785,6 +796,7 @@ impl RobotState {
+             board: params.board.version,
+             feetech: std::sync::OnceLock::new(),
+             host_imu: std::sync::OnceLock::new(),
++            journal_path: std::sync::OnceLock::new(),
+             policy_error: ArcSwapOption::empty(),
+             policy_change_error: ArcSwapOption::empty(),
+             policies: ArcSwap::from_pointee(PolicyNames::of(&params.policy.resolved())),
+@@ -1120,6 +1132,9 @@ async fn main() -> ExitCode {
+         (!args.fake && args.sim.is_none()).then(|| PathBuf::from(vetbook::DEFAULT_PATH))
+     });
+     state.vetbook = vetbook::Book::open(vetbook_path, env!("CARGO_PKG_VERSION"));
++    if let Some(path) = args.journal.clone() {
++        let _ = state.journal_path.set(path);
++    }
+     let state = Arc::new(state);
+ 
+     if args.unhealthy {
+@@ -2276,6 +2291,36 @@ async fn control_loop<T: RobotIo>(
+         "control loop running"
+     );
+ 
++    // The tick journal (duck-brain P13), when `--journal` asked for one.
++    let journal_started = Instant::now();
++    let mut journal_tick = 0u64;
++    let mut journal = state.journal_path.get().and_then(|path| {
++        let header = serde_json::json!({
++            "journal": 1,
++            "robotd": env!("CARGO_PKG_VERSION"),
++            "hz": 1.0 / period.as_secs_f64(),
++            "unix_s": std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .map_or(0.0, |d| d.as_secs_f64()),
++            "joints": duck_control::JOINT_NAMES,
++            "ids": duck_control::JOINT_IDS,
++            "bus": params.bus,
++            "feetech": params.feetech,
++            "body_imu": params.body_imu,
++            "policy": params.policy,
++        });
++        match journal::Journal::open(path, &header) {
++            Ok(j) => {
++                tracing::warn!(path = %path.display(), "writing the tick journal");
++                Some(j)
++            }
++            Err(e) => {
++                tracing::error!(error = %e, path = %path.display(), "cannot write the tick journal");
++                None
++            }
++        }
++    });
++
+     let mut ticker = tokio::time::interval(period);
+     // `Skip`, not `Burst` and not `Delay`.
+     //
+@@ -3674,6 +3719,8 @@ async fn control_loop<T: RobotIo>(
+             1.0
+         };
+ 
++        // What the policy was fed and gave, this tick — the journal's (P13).
++        let mut journal_policy: Option<serde_json::Value> = None;
+         let (mut targets, gain, moving, policy_label) = match (driving, sensors.as_ref()) {
+             // The limp-fall sequence, before anything else — `driving` is false throughout,
+             // so without this it would fall through to the hold branch and the robot would
+@@ -3733,13 +3780,27 @@ async fn control_loop<T: RobotIo>(
+                 // A `live` skill reads the client's twist as it came, unsmoothed (duck-brain P4).
+                 controller.set_live_twist(twist_target);
+                 match controller.step(sensors, &command, snapshot.pose.active, dt, scale_mult) {
+-                    Ok(step) => (
+-                        step.targets,
+-                        step.gain,
+-                        // A scripted move is motion whatever the twist says; so is walking.
+-                        step.busy || command.twist_magnitude() > 0.0,
+-                        step.label,
+-                    ),
++                    Ok(step) => {
++                        if journal.is_some() {
++                            journal_policy = controller.journal_view().map(|(input, action, file, slot)| {
++                                serde_json::json!({
++                                    "net": slot,
++                                    "file": file,
++                                    "obs": input,
++                                    "action": action,
++                                    "scale_mult": scale_mult,
++                                    "targets": step.targets,
++                                })
++                            });
++                        }
++                        (
++                            step.targets,
++                            step.gain,
++                            // A scripted move is motion whatever the twist says; so is walking.
++                            step.busy || command.twist_magnitude() > 0.0,
++                            step.label,
++                        )
++                    }
+                     Err(e) => {
+                         tracing::warn!(error = %e, "inference failed; holding");
+                         (hold, policy_cfg.gain, false, "held".into())
+@@ -3952,6 +4013,28 @@ async fn control_loop<T: RobotIo>(
+             Err(e) => tracing::warn!(error = %e, "bus write failed"),
+         }
+ 
++        if let Some(j) = journal.as_mut() {
++            journal_tick += 1;
++            let read = fresh.as_ref();
++            j.write(&serde_json::json!({
++                "tick": journal_tick,
++                "t_us": tick_start.duration_since(journal_started).as_micros() as u64,
++                "label": &*policy_label,
++                "policy": journal_policy.take(),
++                "targets": targets,
++                "gain": gain,
++                "fresh": read.is_some(),
++                "positions": read.map(|s| s.positions),
++                "velocities": read.map(|s| s.velocities),
++                "imu": read.map(|s| serde_json::json!({
++                    "gyro": s.imu.gyro,
++                    "gravity": s.imu.gravity,
++                    "quat": s.imu.quat,
++                })),
++                "bus": safety.journal(),
++            }));
++        }
++
+         vettally.tick(&vetbook::Facts {
+             dt,
+             torqued: bringup != Bringup::Limp && !powered_off,
+-- 
+2.43.0
+

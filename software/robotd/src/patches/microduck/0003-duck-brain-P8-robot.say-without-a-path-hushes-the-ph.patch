@@ -1,0 +1,180 @@
+From f7dcd95d6ba2606a1a86497adf75d8c3a3a37ce1 Mon Sep 17 00:00:00 2001
+From: duck-brain <duck-brain@localhost>
+Date: Tue, 6 Oct 2026 22:19:24 +0000
+Subject: [PATCH 3/4] duck-brain P8: robot.say without a path hushes the phrase
+ being played
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The assistant talks for seconds at a time (duck-brain design §22) and the
+person may speak over it: the brain asks robotd to stop the phrase. Only
+a robot.say phrase is stopped; a bank sound or the wheee ride is not the
+duck talking. Audio off refuses, as for a phrase.
+---
+ duck-ipc-proto/src/lib.rs |  3 ++-
+ robotd/src/intents.rs     | 24 +++++++++++++++++-------
+ robotd/src/main.rs        | 23 +++++++++++++++++++----
+ robotd/src/sound.rs       | 13 +++++++++++++
+ 4 files changed, 51 insertions(+), 12 deletions(-)
+
+diff --git a/duck-ipc-proto/src/lib.rs b/duck-ipc-proto/src/lib.rs
+index 2c4aa17..eb8021b 100644
+--- a/duck-ipc-proto/src/lib.rs
++++ b/duck-ipc-proto/src/lib.rs
+@@ -2395,7 +2395,8 @@ pub struct FlashlightParams {
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+ pub struct SayParams {
+-    /// The wav to play; must lie inside the robot's `[audio] say_dir`.
++    /// The wav to play; must lie inside the robot's `[audio] say_dir`. Empty: stop the phrase
++    /// being played (patch P8 — the person spoke over the duck).
+     pub path: String,
+ }
+ 
+diff --git a/robotd/src/intents.rs b/robotd/src/intents.rs
+index d4ae2ad..6af612d 100644
+--- a/robotd/src/intents.rs
++++ b/robotd/src/intents.rs
+@@ -203,9 +203,19 @@ pub struct Intents {
+     /// `robot.rebootMotors`, pending: the ids to reboot (empty = all). A mutex rather than an
+     /// atomic because it carries a list; the loop takes it with `try_lock`, so it can never wait.
+     reboot_motors: Mutex<Option<Vec<u8>>>,
+-    /// `robot.say`, pending: the wav to play (patch P7). The latest wins — a phrase that has
+-    /// not started yet when the next arrives is stale.
+-    say: Mutex<Option<std::path::PathBuf>>,
++    /// `robot.say`, pending: the wav to play (patch P7), or the phrase to cut short (P8). The
++    /// latest wins — a phrase that has not started yet when the next arrives is stale.
++    say: Mutex<Option<Say>>,
++}
++
++/// What `robot.say` asked the loop for (duck-brain patches P7, P8).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Say {
++    /// Play this wav (already checked by `dispatch`).
++    Play(std::path::PathBuf),
++    /// Stop the phrase being played — the person spoke over the duck (barge-in). A bank sound
++    /// playing is left alone.
++    Hush,
+ }
+ 
+ /// A pending policy change, as [`Intents::request_policy_change`] took it.
+@@ -498,15 +508,15 @@ impl Intents {
+         }
+     }
+ 
+-    /// Queue a phrase for the loop to play (`robot.say`, already checked by `dispatch`).
+-    pub fn request_say(&self, wav: std::path::PathBuf) {
++    /// Queue a phrase for the loop to play, or a hush (`robot.say`, already checked by `dispatch`).
++    pub fn request_say(&self, say: Say) {
+         if let Ok(mut slot) = self.say.lock() {
+-            *slot = Some(wav);
++            *slot = Some(say);
+         }
+     }
+ 
+     /// Take the pending phrase, if any. Never blocks, like [`Self::take_reboot_motors`].
+-    pub fn take_say(&self) -> Option<std::path::PathBuf> {
++    pub fn take_say(&self) -> Option<Say> {
+         self.say.try_lock().ok().and_then(|mut slot| slot.take())
+     }
+ 
+diff --git a/robotd/src/main.rs b/robotd/src/main.rs
+index 75eaaae..d6ad224 100644
+--- a/robotd/src/main.rs
++++ b/robotd/src/main.rs
+@@ -2632,8 +2632,10 @@ async fn control_loop<T: RobotIo>(
+             for tag in intents.take_sounds() {
+                 voice.play(tag.as_str(), false);
+             }
+-            if let Some(wav) = intents.take_say() {
+-                voice.play_file(&wav);
++            match intents.take_say() {
++                Some(intents::Say::Play(wav)) => voice.play_file(&wav),
++                Some(intents::Say::Hush) => voice.hush(),
++                None => {}
+             }
+ 
+             // Petting: coo, exactly when the prototype coos — not fallen, no scripted move
+@@ -5297,10 +5299,20 @@ fn dispatch(
+ 
+         // A phrase from duck-brain's duck-say (patch P7): only a wav inside `say_dir`, resolved —
+         // a client names a file, never a place, so `..` and links out of the folder are refused.
++        // An empty path is a hush (patch P8): stop the phrase being played.
++        proto::Call::RobotSay(p) if p.path.is_empty() => {
++            let result = if state.say_dir.is_some() {
++                intents.request_say(intents::Say::Hush);
++                proto::IntentResult::accepted()
++            } else {
++                proto::IntentResult::refused("this robot has no voice: audio is disabled".to_owned())
++            };
++            proto::Response::ok(Some(id), &result)
++        }
+         proto::Call::RobotSay(p) => {
+             let result = match say_file(state.say_dir.as_deref(), &p.path) {
+                 Ok(wav) => {
+-                    intents.request_say(wav);
++                    intents.request_say(intents::Say::Play(wav));
+                     proto::IntentResult::accepted()
+                 }
+                 Err(why) => proto::IntentResult::refused(why),
+@@ -6797,7 +6809,10 @@ mod tests {
+         }
+         assert!(intents.take_say().is_none(), "a refusal must not queue");
+         assert!(ask(&wav).accepted);
+-        assert_eq!(intents.take_say(), Some(wav.canonicalize().unwrap()));
++        assert_eq!(intents.take_say(), Some(intents::Say::Play(wav.canonicalize().unwrap())));
++        // P8: no path is a hush.
++        assert!(ask(std::path::Path::new("")).accepted);
++        assert_eq!(intents.take_say(), Some(intents::Say::Hush));
+ 
+         params.audio.enabled = false;
+         let mute = RobotState::new(&params, std::path::Path::new("/test/robotd.toml"), false, false);
+diff --git a/robotd/src/sound.rs b/robotd/src/sound.rs
+index 413dd97..4ae5a83 100644
+--- a/robotd/src/sound.rs
++++ b/robotd/src/sound.rs
+@@ -175,6 +175,8 @@ pub struct Sound {
+     bank: PathBuf,
+     device: String,
+     child: Option<Child>,
++    /// The child is a `robot.say` phrase (duck-brain P8): what a hush may stop.
++    phrase: bool,
+     /// The wheee rider loops while this is true. Shared with the writer thread; clearing
+     /// it *without* killing the child is what makes the end segment play.
+     wheee_held: Arc<AtomicBool>,
+@@ -202,6 +204,7 @@ impl Sound {
+             bank,
+             device,
+             child: None,
++            phrase: false,
+             wheee_held: Arc::new(AtomicBool::new(false)),
+             ride: Ride::Off,
+             warned_missing: false,
+@@ -243,6 +246,7 @@ impl Sound {
+         }
+         self.singing = None;
+         self.ride = Ride::Off;
++        self.phrase = false;
+         if let Some(mut child) = self.child.take()
+             && let Ok(None) = child.try_wait()
+         {
+@@ -315,6 +319,15 @@ impl Sound {
+         }
+         self.stop_child();
+         self.spawn_wav(wav, false, "say");
++        self.phrase = self.child.is_some();
++    }
++
++    /// Cut the phrase short (`robot.say` without a path, duck-brain P8): the person spoke over
++    /// the duck. Only a phrase — a bank sound or a ride is not the duck talking.
++    pub fn hush(&mut self) {
++        if self.phrase {
++            self.stop_child();
++        }
+     }
+ 
+     fn spawn_wav(&mut self, wav: &Path, blocking: bool, tag: &str) {
+-- 
+2.43.0
+

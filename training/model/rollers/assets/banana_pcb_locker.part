@@ -1,0 +1,13 @@
+{
+    "configuration": "default",
+    "documentId": "1d24afb7e30158ea0f2613bd",
+    "documentMicroversion": "0fbc24e130adbf33632d9822",
+    "elementId": "54e07ea32a4f81c59d7dfb93",
+    "fullConfiguration": "default",
+    "id": "MgubZPxoRCITQEKpa",
+    "isStandardContent": false,
+    "name": "banana_pcb_locker <5>",
+    "partId": "JFD",
+    "suppressed": false,
+    "type": "Part"
+}

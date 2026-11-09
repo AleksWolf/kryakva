@@ -1,0 +1,7 @@
+# robotd tick journal from RAM to SD, see duck-tickflush.py. Started by duck-tickflush.timer every 60 s.
+[Unit]
+Description=duck: tick journal RAM -> SD
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/bin/duck-tickflush.py

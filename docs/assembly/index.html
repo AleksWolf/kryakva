@@ -1,0 +1,576 @@
+<html lang="en">
+<meta charset="utf-8">
+<title>Microduck Assembly</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: workshop manual — sticky 3D bench on the left, step sheet on the right; stacks on phones */
+:root{
+  --bg:#f3f4f2; --panel:#ffffff; --ink:#1d2321; --muted:#5d6763; --line:#d7dcd9;
+  --accent:#e2731e; --accent-ink:#9a4708; --warn-bg:#fff3df; --warn-line:#e7b45c; --ok:#2f7d5b;
+  --viewer:#e6e9e7; --chip:#eef0ee;
+  --f-display:"Barlow Condensed","Arial Narrow",Arial,sans-serif;
+  --f-body:"IBM Plex Sans","Segoe UI",Roboto,Arial,sans-serif;
+  --f-mono:"IBM Plex Mono",Consolas,"Courier New",monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#151917; --panel:#1d2220; --ink:#e7ebe9; --muted:#9aa5a0; --line:#2f3633;
+  --accent:#f08a3a; --accent-ink:#f7b27a; --warn-bg:#2d2518; --warn-line:#8a6a2c; --ok:#5fbf92;
+  --viewer:#232927; --chip:#262d2a; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#151917; --panel:#1d2220; --ink:#e7ebe9; --muted:#9aa5a0; --line:#2f3633;
+  --accent:#f08a3a; --accent-ink:#f7b27a; --warn-bg:#2d2518; --warn-line:#8a6a2c; --ok:#5fbf92;
+  --viewer:#232927; --chip:#262d2a; color-scheme:dark}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{background:var(--bg);color:var(--ink);font-family:var(--f-body);font-size:15px;line-height:1.5}
+.wrap{max-width:1280px;margin:0 auto;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:20px 48px}
+h1,h2,h3{font-family:var(--f-display);font-weight:600;letter-spacing:.01em;text-wrap:balance;margin:0}
+h1{font-size:2.4rem;line-height:1.05}
+h2{font-size:1.6rem}
+h3{font-size:1.25rem}
+.lede{color:var(--muted);max-width:68ch;margin:.4rem 0 0}
+.mono{font-family:var(--f-mono)}
+header.top{display:flex;flex-wrap:wrap;gap:12px 24px;align-items:flex-end;justify-content:space-between;border-bottom:2px solid var(--ink);padding-bottom:12px}
+.meta{font-family:var(--f-mono);font-size:.78rem;color:var(--muted)}
+nav.phases{display:flex;flex-wrap:wrap;gap:6px;margin:16px 0}
+nav.phases button{font:600 1rem var(--f-display);letter-spacing:.03em;text-transform:uppercase;background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:6px 12px;cursor:pointer}
+nav.phases button[aria-current="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+nav.phases button:focus-visible,.stepnav button:focus-visible,.steplist button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.bench{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);gap:20px;align-items:start}
+@media (max-width:860px){.bench{grid-template-columns:minmax(0,1fr)}}
+.viewer{position:sticky;top:calc(env(safe-area-inset-top,0px) + 8px);background:var(--viewer);border:1px solid var(--line);border-radius:6px;overflow:hidden}
+@media (max-width:860px){.viewer{position:relative;top:0}}
+#gl{display:block;width:100%;aspect-ratio:4/3.2;max-width:100%;touch-action:none}
+.vbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between;padding:8px 10px;border-top:1px solid var(--line);background:var(--panel);font-size:.82rem}
+.legend{display:flex;gap:12px;flex-wrap:wrap;color:var(--muted)}
+.sw{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:-1px;margin-right:4px}
+.vbar button{font:500 .8rem var(--f-body);background:var(--chip);color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:4px 9px;cursor:pointer}
+#tip{position:absolute;pointer-events:none;background:var(--ink);color:var(--bg);font:500 .75rem var(--f-mono);padding:3px 6px;border-radius:3px;white-space:nowrap}
+.lab{position:absolute;left:0;top:0;pointer-events:none;transform:translate(-50%,-50%);background:var(--panel);color:var(--ink);border-left:5px solid;font:600 .8rem var(--f-body);padding:2px 7px;border-radius:3px;white-space:nowrap;box-shadow:0 1px 3px #0006}
+#loading{position:absolute;inset:0;display:grid;place-items:center;color:var(--muted);font-family:var(--f-mono);font-size:.85rem}
+.sheet{display:flex;flex-direction:column;gap:14px;min-width:0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:16px 18px}
+.stephead{display:flex;gap:14px;align-items:baseline}
+.stepno{font:700 2.6rem/1 var(--f-display);color:var(--accent)}
+.stepnav{display:flex;gap:8px;justify-content:space-between}
+.stepnav button{font:600 .95rem var(--f-display);letter-spacing:.03em;text-transform:uppercase;background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:8px 14px;cursor:pointer;flex:1}
+.stepnav button:disabled{opacity:.4;cursor:default}
+.body p{margin:.5rem 0;max-width:68ch}
+.body ol{margin:.5rem 0;padding-left:1.3rem}
+.body li{margin:.25rem 0}
+.side{font-size:.85rem;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.86rem}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font:600 .72rem var(--f-body);text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+td.n{font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+.tscroll{overflow-x:auto}
+.spec{font-family:var(--f-mono);font-weight:500;white-space:nowrap}
+.warn{background:var(--warn-bg);border:1px solid var(--warn-line);border-radius:5px;padding:9px 12px;font-size:.88rem}
+.warn b{color:var(--accent-ink)}
+.src{font-family:var(--f-mono);font-size:.72rem;color:var(--muted);word-break:break-all}
+.steplist{display:flex;flex-direction:column;gap:2px;max-height:none}
+.steplist button{display:flex;gap:10px;align-items:baseline;text-align:left;background:none;border:0;border-radius:4px;padding:5px 8px;color:var(--ink);font:400 .88rem var(--f-body);cursor:pointer}
+.steplist button span.k{font-family:var(--f-mono);color:var(--muted);min-width:2.2em}
+.steplist button[aria-current="true"]{background:var(--chip);font-weight:600}
+section.ref{margin-top:36px;display:flex;flex-direction:column;gap:16px}
+section.ref{display:none}body.tables section.ref{display:flex;margin-top:20px}body.tables .lcol{display:none}.pgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr));gap:16px;align-items:start}.pgrid .tscroll{margin-top:0}.pgrid.stack{grid-template-columns:minmax(0,1fr)}.lcol{display:flex;flex-direction:column;gap:20px;min-width:0}body.tables .bench{grid-template-columns:minmax(0,1fr)}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,380px),1fr));gap:16px}
+.q li{margin:.35rem 0}
+@media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
+</style>
+
+<div class="wrap">
+  <header class="top">
+    <div>
+      <h1>Microduck Assembly</h1>
+      <p class="lede">Step-by-step assembly of the duck on HD-1910 servos.</p>
+    </div>
+    
+  </header>
+
+  <nav class="phases" id="phases" aria-label="Assembly phases"></nav>
+
+  <div class="bench">
+    <div class="lcol">
+    <div class="viewer" id="viewer">
+      <canvas id="gl" aria-label="3D model of the step"></canvas>
+      <div id="loading">Loading model…</div>
+      <div id="labs"></div>
+      <div id="tip" hidden></div>
+      <div class="vbar">
+        <div class="legend"><span><i class="sw" style="background:var(--accent)"></i>placing now</span><span><i class="sw" style="background:#9aa3a0"></i>already assembled</span><span id="sclegend" style="display:contents"></span></div>
+        <div style="display:flex;gap:6px"><button id="replay" type="button">Replay</button><button id="fit" type="button">Fit</button><button id="ctx" type="button" aria-pressed="true">Context</button></div>
+      </div>
+    </div>
+
+    <div class="card" id="partscard" hidden></div>
+    </div>
+
+    <div class="sheet">
+      <div class="card" id="stepcard" aria-live="polite"></div>
+      <div class="card" id="imgcard" hidden></div>
+      <div class="stepnav"><button id="prev" type="button">← Back</button><button id="next" type="button">Next →</button></div>
+      <div class="card"><h3 id="phtitle">Phase steps</h3><div class="steplist" id="steplist"></div></div>
+    </div>
+  </div>
+
+  <section class="ref" id="ref">
+    <div class="grid2">
+      <div class="card"><h2>Fasteners for the whole duck</h2><p class="side">Sum over the steps; leg and roller steps are counted for both sides. Colour — as on the screws in the 3D scene.</p><div class="tscroll"><table id="fasttbl"></table></div></div>
+      <div class="card"><h2>Bearings and bought parts</h2><div class="tscroll"><table id="buytbl"></table></div></div>
+    </div>
+    <div class="grid2">
+      <div class="card"><h2>Servos: ID and location</h2><div class="tscroll"><table id="servotbl"></table></div><p class="side">Center 2048 — the horn is aligned with the calibration plate (hardware/servo_setup.md).</p></div>
+      <div class="card"><h2>Bus cables</h2><div class="tscroll"><table id="cabletbl"></table></div><p class="side">9 cables of 15 cm come from the servo boxes, the rest — per the purchase list (hardware/cables.md).</p></div>
+    </div>
+    <div class="card"><h2>Printed parts in the assembly</h2><div class="tscroll"><table id="printtbl"></table></div></div>
+  </section>
+</div>
+
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+<script type="module">
+import * as THREE from 'three';
+import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+
+/* ---------- parts (instance keys from main.step / roller.step) ---------- */
+const S={yawL:'hd1910_servo_simplified#13',yawR:'hd1910_servo_simplified#12',rollL:'hd1910_servo_simplified#14',rollR:'hd1910_servo_simplified#8',
+ pitchL:'hd1910_servo_simplified#5',pitchR:'hd1910_servo_simplified#15',kneeL:'hd1910_servo_simplified#7',kneeR:'hd1910_servo_simplified#2',
+ ankL:'hd1910_servo_simplified#9',ankR:'hd1910_servo_simplified#3',s069:'hd1910_servo_simplified#4',s049:'hd1910_servo_simplified#1',
+ s035:'hd1910_servo_simplified#10',s040:'hd1910_servo_simplified#6',s005:'hd1910_servo_simplified#11'};
+const B={yawL:'bearing_22x16x4_simplified#11',yawR:'bearing_22x16x4_simplified#8',rollL:'bearing_22x16x4_simplified#3',rollR:'bearing_22x16x4_simplified#4',
+ pitchL:'bearing_22x16x4_simplified#6',pitchR:'bearing_22x16x4_simplified#5',kneeL:'bearing_22x16x4_simplified#7',kneeR:'bearing_22x16x4_simplified#10',
+ b012:'bearing_22x16x4_simplified#1',b003:'bearing_22x16x4_simplified#2',b014:'bearing_22x16x4_simplified#9',
+ ankL:'bearing_15x10x3_simplified#3',ankR:'bearing_15x10x3_simplified#1',b050:'bearing_15x10x3_simplified#2'};
+const L={leg:'leg#1',axle:'ankle_axle#2',ankle:'ankle_left#1',foot:'foot_left#1',sole:'sole_left#1',upper:'upper_leg_left#1',plate:'rigidity_plate#2',
+ hip:'hip#2',y2r:'yaw2roll#2',broll:'bearing_roll#2'};
+const R={roller:'R:roller#1',rimA:'R:rim#2',rimB:'R:rim#3',tireA:'R:tire#4',tireB:'R:tire#1',bushA:'R:bushing#1',bushB:'R:bushing#4',
+ brg:['R:bearing_12x6x4_simplified#1','R:bearing_12x6x4_simplified#2','R:bearing_12x6x4_simplified#3','R:bearing_12x6x4_simplified#4']};
+const trunkCore=[S.yawL,S.yawR,'trunk_base#1','power_support#1','power_board_simplified#1','imu_lsm6dsv16x_module_simplified#1'];
+const neckSet=[S.s069,S.s049,'neck#1','neck#2'];
+const thighL=[S.pitchL,S.kneeL,L.upper,L.plate,B.kneeL];
+const shinL=[S.ankL,L.leg,L.ankle,L.axle,B.ankL,L.foot,L.sole];
+const legL=[...thighL,...shinL,L.hip,B.pitchL,B.rollL];
+const labThigh=[{k:S.pitchL,t:'Thigh: 22 (right leg 12)',c:'#2f7fc1'},{k:S.kneeL,t:'Knee: 23 (right leg 13)',c:'#2f9e6e'}];
+const headBase=['bottom_head_shell#1',S.s040,S.s005,B.b003,B.b014,B.b050];
+
+/* ---------- steps ---------- */
+/* f: fasteners {s:spec, k:kind, n:count per side/once, w:where}; x2: leg/roller step repeated for the right side */
+const PHASES=[
+{id:'prep',name:'Preparation',steps:[
+ {t:'What you need',tables:true,show:[],ctx:[],
+  p:['Fasteners for the whole duck, bearings and bought parts, servos, bus cables, Zero 3W pins and printed parts — in the tables below.'],
+  f:[]},
+ {t:'UC-01: soldering',img:[{t:'Headers on the UC-01',src:'img/uc01_plugs.png'}],buy:[['Right-angle pin header 2.54 mm',1],['AMP 2.0-3P header',2]],show:['uc01_simple#1'],ctx:[],
+  p:['On the UC-01, desolder the factory servo connectors and the straight pin header. Solder in a right-angle pin header and two AMP 2.0-3P headers with the open side of the header toward the near edge of the board.'],
+  f:[]},
+ {t:'Servos: ID, zero, rear horns',parts:[['Servo HD-1910',15],['UC-01',1],['calibration_plate',1]],show:[S.yawL],ctx:[],
+  p:['Set up each servo per hardware/servo_setup.md: ID, zero with the calibration plate cad/calibration_plate.step. New servos answer with ID 1 — connect them one at a time.',
+     'IDs. Left leg: 20 hip yaw, 21 hip roll, 22 hip pitch, 23 knee, 24 ankle. Right leg: 10, 11, 12, 13, 14 in the same order. Neck and head: 30 neck pitch, 31 head pitch, 32 head yaw, 33 head roll, 34 beak.',
+     'Label each servo with its ID.',
+     'Remove the rear passive horns from servos 10–14, 20–24, 32, 33 and 34. Keep the rear discs on servos 30 and 31: screws go into them.',
+     ],
+  f:[]},
+ {t:'Heat-set inserts: feet',show:['foot_left#1','foot_right#1'],ctx:[],ins:['toe'],insMirror:[['foot_left#1','foot_right#1']],
+  p:['Inserts are melted in before assembly, flush with the part face. Insert locations are marked with yellow cylinders in the scene.',
+     'Foot: 1 insert M2×4×Ø3 in the toe, on each foot.'],
+  f:[{s:'insert M2×4×Ø3',n:2,w:'foot toes'}]},
+ {t:'Heat-set inserts: top_head_shell',show:['top_head_shell#1'],ctx:[],ins:['headjoin','uc01'],
+  p:['top_head_shell: 3 inserts M2×4×Ø3 in the bosses and 2 in the UC-01 standoffs.'],
+  f:[{s:'insert M2×4×Ø3',n:5,w:'bosses 3, UC-01 standoffs 2'}]},
+ {t:'Heat-set inserts: face_part',show:['face_part#1'],ctx:[],ins:['zero','cam','tof'],
+  p:['face_part: 4 inserts M2×4×Ø3 for the Zero 3W standoffs, 4 inserts M2×3×Ø3.2 for the camera and 2 for the ToF.'],
+  f:[{s:'insert M2×4×Ø3',n:4,w:'Zero 3W standoffs'},{s:'insert M2×3×Ø3.2',n:6,w:'camera 4, ToF 2'}]},
+ {t:'Heat-set inserts: motor_support',show:['motor_support#1'],ctx:[],ins:['amp'],
+  p:['motor_support: 2 inserts M2×3×Ø3.2 for the amplifier.'],
+  f:[{s:'insert M2×3×Ø3.2',n:2,w:'amplifier'}]},
+ {t:'Heat-set inserts: right_shell',show:['right_shell#1'],ctx:[],ins:['shelljoin'],
+  p:['right_shell: 1 insert M2×3×Ø3.2 in the joint of the halves.'],
+  f:[{s:'insert M2×3×Ø3.2',n:1,w:'joint of the halves'}]},
+ {t:'Heat-set inserts: rollers',x2:true,show:['R:roller#1'],ctx:[],ins:['rtoe'],
+  p:['Roller: 1 insert M2×4×Ø3 in the toe, on each roller.'],
+  f:[{s:'insert M2×4×Ø3',n:1,w:'roller toe'}]},
+ {t:'Foot: sole',show:['sole_left#1','sole_right#1'],ctx:['foot_left#1','foot_right#1'],
+  p:['Fit the sole onto the foot.'],
+  f:[]},
+ {t:'PCB and battery contacts',buy:[['AMP 2.0-3P header',5],['NP-F battery contact (from a charger)',2],['Wire 16 (18) AWG, 5 cm',2],['Cable 9 cm with one connector',1]],img:[{t:'PCB header pinout',src:'img/pinout.png'},{t:'Headers on the PCB, front view',src:'img/pcb_3d.png'}],show:['power_board_simplified#1'],ctx:['power_support#1'],
+  p:['Solder 5 AMP 2.0-3P headers into the PCB with the open side toward the front of the duck. Header pinout — in the picture hardware/power_board/pinout.png.',
+     'Solder 16 (18) AWG wires to the two NP-F battery contacts and screw the contacts into power_support with self-tapping screws.',
+     'Take the 9 cm cable with one connector. Using the L PWR header, find with a continuity test which wires are V and G; cut S off. Solder V and G to the neck power pads; the connector will later go to servo 30.',
+     'Check with a multimeter against the diagram hardware/power_board/pinout.png: no short between BAT+ and BAT−; + and − on all connectors match the diagram; the signal contacts S are not shorted to ground or to +, and the signal has continuity between connectors.',
+     'Set the PCB aside for now: it goes in together with power_support on M2×8 screws in the “Trunk” phase.'],
+  f:[{s:'self-tapping screw Ø1.36×3.3',n:2,w:'battery contacts'}]},
+]},
+{id:'legs',name:'Legs',steps:[
+ {t:'Shin on the ankle servo',buy:[['Cable 15 cm',1],['Cable 20 cm',1]],show:[L.leg],ctx:[S.ankL],x2:true,sc:['legback'],
+  p:['The legs are assembled bottom to top. The scene shows the left leg (servos 24, 23, 22). The right leg (14, 13, 12) is the same, only the ankle and upper_leg are mirrored.',
+     'Connect two cables to the ankle servo (left leg 24, right 14): 15 cm and 20 cm.',
+     'Place the shin against the rear side of the ankle servo. The rear boss of the servo goes into the round hole of the shin.',
+     'Lay both wires in the gap between the shin and the servo cover and pull them out through the window in leg.',
+     'Fix the shin with 2 screws into the rear holes of the case.'],
+  f:[{s:'M2×8',n:2,w:'shin → rear wall of the ankle servo'}]},
+ {t:'Ankle: bearing',show:[B.ankL],ctx:[L.ankle],x2:true,
+  p:['Insert the 6700 10×15×3 bearing into the ankle seat from the outside.'],
+  f:[]},
+ {t:'Ankle on the ankle horn',show:[L.ankle,B.ankL],ctx:[S.ankL,L.leg],x2:true,sc:['ankhorn'],
+  p:['Connect the servo to the UC-01, set the center (2048) in the servo console and turn on torque.',
+     'Bring the servo with the shin (left leg 24, right 14) between the cheeks of the ankle: the horn toward the cheek with four holes, the rear boss toward the bearing.',
+     'Fix the ankle with 4 screws into the horn. After that the servo can be disconnected from the UC-01.'],
+  f:[{s:'M2×6',n:4,w:'ankle → ankle horn'}]},
+ {t:'Ankle axle',show:[L.axle],ctx:[L.ankle,B.ankL,S.ankL,L.leg],x2:true,sc:['axle'],
+  p:['Insert ankle_axle from the outside through the ankle bearing and the shin onto the rear boss of the servo (left leg 24, right 14).',
+     'Fix the axle with a self-tapping screw in the center into the rear boss of the servo.'],
+  f:[{s:'M2.3×6 self-tapping screw',n:1,w:'axle → rear boss of the servo'}]},
+ {t:'Foot on the ankle',show:[L.foot,L.sole],ctx:[L.ankle,B.ankL,S.ankL,L.leg,L.axle],x2:true,sc:['toe'],
+  p:['Hook the heel of the foot onto the ankle wedge, lower the toe by 5–10°, rotate it up into place and tighten the countersunk screw in the toe.'],
+  f:[{s:'M2×6 countersunk',n:1,w:'ankle toe → foot insert'}]},
+ {t:'Rigidity plate',buy:[['Cable 6 cm',1],['Cable 15 cm',1]],show:[S.pitchL,S.kneeL,L.plate],ctx:[],lab:labThigh,x2:true,sc:['plate'],
+  p:['Left leg: hip pitch servo 22 and knee servo 23. Right leg: hip pitch servo 12 and knee servo 13. Lay rigidity_plate on their top covers and fix it with 4 screws into the corner holes of the cases.',
+     'Connect servos 22 and 23 (on the right leg 12 and 13) with the 6 cm cable and route the wires.',
+     'Connect a new 15 cm cable to servo 22 (on the right leg 12).'],
+  f:[{s:'M2×6',n:4,w:'plate → top covers of the hip and knee servos'}]},
+ {t:'Shin on the knee',show:[...shinL,B.kneeL],ctx:[S.pitchL,S.kneeL,L.plate],lab:labThigh,x2:true,sc:['legknee'],
+  p:['Pass the 15 cm cable from the assembly of step {#Foot on the ankle} through the hole above the knee servo and connect it to the knee servo: on the left leg 23, on the right 13.',
+     'Fit the knee bearing MR2216-2RS 16×22×4 onto the knee boss of the assembled shin.',
+     'Connect servo 22 to the UC-01, set the center (2048) of servo 23 in the servo console and turn on its torque (on the right leg 12 and 13).',
+     'Bring the shin to the plate so that the outer ring of the bearing rests against the plate, and fix the shin with 4 screws into the knee servo horn: on the left leg 23, on the right 13.'],
+  f:[{s:'M2×6',n:4,w:'shin → knee horn'}]},
+ {t:'hip on the hip pitch',show:[L.hip,B.pitchL,B.rollL],ctx:[S.pitchL,S.kneeL,L.plate,B.kneeL,...shinL],lab:labThigh,x2:true,sc:['hippitch'],
+  p:['Press two MR2216-2RS 16×22×4 bearings into hip: hip pitch and roll.',
+     'Set the center (2048) of servo 22 in the servo console and turn on its torque (on the right leg 12).',
+     'Fix hip with 4 screws on the horn of the hip pitch servo: on the left leg 22, on the right 12. After that the leg can be disconnected from the UC-01.'],
+  f:[{s:'M2×6',n:4,w:'hip → pitch horn'}]},
+ {t:'Thigh: servos into upper_leg',buy:[['Nylon cable tie',1]],show:[L.upper],ctx:[S.pitchL,S.kneeL,L.plate,B.kneeL,...shinL,L.hip,B.pitchL,B.rollL],lab:labThigh,x2:true,sc:['upper'],
+  p:['Pull the wire from servo 22 into the hole above servo 23 (on the right leg 12 and 13).',
+     'Fix the 20 cm cable from servo 24 at the edge of the hole above servo 23 with a nylon cable tie (on the right leg 14 and 13).',
+     'Left leg: servos 22 and 23 with the plate into upper_leg_left. Right leg: servos 12 and 13 with the plate into upper_leg_right. Seat them with their rear sides on the pins and fix each with a self-tapping screw into the rear boss. The leg is done.'],
+  f:[{s:'M2.3×4 self-tapping screw',n:2,w:'upper_leg → rear bosses of the servos (do not use longer)'}]},
+]},
+{id:'trunk',name:'Trunk',steps:[
+ {t:'trunk_base on the yaw servos',show:['trunk_base#1'],ctx:[S.yawL,S.yawR],sc:['tbout'],
+  p:['Stand the yaw servos horns down: left 20, right 10.',
+     'Fit trunk_base on the pins and fix it with the outer screw from below into the top cover of each servo.',
+     'Leave the inner holes empty for now — they take the screws through the lower tabs of power_support.'],
+  f:[{s:'M2×4',n:2,w:'trunk_base → yaw servo, outer (do not use longer)'}]},
+ {t:'power_support and PCB',show:['power_support#1','power_board_simplified#1'],ctx:[S.yawL,S.yawR,'trunk_base#1'],sc:['tbin','psup'],
+  p:['Slide the lower tabs of power_support under the trunk_base plate and fix them with screws from below through trunk_base into the yaw servos.',
+     'Lay the PCB on the upper tabs and screw it together with the tabs into the rear covers of the yaw servos. Screw head — no larger than Ø3.8.',
+     'Solder the battery contact wires to BAT− (left) and BAT+ (right) of the PCB.'],
+  f:[{s:'M2×6',n:2,w:'trunk_base + lower tab → yaw servo'},{s:'M2×8',n:2,w:'PCB + upper tab → rear cover of the yaw servo'}]},
+ {t:'IMU on power_support',buy:[['Right-angle pin header 2.54 mm',1],['Dupont wire 30 cm',3],['Dupont wire 34 cm',1]],show:['imu_lsm6dsv16x_module_simplified#1'],ctx:['power_support#1','power_board_simplified#1','trunk_base#1',S.yawL,S.yawR],sc:['imu'],
+  p:['On the LSM6DSV16X module, set the jumpers AD0→GND and CS→VCC and solder in the right-angle pin header.',
+     'Connect 4 Dupont wires to the IMU pin header: VCC red, SDA blue, SCL green — 30 cm each, GND black — 34 cm.',
+     'Fix the module with 2 countersunk screws on power_support, as in the scene. Tighten until it sits flat, no harder.',
+     'Pass the IMU wires through the hole in trunk_base.'],
+  f:[{s:'M2.5×6 countersunk',n:2,w:'IMU → power_support'}]},
+ {t:'yaw2roll on the yaw horn',show:[L.y2r,B.yawL],ctx:[...trunkCore],x2:true,sc:['y2ryaw'],
+  p:['Fit an MR2216-2RS 16×22×4 bearing onto the yaw2roll boss.',
+     'Connect the yaw servo (left 20, right 10) to the UC-01, set the center (2048) in the servo console and turn on torque.',
+     'Fix yaw2roll on the yaw servo horn with 4 screws from the inside — while the roll servo is not in the way. After that the servo can be disconnected from the UC-01.'],
+  f:[{s:'M2×4',n:4,w:'yaw2roll → yaw horn (do not use longer)'}]},
+ {t:'Roll servo and bearing_roll',buy:[['Cable 15 cm',1]],show:[S.rollL,L.broll],ctx:[L.y2r,S.yawL,B.yawL],x2:true,sc:['y2rroll','brollservo','brolllug'],
+  p:['Insert the roll servo (left 21, right 11) with its rear boss into yaw2roll and fix it with 2 screws into the rear cover.',
+     'Place bearing_roll on the pins and fix it: 2 screws into the top cover of the roll servo, 2 into the lugs of yaw2roll.',
+     'Connect the yaw servo to the roll servo with a 15 cm cable: left 20 and 21, right 10 and 11.'],
+  f:[{s:'M2×4',n:2,w:'yaw2roll → rear cover of the roll servo'},{s:'M2×4',n:2,w:'bearing_roll → top cover of the roll servo'},{s:'M2×4',n:2,w:'bearing_roll → yaw2roll lugs (do not use longer)'}]},
+ {t:'Leg on the roll horn',show:[...legL],ctx:[...trunkCore,L.y2r,S.rollL,L.broll,B.yawL],x2:true,sc:['hiproll'],
+  p:['Connect the roll servo (left 21, right 11) to the UC-01, set the center (2048) in the servo console and turn on torque.',
+     'Fix the assembled leg: hip with 4 screws on the roll servo horn. After that the servo can be disconnected from the UC-01.',
+     'Connect the 15 cm cable from servo 22 to roll servo 21 (right 12 and 11).',
+     'Pass the 20 cm cable from the ankle through the hole in trunk_base and connect it to the PCB: the left leg to L PWR, the right leg to R PWR.'],
+  f:[{s:'M2×6',n:4,w:'hip → roll horn'}]},
+ {t:'Wires inside the trunk',buy:[['Cable 4 cm',2]],show:['power_board_simplified#1',S.yawL,S.yawR],ctx:[...trunkCore,L.y2r,S.rollL,L.broll,B.yawL,...legL],
+  p:['Connect to the PCB: L → left servo 20 (4 cm), R → right servo 10 (4 cm). Route the neck power cable up to servo 30.'],
+  f:[]},
+ {t:'Trunk shells',show:['left_shell#1','right_shell#1'],ctx:[...trunkCore,L.y2r,S.rollL,L.broll,B.yawL,...legL],sc:['shellyaw','shellyaw2','shelljoin'],
+  p:['Screw the bosses of the shells to the rear covers of the yaw servos — the screwdriver goes through the channel in the shell.',
+     'Pull the halves together with an M2×8 screw into the right_shell insert.'],
+  f:[{s:'M2×6',n:2,w:'shell bosses → yaw servos (do not use longer)'},{s:'M2×8',n:1,w:'joint of the halves, into the insert'}]},
+]},
+{id:'neck',name:'Neck',steps:[
+ {t:'Neck: servos 30 and 31 and neck plates',buy:[['Cable 4 cm',1]],show:['neck#1','neck#2'],ctx:[S.s069,S.s049],sc:['neck1','neck2'],
+  p:['Place servo 31 above servo 30 and join their cases with two neck plates, 4 screws per plate.',
+     'Connect servos 31 and 30 with the 4 cm cable.'],
+  f:[{s:'M2×6',n:8,w:'neck → cases of servos 30 and 31'}]},
+ {t:'neck_pitch on horn 32',show:['bearing_neck#1',B.b012,'neck_pitch#1'],ctx:[S.s035],sc:['np035'],
+  p:['Place bearing_neck on the top cover of servo 32; it sits on the pins.',
+     'Fit an MR2216-2RS 16×22×4 bearing onto the neck_pitch boss.',
+     'Connect servo 32 to the UC-01, set the center (2048) in the servo console and turn on torque.',
+     'Fix neck_pitch with 4 screws on the horn of servo 32, heads from below. Once servo 31 is installed, these screws cannot be reached. After that the servo can be disconnected from the UC-01.'],
+  f:[{s:'M2×6',n:4,w:'neck_pitch → horn 32'}]},
+ {t:'Neck assembly into neck_pitch',buy:[['Cable 15 cm',1]],show:[...neckSet],ctx:[S.s035,'bearing_neck#1',B.b012,'neck_pitch#1'],sc:['np049'],
+  p:['Connect servo 31 to the UC-01, set the center (2048) in the servo console and turn on torque.',
+     'Bring servo 31 of the neck assembly into the neck_pitch fork and fix it: 4 screws into the horn, 4 into the rear disc. After that the servo can be disconnected from the UC-01.',
+     'Connect servos 32 and 31 with the 15 cm cable.'],
+  f:[{s:'M2×6',n:8,w:'neck_pitch → horn and rear disc of 31'}]},
+]},
+{id:'head',name:'Head',steps:[
+ {t:'Servo 33 on yaw_roll_motion',show:['yaw_roll_motion#1',B.b003,B.b014],ctx:[S.s040],sc:['yrm040'],
+  p:['Fit an MR2216-2RS 16×22×4 bearing onto the horn of servo 33.',
+     'Connect servo 33 to the UC-01, set the center (2048) in the servo console and turn on torque.',
+     'Fix yaw_roll_motion with 4 screws on the horn of servo 33 — right away: after servo 32 they cannot be reached. After that the servo can be disconnected from the UC-01.',
+     'Fit the second MR2216-2RS 16×22×4 bearing onto the front shaft of yaw_roll_motion.'],
+  f:[{s:'M2×6',n:4,w:'yaw_roll_motion → horn 33 (do not use longer)'}]},
+ {t:'Neck assembly into yaw_roll_motion',show:[S.s035,'bearing_neck#1',B.b012,'neck_pitch#1',...neckSet],ctx:['yaw_roll_motion#1',S.s040,B.b003,B.b014],sc:['yrm035'],
+  p:['Insert servo 32 with neck_pitch and the neck into yaw_roll_motion from below and fix it with 4 screws from above into its rear cover.'],
+  f:[{s:'M2×6',n:4,w:'yaw_roll_motion → rear cover of 32'}]},
+ {t:'Everything into bottom_head',buy:[['Cable 15 cm',1]],show:['bottom_head_shell#1',B.b050,S.s005],ctx:['yaw_roll_motion#1',S.s040,B.b003,B.b014,S.s035,'bearing_neck#1',B.b012,'neck_pitch#1',...neckSet],
+  p:['Insert the 6700 10×15×3 jaw bearing into the bottom_head seat.',
+     'Lower the assembled unit into bottom_head from above: the neck goes through the opening in the floor, servo 33 lies in its cradle, the roll bearings go into their seats.',
+     'Lay servo 34 into its cradle last: before that it gets in the way of neck_pitch.',
+     'Servos 33 and 34 have no screws: motor_support will hold them down.',
+     'Connect a 15 cm cable to the lower connector of servo 34 — later it goes to the UC-01.'],
+  f:[]},
+ {t:'motor_support',buy:[['Cable 6 cm',1],['Cable 15 cm',1]],show:['motor_support#1'],ctx:[...headBase,'yaw_roll_motion#1',S.s035],sc:['ms'],
+  p:['Place motor_support with its flange on the bottom_head standoffs and drive 4 M2.5 screws from above.',
+     'Connect servos 33 and 32 with the 6 cm cable.',
+     'Connect servos 34 and 33 with the 15 cm cable.'],
+  f:[{s:'M2.5×6',n:4,w:'motor_support → bottom_head standoffs'}]},
+ {t:'Neck and head into the shells',show:[...neckSet,S.s035,'bearing_neck#1',B.b012,'neck_pitch#1','yaw_roll_motion#1',...headBase,'motor_support#1'],ctx:[...trunkCore,'left_shell#1','right_shell#1',L.y2r,S.rollL,L.broll,B.yawL,...legL],sc:['lshell','rshell'],
+  p:['Pass the neck with the head between the ears of the shells and connect the neck power cable to the free port of servo 30.',
+     'Connect servo 34 to the UC-01, set the center (2048) of servo 30 in the servo console and turn on its torque.',
+     'Fix the left_shell ear with 4 screws on the horn of servo 30, the right_shell ear — with 4 screws on the rear disc of servo 30.',
+     'Pass the IMU wires into the head.'],
+  f:[{s:'M2×6',n:4,w:'left_shell → horn of servo 30'},{s:'M2×6',n:4,w:'right_shell → rear disc of servo 30'}]},
+ {t:'Jaw',show:['jaw#1'],ctx:[...headBase,'motor_support#1'],sc:['jaw'],
+  p:['Set the center (2048) of servo 34 in the servo console and turn on torque.',
+     'Insert the jaw shaft into the 6700 10×15×3 bearing and fix jaw with 4 screws on the horn of servo 34. After that the UC-01 can be disconnected.'],
+  f:[{s:'M2×6',n:4,w:'jaw → horn 34'}]},
+ {t:'UC-01 under the top_head dome',buy:[['UBEC 5 V / 3 A',1],['Dupont wire',3],['Cable 25 cm',1]],show:['uc01_simple#1'],ctx:['top_head_shell#1'],sc:['uc01'],
+  p:['Set the level switch on the UC-01 to 3.3 V.',
+     'Connect three Dupont wires to pins R, T and G of the UC-01 pin header. Pin V stays free.',
+     'Clamp the UBEC input (+ and −) in the UC-01 power screw terminal (+ and −).',
+     'Turn top_head_shell dome down. Lay the UC-01 components up, servo ports toward the face, and fit the hole next to the screw terminal onto the pin of standoff 3.',
+     'Fix the UC-01 with 2 screws through the holes next to the servo ports into the inserts of standoffs 1 and 2.',
+     'Connect to the UC-01 the 15 cm cable from servo 34 (first port) and the 25 cm cable from the PCB (second port).'],
+  f:[{s:'M2×4',n:2,w:'UC-01 → top_head standoff inserts (head no larger than Ø3.8)'}]},
+ {t:'Face: ToF, microphone, camera, eye',buy:[['Dupont wire',4],['Wire 24 AWG',5]],show:['face_part#1','tof_vl53l8cx_board_simplified#1','mic_ics43434_round_simplified#1','camera_8m_219_simplified#1','noenoeil#1'],ctx:[],sc:['tof','cam'],
+  p:['On the ToF module, bridge SPI_I2C_N, NCS and GND with a jumper.',
+     'Solder wires to the ToF: VIN red, SCL green, SDA blue, GND — to the common ground.',
+     'Fix the ToF with 2 screws into the face_part inserts.',
+     'On the microphone module, bridge L/R and GND with a jumper.',
+     'Solder wires to the microphone: SCK purple, WS orange, VDD red, SD grey, GND black.',
+     'Insert the microphone under the tabs with hooks.',
+     'Fix the camera with 4 screws into the face_part inserts, ribbon cable to the left. The ribbon cable is the standard one from the camera kit.',
+     'Insert the noenoeil eye with its three teeth into the slots of the face.'],
+  f:[{s:'M2×4',n:2,w:'ToF → inserts'},{s:'M2×4',n:4,w:'camera → inserts'}]},
+ {t:'Face: Zero 3W with heatsink, amplifier, speaker',img:[{t:'Wiring diagram',src:'img/wiring.png'}],buy:[['Radxa Heatsink 5519A',1],['Dupont wire',6]],show:['radxa_zero_3w_simplified#1','zero clamp#1','max98357a_module_simplified#1','speaker_2535_simplified#1'],ctx:['face_part#1','tof_vl53l8cx_board_simplified#1','mic_ics43434_round_simplified#1','camera_8m_219_simplified#1','noenoeil#1'],sc:['zero','amp'],
+  p:['Connect the camera ribbon cable to the Zero 3W.',
+     'Lay the heatsink with its thermal pad on the Zero 3W.',
+     'Place the Zero 3W on the face_part standoffs, and on top of it the zero clamp, legs to the board. The cut-off leg goes in the corner between the heatsink and the end of the pin header farther from the antenna.',
+     'Drive 4 screws through the clamp and the board into the standoff inserts.',
+     'Solder the speaker wires to the amplifier board.',
+     'Connect wires to the amplifier pin header: VIN red, BCLK purple, LRC orange, DIN brown, SD grey, GND — to the common ground.',
+     'Do the wiring per the wiring diagram hardware/wiring.png.',
+     'Fix the MAX98357A amplifier with 2 screws into the inserts, pin header toward the face — the pin header hangs over the front edge of motor_support.',
+     'Lay the 3525 speaker on top of motor_support, on the pad above servo 33. It has no screws: top_head covers it from above.'],
+  f:[{s:'M2×12',n:4,w:'zero clamp and Zero 3W → inserts (head up to Ø3.8)'},{s:'M2×4',n:2,w:'amplifier → inserts (do not use longer)'}]},
+ {t:'Close the head',buy:[['Dupont wire',3]],show:['jaw_soft#1','soft_mouth_top#1','top_head_shell#1','uc01_simple#1','face_part#1','camera_8m_219_simplified#1','tof_vl53l8cx_board_simplified#1','radxa_zero_3w_simplified#1','zero clamp#1','mic_ics43434_round_simplified#1','noenoeil#1'],ctx:[...headBase,'motor_support#1','jaw#1','yaw_roll_motion#1',S.s035,'neck_pitch#1'],sc:['headjoin'],
+  p:['Route the 25 cm cable through the slot in the bottom_head rib (rear left corner).',
+     'Put the face in place. It has no screws — top_head and bottom_head clamp it.',
+     'Fit top_head_shell with the UC-01 and fix it with 3 screws from below through bottom_head into the inserts.',
+     'Stick on the soft inserts jaw_soft and soft_mouth_top with paper-backed double-sided tape.'],
+  f:[{s:'M2×6',n:3,w:'bottom_head → top_head inserts'},{s:'paper-backed double-sided tape',n:1,w:'soft inserts'}]},
+]},
+{id:'finish',name:'Battery',steps:[
+ {t:'Battery NP-F550',show:['np-f550#1'],ctx:[...trunkCore,'left_shell#1','right_shell#1'],
+  p:['Place the battery on the latch and teeth of power_support, contacts to contacts. The duck is done.'],
+  f:[]},
+]},
+{id:'rollers',name:'Rollers',steps:[
+ {t:'Wheel: rim, tire, bearings',units:2,show:[R.rimA,R.tireA,R.rimB,R.tireB,...R.brg],ctx:[],x2:true,
+  p:['The rim and the tire are best printed as one part. If they are printed separately, stretch the TPU tire onto the rim.','Insert 2 MR126ZZ 6×12×4 bearings into the rim.','Assemble 4 wheels, 2 per roller.'],
+  f:[]},
+ {t:'Wheels into the roller',show:[R.rimA,R.tireA,R.rimB,R.tireB,R.bushA,R.bushB,...R.brg],ctx:[R.roller],x2:true,sc:['raxle'],
+  p:['Insert the bushing into the wheel bearings.',
+     'Place the wheel between the cheeks of the roller so that the bushing lines up with the axle holes.',
+     'Insert an M2.5×14 screw from the side of the head recess through the cheek and the bushing and screw it into the opposite cheek. Tighten until the cheeks press against the bushing; the wheel must spin freely.',
+     'Install the second wheel the same way. The rollers are identical, there is no left or right.'],
+  f:[{s:'M2.5×14',n:2,w:'wheel axle'}]},
+ {t:'Roller instead of the foot',asm:['Wheels into the roller','Ankle axle'],show:[R.roller,R.rimA,R.tireA,R.rimB,R.tireB,R.bushA,R.bushB,...R.brg],ctx:[L.ankle,S.ankL,L.leg,L.axle],x2:true,sc:['rtoe'],
+  p:['Unscrew the toe screw and remove the foot.','Install the roller the same way as the foot: heel onto the wedge, toe down by 5–10°, rotate it up and tighten the same screw into the roller insert.'],
+  f:[]},
+]},
+];
+
+const SCSPEC={rtoe:'M2×6 countersunk',raxle:'M2.5×14',toe:'M2×6 countersunk',ankhorn:'M2×6',axle:'M2.3×6 self-tapping screw',legback:'M2×8',legknee:'M2×6',upper:'M2.3×4 self-tapping screw',plate:'M2×6',hippitch:'M2×6',hiproll:'M2×6',brollservo:'M2×4',brolllug:'M2×4',y2ryaw:'M2×4',y2rroll:'M2×4',tbout:'M2×4',tbin:'M2×6',psup:'M2×8',imu:'M2.5×6 countersunk',lshell:'M2×6',rshell:'M2×6',shellyaw:'M2×6',shellyaw2:'M2×6',shelljoin:'M2×8',neck1:'M2×6',neck2:'M2×6',np035:'M2×6',np049:'M2×6',yrm035:'M2×6',yrm040:'M2×6',ms:'M2.5×6',amp:'M2×4',uc01:'M2×4',jaw:'M2×6',cam:'M2×4',tof:'M2×4',zero:'M2×12',headjoin:'M2×6'};
+const SCCOL={'insert M2×4×Ø3':'#e8b923','insert M2×3×Ø3.2':'#b98cf0','M2×12':'#6b8e23','M2×4':'#2f8fd8','M2×5':'#22a466','M2×6':'#e0b414','M2×8':'#c93d93','M2×6 countersunk':'#7d5ce0','M2.5×6':'#17b5b5','M2.5×6 countersunk':'#d4552a','M2.5×14':'#5b6bd6','M2.3×4 self-tapping screw':'#9b6b3f','M2.3×6 self-tapping screw':'#e04848'};
+const TPU=new Set(['sole_left#1','sole_right#1','jaw_soft#1','soft_mouth_top#1','R:tire#1','R:tire#2','R:tire#3','R:tire#4']);
+
+const SERVOS=[['left 20, right 10','hip yaw','horn down in trunk_base'],['left 21, right 11','hip roll','in yaw2roll'],['left 22, right 12','hip pitch','in upper_leg'],['left 23, right 13','knee','in upper_leg'],['left 24, right 14','ankle','in the ankle'],['30','neck pitch','in the shells'],['31','head pitch','above 30, neck plates'],['32','head yaw','in yaw_roll_motion'],['33','head roll','in bottom_head'],['34','beak','in bottom_head']];
+const PINS=[['1','3.3 V','IMU VCC (red)'],['2','5 V','amplifier VIN (red)'],['3','SDA (I²C3)','IMU SDA (blue)'],['4','5 V','UBEC +5 (red)'],['5','SCL (I²C3)','IMU SCL (green)'],
+ ['6','GND','UBEC − (black)'],['8','TX (UART2)','UC-01 R (yellow)'],['10','RX (UART2)','UC-01 T (white)'],['12','BCLK (I²S3)','amplifier BCLK (purple)'],['13','GPIO3_A2','amplifier SD (grey)'],['14','GND','common ground (black)'],
+ ['17','3.3 V','ToF VIN (red); microphone VDD — from the ToF VIN pad'],['29','SCL (I²C5)','ToF SCL (green)'],['31','SDA (I²C5)','ToF SDA (blue)'],['35','LRCK (I²S3)','amplifier LRC (orange)'],
+ ['38','SDI (I²S3)','microphone SD (grey)'],['40','SDO (I²S3)','amplifier DIN (brown)']];
+const CABLES=[['PCB L → left 20, PCB R → right 10','4 cm'],['left 20 → 21, right 10 → 11','15 cm'],['left 21 → 22, right 11 → 12','15 cm'],['left 22 → 23, right 12 → 13','6 cm'],['left 23 → 24, right 13 → 14','15 cm'],['PCB L PWR → free port of left 24, R PWR → right 14','20 cm'],['UC-01 → 34','15 cm'],['34 → 33','15 cm'],['33 → 32','6 cm'],['32 → 31','15 cm'],['31 → 30','4 cm'],['UC-01, second port → PCB','25 cm'],['neck power: PCB pads (soldered) → free port of 30, with one connector','9 cm']];
+const BUY=[['Bearing MR2216-2RS 16×22×4','11','8 in the legs, 3 in the head'],['Bearing 6700 10×15×3','3','ankles 2, jaw 1'],['Bearing MR126ZZ 6×12×4','8','rollers'],['Battery ZITAY NP-F550C','1',''],['PCB','1','hardware/power_board'],['Bus cables AMP 2.0-3P','19','9 from the servo boxes, 10 per hardware/cables.md'],['Nylon cable tie, the shortest','2','20 cm cables in the legs']];
+
+
+/* ---------- UI ---------- */
+let ph=0, st=0;
+const $=id=>document.getElementById(id);
+function flat(){const a=[];PHASES.forEach((p,i)=>p.steps.forEach((s,j)=>a.push([i,j])));return a}
+const ALL=flat();
+function stepNo(i,j){return ALL.findIndex(([a,b])=>a===i&&b===j)+1}
+function sw(spec){const c=SCCOL[spec];return c?`<i class="sw" style="background:${c}"></i>`:''}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function renderPhases(){$('phases').innerHTML=PHASES.map((p,i)=>`<button type="button" data-p="${i}" aria-current="${i===ph}">${esc(p.name)}</button>`).join('');
+ $('phases').querySelectorAll('button').forEach(b=>b.onclick=()=>go(+b.dataset.p,0));}
+function renderList(){const p=PHASES[ph];$('phtitle').textContent=p.name+': steps';
+ $('steplist').innerHTML=p.steps.map((s,j)=>`<button type="button" data-s="${j}" aria-current="${j===st}"><span class="k">${stepNo(ph,j)}</span><span>${esc(s.t)}</span></button>`).join('');
+ $('steplist').querySelectorAll('button').forEach(b=>b.onclick=()=>go(ph,+b.dataset.s));}
+const PNAME={hd1910_servo:'Servo HD-1910',bearing_22x16x4:'Bearing MR2216-2RS 16×22×4',bearing_15x10x3:'Bearing 6700 10×15×3',bearing_12x6x4:'Bearing MR126ZZ 6×12×4',
+ power_board:'PCB',imu_lsm6dsv16x_module:'IMU LSM6DSV16X',max98357a_module:'Amplifier MAX98357A',speaker_2535:'Speaker 3525',camera_8m_219:'Camera Radxa 8M 219',
+ tof_vl53l8cx_board:'ToF VL53L8CX',radxa_zero_3w:'Radxa Zero 3W',mic_ics43434_round:'Microphone ICS-43434',uc01_simple:'UC-01','np-f550':'Battery NP-F550'};
+const pname=(k,x2)=>{const b=k.replace(/^R:/,'').replace(/#\d+$/,'').replace(/_simplified$/,'');let nm=PNAME[b]||b;if(x2&&!PNAME[b])nm=nm.replace(/_left$/,'_left / '+nm.replace(/_left$/,'_right'));return nm};
+// parts of a step: parts that appear for the first time, bought items not in the model (buy), and what was assembled
+// earlier as "assembly from step N" (a single earlier part keeps its name)
+const stepAt=k=>PHASES[ALL[k][0]].steps[ALL[k][1]];
+const asmOf=q=>[...new Set([...(q.show||[]),...(q.ctx||[])])];
+const brk=q=>{const a=asmOf(q);return !q.x2&&a.length>1&&a.some(x=>!/_(left|right)#/.test(x))};
+const cx2Memo={};function cumX2(k){if(k in cx2Memo)return cx2Memo[k];const own=new Set(asmOf(stepAt(k)));let ok=!!stepAt(k).x2;
+ for(let i=0;i<k&&ok;i++){const q=stepAt(i);if(q.tables||q.parts)continue;if(asmOf(q).some(x=>own.has(x))&&(q.x2?!cumX2(i):brk(q)))ok=false}return cx2Memo[k]=ok}
+const cumMemo={};function cumOf(k){if(cumMemo[k])return cumMemo[k];const own=new Set(asmOf(stepAt(k)));const c=new Set(own);
+ for(let i=0;i<k;i++){const q=stepAt(i);if(q.tables||q.parts)continue;if(asmOf(q).some(x=>own.has(x)))cumOf(i).forEach(x=>c.add(x))}return cumMemo[k]=c}
+function partsTable(s){if(s.tables)return '';const rows=[];const add=(nm,n,x2)=>{const r=rows.find(r=>r[0]===nm&&r[2]===x2);if(r)r[1]+=n;else rows.push([nm,n,x2])};
+ const addP=(k,x2)=>{const nm=pname(k,false);if(x2&&/_left$/.test(nm)){add(nm,1,false);add(nm.replace(/_left$/,'_right'),1,false)}else add(nm,1,x2)};
+ const j=ALL.findIndex(([a,b])=>PHASES[a].steps[b]===s);const seen=new Set();
+ for(let k=0;k<j;k++){const q=stepAt(k);if(q.tables||q.parts)continue;asmOf(q).forEach(x=>seen.add(x))}
+ const here=asmOf(s);
+ if(s.parts)s.parts.forEach(([k,n])=>add(k,n,false));else here.filter(x=>!seen.has(x)).forEach(x=>addP(x,!!s.x2));
+ (s.buy||[]).forEach(([k,n])=>add(k,n,!!s.x2));
+ if(s.asm){s.asm.forEach(tt=>{const k=ALL.findIndex(([a,b])=>PHASES[a].steps[b].t===tt);if(k>=0)add(`Assembly from step ${k+1}`,stepAt(k).units||1,!!s.x2)});
+  return rows.length?`<div class="tscroll"><table><tr><th>Parts</th><th>Qty</th></tr>${rows.map(([k,v,x2])=>`<tr><td class="spec">${esc(k)}</td><td class="n">${v*(x2?2:1)}</td></tr>`).join('')}</table></div>`:''}
+ const left=new Set(here.filter(x=>seen.has(x)));
+ while(left.size){let best=-1,bn=0;
+  for(let k=j-1;k>=0;k--){const q=stepAt(k);if(q.tables||q.parts)continue;if(asmOf(q).some(x=>left.has(x))){best=k;break}}
+  if(best<0)break;{const cb=cumOf(best);for(let k=j-1;k>best;k--){const q2=stepAt(k);if(q2.tables||q2.parts)continue;const ck=cumOf(k);if([...cb].every(x=>ck.has(x))){best=k;break}}}
+  const q=stepAt(best);const set=asmOf(q);cumOf(best).forEach(x=>left.delete(x));
+  const one=set.length===1;const x2=!!(s.x2&&(one||cumX2(best)||(!q.x2&&!brk(q))));add(`Assembly from step ${best+1}`,q.units||1,x2)}
+ left.forEach(x=>addP(x,!!s.x2));
+ if(!rows.length)return '';
+ return `<div class="tscroll"><table><tr><th>Parts</th><th>Qty</th></tr>${rows.map(([k,v,x2])=>`<tr><td class="spec">${esc(k)}</td><td class="n">${v*(x2?2:1)}</td></tr>`).join('')}</table></div>`}
+// {#Step title} in a step text becomes that step's current number
+function stepRefs(x){return x.replace(/\{#([^}]+)\}/g,(m,tt)=>{const k=ALL.findIndex(([a,b])=>PHASES[a].steps[b].t===tt);return k<0?m:String(k+1)})}
+function renderCard(){const s=PHASES[ph].steps[st];const n=stepNo(ph,st);
+ const pt=partsTable(s);
+ const ft=s.f.length?`<div class="tscroll"><table><tr><th>Fasteners</th><th>Qty</th><th>Where</th></tr>${s.f.map(f=>`<tr><td class="spec">${sw(f.s)}${esc(f.s)}</td><td class="n">${f.n*(s.x2?2:1)}</td><td>${esc(f.w)}</td></tr>`).join('')}</table></div>`:'';
+ $('imgcard').innerHTML=(s.img||[]).map(im=>`<h3>${esc(im.t)}</h3><a href="${im.src}" target="_blank"><img src="${im.src}" alt="${esc(im.t)}" style="width:100%;display:block;border-radius:6px;margin-bottom:12px"></a>`).join('');$('imgcard').hidden=!s.img;
+ const longNames=[...(s.parts||[]),...(s.buy||[])].some(([k])=>k.length>26)||(s.f||[]).some(f=>f.w.length>30||f.s.length>20)||(s.show||[]).some(k=>pname(k,s.x2).length>26);
+ $('partscard').innerHTML=`<div class="pgrid${longNames?' stack':''}">${pt?`<div>${pt}</div>`:''}${ft?`<div>${ft}</div>`:''}</div>`;$('partscard').hidden=!(pt||ft);
+ $('stepcard').innerHTML=`<div class="stephead"><span class="stepno">${n}</span><div><div class="meta">${esc(PHASES[ph].name)} · step ${st+1} of ${PHASES[ph].steps.length}${s.x2?' · both sides':''}</div><h2>${esc(s.t)}</h2></div></div>
+ <div class="body">${s.p.map(t=>`<p>${esc(stepRefs(t))}</p>`).join('')}</div>${s.pins?`<div class="tscroll"><table><tr><th>Pin</th><th>Signal</th><th>Where</th></tr>${PINS.map(r=>`<tr><td class="n">${r[0]}</td><td class="spec">${esc(r[1])}</td><td>${esc(r[2])}</td></tr>`).join('')}</table></div>`:''}${s.warn?`<div class="warn" style="margin-top:10px"><b>Check:</b> ${esc(s.warn)}</div>`:''}`;
+ $('prev').disabled=n===1;$('next').disabled=n===ALL.length;}
+function go(i,j){ph=i;st=j;const s=PHASES[i].steps[j];document.body.classList.toggle('tables',!!s.tables);renderPhases();renderList();renderCard();if(!s.tables)show(s);try{localStorage.setItem('duckstep',JSON.stringify([i,j]))}catch(e){}}
+$('prev').onclick=()=>{const k=stepNo(ph,st)-2;if(k>=0)go(...ALL[k])};
+$('next').onclick=()=>{const k=stepNo(ph,st);if(k<ALL.length)go(...ALL[k])};
+
+/* reference tables */
+(function(){const tot={};PHASES.forEach(p=>p.steps.forEach(s=>s.f.forEach(f=>{const m=(s.x2?2:1);const key=f.s;(tot[key]=tot[key]||{n:0,w:[]}).n+=f.n*m;tot[key].w.push(f.w+(m>1?' (×2)':''))})));
+ const rows=Object.entries(tot).sort((a,b)=>a[0].localeCompare(b[0],'ru'));
+ $('fasttbl').innerHTML='<tr><th>Item</th><th>Total</th></tr>'+rows.map(([k,v])=>`<tr><td class="spec">${sw(k)}${esc(k)}</td><td class="n">${v.n}</td></tr>`).join('');
+ $('buytbl').innerHTML='<tr><th>Item</th><th>Qty</th><th></th></tr>'+BUY.map(r=>`<tr><td>${esc(r[0])}</td><td class="n">${r[1]}</td><td class="side">${esc(r[2])}</td></tr>`).join('');
+ $('servotbl').innerHTML='<tr><th>ID</th><th>Joint</th><th>Location</th></tr>'+SERVOS.map(r=>`<tr><td class="spec">${r[0]}</td><td>${esc(r[1])}</td><td class="side">${esc(r[2])}</td></tr>`).join('');
+  $('cabletbl').innerHTML='<tr><th>From → to</th><th>Cable</th></tr>'+CABLES.map(r=>`<tr><td>${esc(r[0])}</td><td class="n">${r[1]}</td></tr>`).join('');
+ const PRINT=[['trunk_base','1',''],['power_support','1',''],['left_shell / right_shell','1 + 1',''],['neck','2',''],['yaw2roll','2',''],['bearing_roll','2',''],['hip','2','one part for both legs'],['upper_leg_left / right','1 + 1','right is a mirror'],['rigidity_plate','2','one for both legs'],['leg','2','one for both legs'],['ankle_left / right','1 + 1','right is a mirror'],['ankle_axle','2',''],['foot_left / right','1 + 1',''],['sole_left / right','1 + 1','TPU'],['neck_pitch','1',''],['bearing_neck','1',''],['yaw_roll_motion','1',''],['bottom_head_shell','1',''],['motor_support','1',''],['top_head_shell','1',''],['face_part','1',''],['zero clamp','1','Zero 3W heatsink clamp'],['noenoeil','1',''],['jaw','1',''],['jaw_soft, soft_mouth_top','1 + 1','TPU'],['roller','2','rollers, one part for both legs'],['rim','4','rollers'],['tire','4','rollers, TPU'],['bushing','4','rollers']];
+ $('printtbl').innerHTML='<tr><th>Part (name in STEP)</th><th>Qty</th><th></th></tr>'+PRINT.map(r=>`<tr><td class="spec">${esc(r[0])}</td><td class="n">${r[1]}</td><td class="side">${esc(r[2])}</td></tr>`).join('');
+})();
+
+/* ---------- 3D ---------- */
+const canvas=$('gl');
+const renderer=new THREE.WebGLRenderer({canvas,antialias:true,alpha:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+const scene=new THREE.Scene();
+const cam=new THREE.PerspectiveCamera(35,1,1,5000);
+const controls=new OrbitControls(cam,canvas);controls.enableDamping=true;
+scene.add(new THREE.HemisphereLight(0xffffff,0x8a8f8c,1.6));
+const dl=new THREE.DirectionalLight(0xffffff,1.6);dl.position.set(1,2,1.5);scene.add(dl);
+const root=new THREE.Group();root.rotation.x=-Math.PI/2;scene.add(root);
+const css=getComputedStyle(document.documentElement);
+const ACC=new THREE.Color(css.getPropertyValue('--accent').trim()||'#e2731e');
+const mNew=new THREE.MeshStandardMaterial({color:ACC,roughness:.55,metalness:.05,flatShading:true});
+const mCtx=new THREE.MeshStandardMaterial({color:0x9aa3a0,roughness:.8,transparent:true,opacity:.55,depthWrite:false,flatShading:true});
+const mServoNew=new THREE.MeshStandardMaterial({color:0xc75a10,roughness:.5,flatShading:true});
+const mTpu=new THREE.MeshStandardMaterial({color:0x48535c,roughness:.9,flatShading:true});
+const scMats={};function scMat(spec){return scMats[spec]||(scMats[spec]=new THREE.MeshStandardMaterial({color:new THREE.Color(SCCOL[spec]||'#ffffff'),roughness:.35,metalness:.6,flatShading:true}))}
+const labMats={};function labMat(c){return labMats[c]||(labMats[c]=new THREE.MeshStandardMaterial({color:new THREE.Color(c),roughness:.5,flatShading:true}))}
+let labs=[];
+const byKey=new Map();
+const san=k=>k.replace(/[\[\]\.:\/]/g,'').replace(/\s/g,'_');
+let cur=null, anim=null, ctxOn=true;
+function size(){const w=canvas.clientWidth,h=canvas.clientHeight;renderer.setSize(w,h,false);cam.aspect=w/h;cam.updateProjectionMatrix()}
+new ResizeObserver(size).observe(canvas);
+const onModel=g=>{
+  g.scene.traverse(o=>{if(o.isMesh||o.isGroup||o.isObject3D){const k=o.userData&&o.userData.name?o.userData.name:o.name;if(k&&!byKey.has(san(k))&&(o.isMesh||o.children.some(c=>c.isMesh)))byKey.set(san(k),o)}});
+  root.add(g.scene);g.scene.traverse(o=>{if(o.isMesh){o.visible=false;if(!o.geometry.attributes.normal)o.geometry.computeVertexNormals()}});
+  $('loading').hidden=true;size();
+  let start=[0,0];try{const v=JSON.parse(localStorage.getItem('duckstep'));if(v&&PHASES[v[0]]&&PHASES[v[0]].steps[v[1]])start=v}catch(e){}
+  go(...start);
+};
+const failModel=()=>{$('loading').textContent='Failed to load the model (duck.glb)'};
+fetch('duck.glb').then(r=>{if(!r.ok)throw 0;return r.arrayBuffer()}).then(b=>new GLTFLoader().parse(b,'',onModel,failModel)).catch(failModel);
+function meshesOf(k){const o=byKey.get(san(k));if(!o)return[];const a=[];o.traverse(c=>{if(c.isMesh)a.push(c)});return a}
+const INSDIM={toe:[3,4],rtoe:[3,4],headjoin:[3,4],uc01:[3,4],zero:[3,4],cam:[3.2,3],tof:[3.2,3],amp:[3.2,3],shelljoin:[3.2,3]};
+const insG=new THREE.Group();const insGeo=new THREE.CylinderGeometry(1,1,1,20);
+const insMats={};const insMat=sp=>insMats[sp]||(insMats[sp]=new THREE.MeshBasicMaterial({color:new THREE.Color(SCCOL[sp]),depthTest:false,transparent:true,opacity:0.9}));
+let insAdded=false;
+function show(s){if(!insAdded){scene.add(insG);insAdded=true}if(!byKey.size||s.tables)return;cur=s;
+  byKey.forEach(o=>o.traverse(c=>{if(c.isMesh){c.visible=false;c.position.copy(c.userData.home||c.position)}}));
+  const box=new THREE.Box3();const ctxBox=new THREE.Box3();
+  const newM=[];s.show.forEach(k=>meshesOf(k).forEach(m=>{if(!m.userData.home)m.userData.home=m.position.clone();m.visible=true;m.material=TPU.has(k)?mTpu:(k.startsWith('hd1910')?mServoNew:mNew);newM.push(m);m.updateWorldMatrix(true,false);box.expandByObject(m)}));
+  if(ctxOn)s.ctx.filter(k=>!s.show.includes(k)).forEach(k=>meshesOf(k).forEach(m=>{if(!m.userData.home)m.userData.home=m.position.clone();m.visible=true;m.material=mCtx;m.updateWorldMatrix(true,false);ctxBox.expandByObject(m)}));
+  // labelled parts: own colour + a tag that follows the camera
+  $('labs').innerHTML='';labs=[];
+  (s.lab||[]).forEach(l=>{const ms=meshesOf(l.k).filter(m=>m.visible);if(!ms.length)return;const b=new THREE.Box3();
+    ms.forEach(m=>{m.material=labMat(l.c);m.updateWorldMatrix(true,false);b.expandByObject(m)});
+    const el=document.createElement('div');el.className='lab';el.style.borderColor=l.c;el.textContent=l.t;el.hidden=true;$('labs').append(el);
+    labs.push({el,p:b.getCenter(new THREE.Vector3())})});
+  const used=new Set();
+  byKey.forEach((o,k)=>{if(!k.startsWith('SCREW|'))return;const j=k.split('|')[1];if(!(s.sc||[]).includes(j))return;const spec=SCSPEC[j];used.add(spec);
+    o.traverse(c=>{if(c.isMesh){if(!c.userData.home)c.userData.home=c.position.clone();c.visible=true;c.material=scMat(spec);newM.push(c)}})});
+  // inserts: a cylinder of the insert's size (Ø × length, mm) at the screw tip, inside the shown part; seen through the part
+  insG.clear();const insUsed=new Set();const partC=box.getCenter(new THREE.Vector3());
+  byKey.forEach((o,k)=>{if(!k.startsWith('SCREW|'))return;const jn=k.split('|')[1];if(!(s.ins||[]).includes(jn))return;
+    const bb=new THREE.Box3();o.traverse(c=>{if(c.isMesh){c.updateWorldMatrix(true,false);bb.expandByObject(c)}});if(bb.isEmpty())return;
+    const sz=bb.getSize(new THREE.Vector3()),ctr=bb.getCenter(new THREE.Vector3());const ax=sz.x>=sz.y&&sz.x>=sz.z?'x':(sz.y>=sz.z?'y':'z');
+    const mm=sz[ax]/parseFloat(SCSPEC[jn].split('×')[1]);const [d,len]=INSDIM[jn];
+    const dir=new THREE.Vector3();dir[ax]=1;const a=ctr.clone().addScaledVector(dir,sz[ax]/2),b2=ctr.clone().addScaledVector(dir,-sz[ax]/2);
+    const tip=a.distanceTo(partC)<b2.distanceTo(partC)?a:b2;const back=ctr.clone().sub(tip).normalize();
+    const isp=d===3?'insert M2×4×Ø3':'insert M2×3×Ø3.2';insUsed.add(isp);const cyl=new THREE.Mesh(insGeo,insMat(isp));cyl.renderOrder=10;cyl.position.copy(tip).addScaledVector(back,len*mm/2);cyl.scale.set(d*mm/2,len*mm,d*mm/2);
+    if(ax==='x')cyl.rotation.z=Math.PI/2;else if(ax==='z')cyl.rotation.x=Math.PI/2;insG.add(cyl)});
+  // mirrored part with no screws in the scene (right foot): copy the marker across, mirrored on the side axis
+  (s.insMirror||[]).forEach(([kl,kr])=>{const bl=new THREE.Box3(),br=new THREE.Box3();meshesOf(kl).forEach(m=>bl.expandByObject(m));meshesOf(kr).forEach(m=>br.expandByObject(m));
+    if(bl.isEmpty()||br.isEmpty())return;const cl=bl.getCenter(new THREE.Vector3()),cr=br.getCenter(new THREE.Vector3()),d=cr.clone().sub(cl);
+    const sa=Math.abs(d.x)>=Math.abs(d.y)&&Math.abs(d.x)>=Math.abs(d.z)?'x':(Math.abs(d.y)>=Math.abs(d.z)?'y':'z');
+    [...insG.children].filter(c=>bl.containsPoint(c.position)).forEach(c=>{const m=c.clone();const off=c.position.clone().sub(cl);off[sa]=-off[sa];m.position.copy(cr).add(off);insG.add(m)})});
+  $('sclegend').innerHTML=[...used].map(sp=>`<span>${sw(sp)}${esc(sp)}</span>`).join('')+[...insUsed].map(sp=>`<span>${sw(sp)}${esc(sp)}</span>`).join('');
+  const all=box.clone();if(!ctxBox.isEmpty())all.union(ctxBox);
+  fit(all);
+  // fly-in: away from the context centre (or from above), in world space
+  const c=box.getCenter(new THREE.Vector3());const from=ctxBox.isEmpty()?new THREE.Vector3(0,1,0):c.clone().sub(ctxBox.getCenter(new THREE.Vector3()));
+  if(from.length()<1e-3)from.set(0,1,0);from.normalize();const dist=all.getSize(new THREE.Vector3()).length()*0.35;
+  const off=new THREE.Vector3().copy(from).multiplyScalar(dist);
+  const inv=new THREE.Matrix4();
+  newM.forEach(m=>{inv.copy(m.parent.matrixWorld).invert();m.userData.off=off.clone().applyMatrix3(new THREE.Matrix3().setFromMatrix4(inv))});
+  const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
+  anim={t0:performance.now(),dur:reduce?0:900,meshes:newM};
+}
+function fit(b){if(b.isEmpty())return;const c=b.getCenter(new THREE.Vector3());const r=b.getSize(new THREE.Vector3()).length()/2;
+  const d=r/Math.sin(THREE.MathUtils.degToRad(cam.fov/2))*1.05;const dir=new THREE.Vector3(1.1,0.7,1.25).normalize();
+  cam.position.copy(c).addScaledVector(dir,d);cam.near=d/100;cam.far=d*10;cam.updateProjectionMatrix();controls.target.copy(c);controls.update();}
+$('fit').onclick=()=>{if(cur)show(cur)};$('replay').onclick=()=>{if(cur)show(cur)};
+$('ctx').onclick=()=>{ctxOn=!ctxOn;$('ctx').setAttribute('aria-pressed',ctxOn);if(cur)show(cur)};
+const ray=new THREE.Raycaster(),mp=new THREE.Vector2();
+canvas.addEventListener('pointermove',e=>{const r=canvas.getBoundingClientRect();mp.set((e.clientX-r.left)/r.width*2-1,-(e.clientY-r.top)/r.height*2+1);ray.setFromCamera(mp,cam);
+  const hit=ray.intersectObject(root,true).find(h=>h.object.visible);const tip=$('tip');
+  if(hit){let o=hit.object,name='';while(o&&o!==root){const k=o.userData&&o.userData.name||o.name;if(k&&byKey.get(san(k))===o){name=k;break}o=o.parent}
+    tip.textContent=(name||hit.object.name).replace(/^R:/,'').replace(/_simplified/,'');tip.hidden=false;tip.style.left=(e.clientX-r.left+12)+'px';tip.style.top=(e.clientY-r.top+12)+'px'}else tip.hidden=true});
+canvas.addEventListener('pointerleave',()=>$('tip').hidden=true);
+(function loop(t){requestAnimationFrame(loop);
+  if(anim){const k=anim.dur?Math.min(1,(t-anim.t0)/anim.dur):1;const e=1-Math.pow(1-k,3);
+    anim.meshes.forEach(m=>{m.position.copy(m.userData.home).addScaledVector(m.userData.off,1-e)});if(k>=1)anim=null}
+  controls.update();renderer.render(scene,cam);
+  labs.forEach(l=>{const v=l.p.clone().project(cam);l.el.hidden=!!anim||v.z>1;l.el.style.left=(v.x+1)/2*canvas.clientWidth+'px';l.el.style.top=(1-v.y)/2*canvas.clientHeight+'px'})})(0);
+</script>

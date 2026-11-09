@@ -1,0 +1,311 @@
+From 0135e7a732cbbef2a5d1b9f3e219518a4678c0c9 Mon Sep 17 00:00:00 2001
+From: duck-brain <duck-brain@localhost>
+Date: Wed, 4 Nov 2026 20:04:28 +0000
+Subject: [PATCH] duck-brain P21: a volume for the duck, and the vet book once
+ a minute again
+
+Alex's answers of 05.11.2026:
+- [audio] volume, 0-1, linear (default 1): every sample robotd writes is
+  multiplied by it - the fed wavs (bank sounds, robot.say phrases), the
+  wheee segments, the theremin and the chorale. The duck's MAX98357A has
+  no volume of its own. A wav that is not 16-bit PCM still goes to aplay
+  as a file, unscaled.
+- The vet book is saved once a minute again (P14 had made it five), on a
+  clean stop as before, and also right before robotd powers the board
+  off (low battery, robot.shutdown), in case the stop that follows does
+  not get to it.
+---
+ robotd-params/src/lib.rs      |  4 ++
+ robotd-params/src/registry.rs |  5 ++
+ robotd/src/main.rs            | 27 +++++++----
+ robotd/src/sound.rs           | 88 +++++++++++++++++++++++++++++++++--
+ robotd/src/vetbook.rs         |  9 ++--
+ 5 files changed, 115 insertions(+), 18 deletions(-)
+
+diff --git a/robotd-params/src/lib.rs b/robotd-params/src/lib.rs
+index 42ee98f..c081a47 100644
+--- a/robotd-params/src/lib.rs
++++ b/robotd-params/src/lib.rs
+@@ -1115,6 +1115,9 @@ pub struct AudioParams {
+     /// The only folder `robot.say` plays from (duck-brain patch P7): its `duck-say` writes the
+     /// phrases there. A client may name a file, never a place.
+     pub say_dir: PathBuf,
++    /// Playback volume, 0–1, linear (duck-brain P21): every sample robotd writes is multiplied
++    /// by it — the duck's MAX98357A has no volume of its own. 0.5 is −6 dB.
++    pub volume: f64,
+ }
+ 
+ impl Default for AudioParams {
+@@ -1132,6 +1135,7 @@ impl Default for AudioParams {
+             pet_enter_threshold: 0.95,
+             pet_exit_threshold: 0.85,
+             say_dir: PathBuf::from("/run/duck-say"),
++            volume: 1.0,
+         }
+     }
+ }
+diff --git a/robotd-params/src/registry.rs b/robotd-params/src/registry.rs
+index 1fdd6f0..882ebad 100644
+--- a/robotd-params/src/registry.rs
++++ b/robotd-params/src/registry.rs
+@@ -505,6 +505,11 @@ pub const REGISTRY: &[Entry] = &[
+         Kind::Float,
+         "…and ends below this one (hysteresis)",
+     ),
++    entry(
++        "audio.volume",
++        Kind::Float,
++        "Playback volume, 0–1, linear — the amplifier has none (duck-brain P21)",
++    ),
+     // ── [media] ──────────────────────────────────────────────────────────────
+     feature(
+         "media.source",
+diff --git a/robotd/src/main.rs b/robotd/src/main.rs
+index 62b97e1..6cf4872 100644
+--- a/robotd/src/main.rs
++++ b/robotd/src/main.rs
+@@ -1184,13 +1184,18 @@ async fn main() -> ExitCode {
+     }
+ 
+     // The real thing. `setsid` detaches the command from this process's cgroup, so the
+-    // poweroff proceeds while systemd is busy killing robotd itself.
+-    let poweroff: PowerOff = Arc::new(|| {
+-        let result = std::process::Command::new("setsid")
+-            .args(["sh", "-c", "systemctl poweroff"])
+-            .spawn();
+-        if let Err(e) = result {
+-            tracing::error!(error = %e, "cannot power off");
++    // poweroff proceeds while systemd is busy killing robotd itself. The vet book is saved first
++    // (duck-brain P21): the stop that follows saves it again, unless systemd runs out of patience.
++    let poweroff: PowerOff = Arc::new({
++        let state = Arc::clone(&state);
++        move || {
++            state.vetbook.save();
++            let result = std::process::Command::new("setsid")
++                .args(["sh", "-c", "systemctl poweroff"])
++                .spawn();
++            if let Err(e) = result {
++                tracing::error!(error = %e, "cannot power off");
++            }
+         }
+     });
+ 
+@@ -1448,7 +1453,8 @@ impl WaitingVoice {
+         let audio = params.audio.resolve_devices(&robotd_params::alsa_card_ids(
+             &std::fs::read_to_string("/proc/asound/cards").unwrap_or_default(),
+         ));
+-        let mut voice = sound::Sound::new(params.audio.bank.clone(), audio.playback);
++        let mut voice = sound::Sound::new(params.audio.bank.clone(), audio.playback)
++            .with_volume(params.audio.volume);
+         let stop = Arc::new(AtomicBool::new(false));
+         let stopped = Arc::clone(&stop);
+         let thread = std::thread::Builder::new()
+@@ -2452,7 +2458,10 @@ async fn control_loop<T: RobotIo>(
+     let mut voice = params
+         .audio
+         .enabled
+-        .then(|| sound::Sound::new(params.audio.bank.clone(), audio.playback.clone()));
++        .then(|| {
++            sound::Sound::new(params.audio.bank.clone(), audio.playback.clone())
++                .with_volume(params.audio.volume)
++        });
+     let pet: Option<pet_detect::worker::PetHandle> = if params.audio.enabled
+         && params.audio.pet_detect_resolved(params.policy.mode)
+         && let Some(model) = params.audio.pet_model_resolved()
+diff --git a/robotd/src/sound.rs b/robotd/src/sound.rs
+index be28f40..f2660dc 100644
+--- a/robotd/src/sound.rs
++++ b/robotd/src/sound.rs
+@@ -174,6 +174,8 @@ impl Live {
+ pub struct Sound {
+     bank: PathBuf,
+     device: String,
++    /// `[audio] volume` (duck-brain P21): every sample this player writes is multiplied by it.
++    volume: f32,
+     child: Option<Child>,
+     /// Set to fade out the wav the child is playing, when it is one fed by [`feed_wav`]
+     /// (duck-brain P20): cutting it then means fading, not killing.
+@@ -208,6 +210,7 @@ impl Sound {
+         Self {
+             bank,
+             device,
++            volume: 1.0,
+             child: None,
+             fade: None,
+             draining: Vec::new(),
+@@ -221,6 +224,17 @@ impl Sound {
+         }
+     }
+ 
++    /// Play everything at `volume` (`[audio] volume`, 0–1, linear; clamped). The duck's
++    /// MAX98357A has no volume of its own, so this is the only one (duck-brain P21).
++    pub fn with_volume(mut self, volume: f64) -> Self {
++        self.volume = if volume.is_finite() {
++            volume.clamp(0.0, 1.0) as f32
++        } else {
++            1.0
++        };
++        self
++    }
++
+     /// Random wav from the bank's `tag` directory — the prototype's nanos-based pick, which
+     /// is exactly as random as a duck needs.
+     fn pick(&mut self, tag: &str) -> Option<PathBuf> {
+@@ -369,7 +383,8 @@ impl Sound {
+     /// and ending in zeros, faded when cut. Anything else goes to `aplay` as a file, as before.
+     fn spawn_wav(&mut self, wav: &Path, blocking: bool, tag: &str) {
+         self.reap_draining();
+-        if let Some(pcm) = read_wav16(wav) {
++        if let Some(mut pcm) = read_wav16(wav) {
++            scale_samples(&mut pcm.samples, self.volume);
+             let child = Command::new("aplay")
+                 .args(["-q", "-D", &self.device, "-t", "raw", "-f", "S16_LE"])
+                 .args(["-r", &pcm.rate.to_string(), "-c", &pcm.channels.to_string()])
+@@ -467,6 +482,7 @@ impl Sound {
+         // instrument every time, which is the one kind of variety a duck does not want.
+         let mut stream = Stream::wheee(&personality, 0);
+ 
++        let volume = self.volume;
+         let spawned = std::thread::Builder::new()
+             .name("theremin".into())
+             .spawn(move || {
+@@ -492,7 +508,7 @@ impl Sound {
+                     stream.block(&mut block);
+                     bytes.clear();
+                     for sample in &block {
+-                        let scaled = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
++                        let scaled = (sample * volume * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                         bytes.extend_from_slice(&scaled.to_le_bytes());
+                     }
+ 
+@@ -566,6 +582,7 @@ impl Sound {
+         // here, it is absent, so the note is carried by harmonics the driver can actually make.
+         voice.set_speaker_rolloff(Some(SPEAKER_ROLLOFF_HZ));
+ 
++        let volume = self.volume;
+         let spawned = std::thread::Builder::new()
+             .name("chorale".into())
+             .spawn(move || {
+@@ -614,7 +631,7 @@ impl Sound {
+                     voice.block(&mut block);
+                     bytes.clear();
+                     for sample in &block {
+-                        let scaled = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
++                        let scaled = (sample * volume * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                         bytes.extend_from_slice(&scaled.to_le_bytes());
+                     }
+                     let ahead = sent as f64 / bytes_per_sec - t0.elapsed().as_secs_f64();
+@@ -825,12 +842,15 @@ impl Sound {
+             .unwrap_or(0);
+         let letter = letters.swap_remove(nanos % letters.len());
+         let seg = |name: &str| read_wav_pcm(&dir.join(format!("wheee_{name}_{letter}.wav")));
+-        let (Some((rate, start_pcm)), Some((_, loop_pcm)), Some((_, end_pcm))) =
++        let (Some((rate, mut start_pcm)), Some((_, mut loop_pcm)), Some((_, mut end_pcm))) =
+             (seg("start"), seg("loop"), seg("end"))
+         else {
+             self.degraded_wheee();
+             return;
+         };
++        for pcm in [&mut start_pcm, &mut loop_pcm, &mut end_pcm] {
++            scale_bytes(pcm, self.volume);
++        }
+         let child = Command::new("aplay")
+             .args([
+                 "-q",
+@@ -993,6 +1013,25 @@ fn read_wav16(path: &Path) -> Option<Wav16> {
+     None
+ }
+ 
++/// Samples times `volume` (P21); 1 leaves them as they are.
++fn scale_samples(samples: &mut [i16], volume: f32) {
++    if volume < 1.0 {
++        for s in samples {
++            *s = (f32::from(*s) * volume).round() as i16;
++        }
++    }
++}
++
++/// The same on raw S16LE bytes (the wheee segments).
++fn scale_bytes(pcm: &mut [u8], volume: f32) {
++    if volume < 1.0 {
++        for c in pcm.chunks_exact_mut(2) {
++            let s = (f32::from(i16::from_le_bytes([c[0], c[1]])) * volume).round() as i16;
++            c.copy_from_slice(&s.to_le_bytes());
++        }
++    }
++}
++
+ /// `d` of `wav`, in interleaved samples.
+ fn samples_in(wav: &Wav16, d: Duration) -> usize {
+     (d.as_secs_f64() * f64::from(wav.rate)).round() as usize * usize::from(wav.channels)
+@@ -1153,6 +1192,47 @@ mod tests {
+         assert!(cut[70..].iter().all(|&s| s == 0));
+     }
+ 
++    /// `[audio] volume` (P21): samples and raw bytes scaled alike, clamped to 0–1, 1 untouched.
++    #[test]
++    fn the_volume_scales_every_sample() {
++        let mut s = vec![10_000i16, -10_000, 32_767];
++        scale_samples(&mut s, 0.5);
++        assert_eq!(s, [5_000, -5_000, 16_384]);
++        let mut b: Vec<u8> = [10_000i16, -32_768]
++            .iter()
++            .flat_map(|x| x.to_le_bytes())
++            .collect();
++        scale_bytes(&mut b, 0.25);
++        assert_eq!(
++            b,
++            [2_500i16, -8_192]
++                .iter()
++                .flat_map(|x| x.to_le_bytes())
++                .collect::<Vec<_>>()
++        );
++        let mut same = vec![1i16, -1];
++        scale_samples(&mut same, 1.0);
++        assert_eq!(same, [1, -1]);
++        let bank = PathBuf::from("/nonexistent");
++        assert_eq!(Sound::new(bank.clone(), "null".into()).volume, 1.0);
++        assert_eq!(
++            Sound::new(bank.clone(), "null".into())
++                .with_volume(2.0)
++                .volume,
++            1.0
++        );
++        assert_eq!(
++            Sound::new(bank.clone(), "null".into())
++                .with_volume(-1.0)
++                .volume,
++            0.0
++        );
++        assert_eq!(
++            Sound::new(bank, "null".into()).with_volume(f64::NAN).volume,
++            1.0
++        );
++    }
++
+     /// A missing bank must degrade to silence, not errors — robots without a codec walk on.
+     #[test]
+     fn a_missing_bank_is_silent_not_fatal() {
+diff --git a/robotd/src/vetbook.rs b/robotd/src/vetbook.rs
+index 7fc3f7b..9e7b6ee 100644
+--- a/robotd/src/vetbook.rs
++++ b/robotd/src/vetbook.rs
+@@ -30,11 +30,10 @@ pub const DEFAULT_PATH: &str = "/var/lib/robot/vetbook.json";
+ /// How often the loop reads the servos' latched alerts — see [`Tracker::alerts`].
+ pub const ALERT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+ 
+-/// How often the book is written to disk. Five minutes in the duck-brain build (P14), not one: the
+-/// book is also written when robotd stops — a shutdown, a low-battery power-off — so only a power
+-/// cut loses anything, and then at most five minutes of counting, against an SD card written once
+-/// a minute for the life of the robot.
+-pub const SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
++/// How often the book is written to disk. Once a minute again (duck-brain P21, Alex 05.11; P14 had
++/// made it five): the book is also written when robotd stops and right before a low-battery
++/// power-off, so a power cut loses at most a minute of counting.
++pub const SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+ 
+ /// A first reading this far above the last saved one means the pack was charged in between. The
+ /// smoothed voltage of a resting pack recovers by a few tenths after a walk; a charge moves it by
+-- 
+2.43.0
+

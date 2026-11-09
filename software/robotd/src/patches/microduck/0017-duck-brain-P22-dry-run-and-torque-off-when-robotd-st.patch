@@ -1,0 +1,580 @@
+From c0bc281bcf20533ee65e46d962f22483b0acfc19 Mon Sep 17 00:00:00 2001
+From: duck-brain <duck-brain@localhost>
+Date: Sat, 7 Nov 2026 22:56:56 +0000
+Subject: [PATCH] duck-brain P22: --dry-run, and torque off when robotd stops
+ or the bus goes silent
+
+Alex's answers of 07.11.2026, before the first stand-up on the duck:
+- robotd --dry-run (Feetech only, needs --journal): the servos and the
+  IMU are read, the loop, the ramp and the policy run, the targets go to
+  the tick journal - and nothing is written to the bus: no torque, no
+  goal, no P/D. robot.health -> feetech.dry_run.
+- Stopping takes torque off every servo: the Feetech driver's Drop runs
+  at the end of the loop (Ctrl+C, SIGTERM) and while a panic unwinds;
+  only when this run switched torque on, never in a dry run.
+- A bus where no servo answers for 5 ticks with torque on: three
+  unverified writes of 40 = 0, health degraded (feetech.silent_cutoff);
+  once servos answer again the cut is repeated, verified, for those that
+  heard none of it. Back with robot.relax, then init, as after the
+  undervoltage cutoff.
+---
+ duck-control/src/feetech.rs | 285 +++++++++++++++++++++++++++++++++++-
+ duck-ipc-proto/src/lib.rs   |   7 +
+ robotd/src/feetech_bus.rs   |  15 +-
+ robotd/src/main.rs          |  26 +++-
+ 4 files changed, 323 insertions(+), 10 deletions(-)
+
+diff --git a/duck-control/src/feetech.rs b/duck-control/src/feetech.rs
+index 55f795a..4be25c7 100644
+--- a/duck-control/src/feetech.rs
++++ b/duck-control/src/feetech.rs
+@@ -74,8 +74,16 @@ pub struct FeetechConfig {
+     /// battery and the low-battery power-off), because register 62 reads low (duck-brain P15). The
+     /// voltage adaptation and the torque cutoff stay on the register as read.
+     pub battery_offset_v: f64,
++    /// `robotd --dry-run` (duck-brain P22): every read as usual, no write at all — no torque, no
++    /// goal, no P/D. Torque on and off are only noted, so the loop ramps, steps the policy and
++    /// journals its targets as it would, with the servos limp where they lie.
++    pub dry_run: bool,
+ }
+ 
++/// Ticks in a row with no servo answering after which torque is cut on every servo, unverified
++/// (duck-brain P22): 100 ms at 50 Hz, past the loop's three ticks of coasting.
++pub const SILENT_CUTOFF_TICKS: u32 = 5;
++
+ impl Default for FeetechConfig {
+     fn default() -> Self {
+         Self {
+@@ -101,6 +109,7 @@ impl Default for FeetechConfig {
+             speed_rad_per_count: TAU / feetech::COUNTS_PER_TURN,
+             temperature_every: 50,
+             battery_offset_v: 0.0,
++            dry_run: false,
+         }
+     }
+ }
+@@ -159,6 +168,8 @@ struct Stats {
+     v_smoothed: Option<f64>,
+     adapt: f64,
+     cutoff: bool,
++    silent_cutoff: bool,
++    dry_run: bool,
+     torque: Option<bool>,
+     rewrites: u64,
+     write_failures: u64,
+@@ -205,6 +216,11 @@ pub struct FeetechSnapshot {
+     pub temps_c: [Option<f64>; NUM_JOINTS],
+     pub errors: [u8; NUM_JOINTS],
+     pub cutoff: bool,
++    /// Torque was cut because no servo answered for [`SILENT_CUTOFF_TICKS`] (P22), and has not
++    /// been switched on since.
++    pub silent_cutoff: bool,
++    /// Nothing is written to the servos (`--dry-run`, P22).
++    pub dry_run: bool,
+     pub torque: Option<bool>,
+     pub rewrites: u64,
+     pub write_failures: u64,
+@@ -265,6 +281,8 @@ impl FeetechShared {
+             temps_c: s.temps,
+             errors: s.errors,
+             cutoff: s.cutoff,
++            silent_cutoff: s.silent_cutoff,
++            dry_run: s.dry_run,
+             torque: s.torque,
+             rewrites: s.rewrites,
+             write_failures: s.write_failures,
+@@ -317,6 +335,10 @@ pub struct FeetechIo<P: Port = SerialPort> {
+     v_smoothed: Option<f64>,
+     low_ticks: u32,
+     cutoff: bool,
++    /// Reads in a row that no servo answered (P22).
++    silent_ticks: u32,
++    /// Torque was cut on a silent bus, unverified: cut it again, verified, once servos answer.
++    off_pending: bool,
+     kp: Option<u16>,
+     /// The driving network's servo settings (duck-brain P17), `None` for `[feetech]`'s. For the
+     /// 14 joints the policy drives; the mouth always runs at `[feetech]`'s.
+@@ -352,6 +374,7 @@ impl<P: Port> FeetechIo<P> {
+         imu: Arc<ImuFeed>,
+     ) -> Self {
+         let bus = Bus::new(port, cfg.read_timeout, cfg.echo);
++        shared.0.lock().unwrap().dry_run = cfg.dry_run;
+         Self {
+             bus,
+             cfg,
+@@ -365,6 +388,8 @@ impl<P: Port> FeetechIo<P> {
+             v_smoothed: None,
+             low_ticks: 0,
+             cutoff: false,
++            silent_ticks: 0,
++            off_pending: false,
+             kp: None,
+             runtime: None,
+             read_started: None,
+@@ -460,7 +485,42 @@ impl<P: Port> FeetechIo<P> {
+         s.counters = self.bus.counters();
+     }
+ 
++    /// One read that no servo answered (P22). The [`SILENT_CUTOFF_TICKS`]th in a row, with torque
++    /// on, cuts it on every servo: three unverified writes of 40 = 0, since nobody would answer a
++    /// read-back. A servo that hears one goes limp; one that hears none keeps its last goal, as
++    /// before. Back with `robot.relax`, then `init`, as after the undervoltage cutoff.
++    fn note_silent(&mut self) {
++        self.silent_ticks += 1;
++        if self.silent_ticks < SILENT_CUTOFF_TICKS
++            || self.shared.0.lock().unwrap().torque != Some(true)
++        {
++            return;
++        }
++        tracing::error!(
++            ticks = self.silent_ticks,
++            dry_run = self.cfg.dry_run,
++            "no servo answers; torque off on every servo (robot.relax, then init, to bring it back)"
++        );
++        if !self.cfg.dry_run {
++            let off: Vec<(u8, [u8; 1])> = JOINT_IDS.iter().map(|&id| (id, [0u8])).collect();
++            let refs: Vec<(u8, &[u8])> = off.iter().map(|(id, b)| (*id, b.as_slice())).collect();
++            for _ in 0..3 {
++                if let Err(e) = self.bus.sync_write(reg::TORQUE.0, reg::TORQUE.1, &refs) {
++                    tracing::error!(error = %e, "torque-off write on a silent bus failed");
++                }
++            }
++        }
++        self.off_pending = !self.cfg.dry_run;
++        let mut s = self.shared.0.lock().unwrap();
++        s.torque = Some(false);
++        s.silent_cutoff = true;
++    }
++
+     fn torque_off_all(&mut self) -> Result<()> {
++        if self.cfg.dry_run {
++            self.shared.0.lock().unwrap().torque = Some(false);
++            return Ok(());
++        }
+         let mut rewrites = 0u64;
+         let failed = feetech::torque_off(
+             &mut self.bus,
+@@ -545,10 +605,13 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+             && self.tick % u64::from(self.cfg.temperature_every) == 1;
+         let len = if with_temperature { 8 } else { 7 };
+ 
+-        let answers = self
+-            .bus
+-            .sync_read(&JOINT_IDS, reg::POSITION.0, len)
+-            .map_err(|e| IoError::Bus(format!("tick sync_read: {e}")))?;
++        let answers = match self.bus.sync_read(&JOINT_IDS, reg::POSITION.0, len) {
++            Ok(answers) => answers,
++            Err(e) => {
++                self.note_silent();
++                return Err(IoError::Bus(format!("tick sync_read: {e}")));
++            }
++        };
+ 
+         let mut v_min: Option<f64> = None;
+         let mut answered = 0usize;
+@@ -672,12 +735,22 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+         };
+ 
+         if answered == 0 {
++            self.note_silent();
+             return Err(IoError::ShortRead {
+                 what: "servo answers",
+                 expected: NUM_JOINTS,
+                 got: 0,
+             });
+         }
++        self.silent_ticks = 0;
++        if self.off_pending {
++            // A cut bus line rather than lost servo power: they kept their torque. Now they hear.
++            self.off_pending = false;
++            tracing::warn!("servos answer again after the silent-bus cutoff; torque off, verified");
++            if let Err(e) = self.torque_off_all() {
++                tracing::error!(error = %e, "torque off after the silent bus did not take everywhere");
++            }
++        }
+         Ok(Sensors {
+             positions: self.positions,
+             velocities: self.velocities,
+@@ -707,9 +780,11 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+             bytes.push((id, raw.to_le_bytes()));
+         }
+         let refs: Vec<(u8, &[u8])> = bytes.iter().map(|(id, b)| (*id, b.as_slice())).collect();
+-        self.bus
+-            .sync_write(reg::GOAL.0, reg::GOAL.1, &refs)
+-            .map_err(|e| IoError::Bus(format!("sync_write goal: {e}")))?;
++        if !self.cfg.dry_run {
++            self.bus
++                .sync_write(reg::GOAL.0, reg::GOAL.1, &refs)
++                .map_err(|e| IoError::Bus(format!("sync_write goal: {e}")))?;
++        }
+         let obs_age = self.read_started.map(|t| t.elapsed());
+         if let Some(a) = obs_age {
+             let mut s = self.shared.0.lock().unwrap();
+@@ -727,6 +802,10 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+     }
+ 
+     fn set_gain(&mut self, kp: u16) -> Result<()> {
++        if self.cfg.dry_run {
++            self.kp = Some(kp);
++            return Ok(());
++        }
+         // Only the servos that answer: a silent one would cost every verification attempt a
+         // full timeout, and the tick with it. It gets its gain with the next torque-on.
+         let ids = self.present_ids();
+@@ -767,6 +846,17 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+         if !on {
+             return self.torque_off_all();
+         }
++        if self.cfg.dry_run {
++            tracing::warn!("dry run: torque on is only noted; the servos stay limp");
++            self.cutoff = false;
++            self.low_ticks = 0;
++            self.silent_ticks = 0;
++            let mut s = self.shared.0.lock().unwrap();
++            s.torque = Some(true);
++            s.cutoff = false;
++            s.silent_cutoff = false;
++            return Ok(());
++        }
+         // The 14 joints the policy drives first, then the mouth on its own: the policy has no
+         // action for the mouth, and the time that matters to walking is the 14's. The joints at
+         // the driving network's P/D when it has its own (P17), the mouth at `[feetech]`'s.
+@@ -846,9 +936,12 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+         if failed.is_empty() {
+             self.cutoff = false;
+             self.low_ticks = 0;
++            self.silent_ticks = 0;
++            self.off_pending = false;
+             let mut s = self.shared.0.lock().unwrap();
+             s.torque = Some(true);
+             s.cutoff = false;
++            s.silent_cutoff = false;
+             Ok(())
+         } else {
+             self.shared.0.lock().unwrap().torque = Some(false);
+@@ -920,7 +1013,7 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+             },
+             "servo settings of the 14 joints"
+         );
+-        if self.shared.0.lock().unwrap().torque != Some(true) {
++        if self.cfg.dry_run || self.shared.0.lock().unwrap().torque != Some(true) {
+             return Ok(());
+         }
+         let mouth = JOINT_IDS[MOUTH_INDEX];
+@@ -969,6 +1062,28 @@ impl<P: Port> RobotIo for FeetechIo<P> {
+     }
+ }
+ 
++/// robotd stopping — Ctrl+C, SIGTERM, the end of the loop, a panic unwinding through it — takes
++/// torque off every servo (duck-brain P22, Alex 07.11.2026): a duck is not left stiff with nothing
++/// driving it. A standing duck then falls; `robot.relax` first is still the gentle way. Only when
++/// this run switched torque on (an IO dropped while waiting for its servos writes nothing), and
++/// never in a dry run, which writes nothing.
++impl<P: Port> Drop for FeetechIo<P> {
++    fn drop(&mut self) {
++        if self.cfg.dry_run || self.shared.0.lock().unwrap().torque != Some(true) {
++            return;
++        }
++        tracing::warn!("stopping: torque off on every servo");
++        for attempt in 1..=3u32 {
++            match self.torque_off_all() {
++                Ok(()) => return,
++                Err(e) => {
++                    tracing::warn!(error = %e, attempt, "torque off at stop did not take everywhere")
++                }
++            }
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -1287,6 +1402,160 @@ mod tests {
+         assert_eq!(io.shared().snapshot().torque, Some(true));
+     }
+ 
++    /// `--dry-run` (P22): reads as usual, not one write on the bus — torque on, goals, gain, a
++    /// network's P/D, torque off, and the drop — while the loop's view and the journal go on.
++    #[test]
++    fn a_dry_run_writes_nothing_and_journals_the_goals() {
++        let mut emu = Emulator::new(&JOINT_IDS);
++        emu.servo_mut(13).unwrap().set(56, 2, 2600);
++        let cfg = FeetechConfig {
++            dry_run: true,
++            ..quick()
++        };
++        let mut io = io(emu, cfg);
++        io.bus_mut().port_mut().log.clear();
++        let before = io.bus_mut().port_mut().servo(13).unwrap().regs;
++        io.set_torque(true).unwrap();
++        let s = io.read().unwrap();
++        let mut goal = s.positions;
++        goal[12] += 0.5;
++        io.write(&JointTargets::new(goal)).unwrap();
++        io.set_gain(100).unwrap();
++        io.set_servo_runtime(Some(ServoRuntime {
++            p: 5,
++            d: 0,
++            voltage_adapt: false,
++        }))
++        .unwrap();
++        let j = io.journal().unwrap();
++        assert_ne!(j["goal_raw"][12], 2600, "the goal is journalled");
++        let snap = io.shared().snapshot();
++        assert!(snap.dry_run);
++        assert_eq!(snap.torque, Some(true), "the loop is told torque is on");
++        io.set_torque(false).unwrap();
++        io.set_torque(true).unwrap();
++        let shared = io.shared();
++        let emu = io.bus_mut().port_mut();
++        let writes: Vec<_> = emu
++            .log
++            .iter()
++            .filter(|(_, instr, _)| *instr == feetech::WRITE || *instr == feetech::SYNC_WRITE)
++            .collect();
++        assert!(writes.is_empty(), "{writes:?}");
++        assert!(emu.servo(13).unwrap().regs == before, "registers untouched");
++        drop(io);
++        assert_eq!(
++            shared.snapshot().torque,
++            Some(true),
++            "the drop wrote nothing either"
++        );
++    }
++
++    /// A bus gone silent with torque on (P22): the fifth read nobody answers cuts torque everywhere,
++    /// three unverified writes of 40 = 0; health says so until the next torque-on.
++    #[test]
++    fn a_silent_bus_cuts_torque_on_the_fifth_tick() {
++        let emu = Emulator::new(&JOINT_IDS);
++        let mut io = io(emu, quick());
++        io.set_torque(true).unwrap();
++        for id in JOINT_IDS {
++            io.bus_mut().port_mut().servo_mut(id).unwrap().silent = true;
++        }
++        io.bus_mut().port_mut().log.clear();
++        let torque_writes = |io: &mut FeetechIo<Emulator>| {
++            io.bus_mut()
++                .port_mut()
++                .log
++                .iter()
++                .filter(|(_, instr, addr)| *instr == feetech::SYNC_WRITE && *addr == 40)
++                .count()
++        };
++        for _ in 0..SILENT_CUTOFF_TICKS - 1 {
++            assert!(io.read().is_err());
++        }
++        assert_eq!(torque_writes(&mut io), 0, "not before the fifth");
++        assert!(!io.shared().snapshot().silent_cutoff);
++        assert!(io.read().is_err());
++        assert_eq!(torque_writes(&mut io), 3);
++        let snap = io.shared().snapshot();
++        assert!(snap.silent_cutoff && snap.torque == Some(false));
++        assert!(io.read().is_err());
++        assert_eq!(torque_writes(&mut io), 3, "once");
++        for id in JOINT_IDS {
++            io.bus_mut().port_mut().servo_mut(id).unwrap().silent = false;
++        }
++        io.read().unwrap();
++        let emu = io.bus_mut().port_mut();
++        assert!(
++            JOINT_IDS
++                .iter()
++                .all(|&id| emu.servo(id).unwrap().get(40, 1) == 0),
++            "servos that heard none of the cut get it, verified, once they answer"
++        );
++        assert!(
++            io.shared().snapshot().silent_cutoff,
++            "until torque comes on again"
++        );
++        io.set_torque(true).unwrap();
++        assert!(!io.shared().snapshot().silent_cutoff);
++    }
++
++    /// A port the test keeps a handle on, to see what the driver wrote as it was dropped.
++    struct Kept(Arc<Mutex<Emulator>>);
++
++    impl feetech::Port for Kept {
++        fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
++            self.0.lock().unwrap().send(bytes)
++        }
++        fn recv(&mut self, buf: &mut [u8], timeout: Duration) -> std::io::Result<usize> {
++            self.0.lock().unwrap().recv(buf, timeout)
++        }
++        fn discard_input(&mut self) -> std::io::Result<()> {
++            self.0.lock().unwrap().discard_input()
++        }
++    }
++
++    /// robotd stopping (P22): the driver dropped with torque on takes it off every servo; one that
++    /// never switched it on writes nothing.
++    #[test]
++    fn dropping_the_driver_takes_torque_off() {
++        let emu = Arc::new(Mutex::new(Emulator::new(&JOINT_IDS)));
++        let mut io = FeetechIo::with_port(
++            Kept(Arc::clone(&emu)),
++            quick(),
++            Arc::default(),
++            Arc::new(ImuFeed::new()),
++        );
++        assert!(io.census().unwrap().is_empty());
++        io.set_torque(true).unwrap();
++        assert!(
++            JOINT_IDS
++                .iter()
++                .all(|&id| emu.lock().unwrap().servo(id).unwrap().get(40, 1) == 1)
++        );
++        drop(io);
++        assert!(
++            JOINT_IDS
++                .iter()
++                .all(|&id| emu.lock().unwrap().servo(id).unwrap().get(40, 1) == 0)
++        );
++
++        let emu = Arc::new(Mutex::new(Emulator::new(&JOINT_IDS)));
++        let mut io = FeetechIo::with_port(
++            Kept(Arc::clone(&emu)),
++            quick(),
++            Arc::default(),
++            Arc::new(ImuFeed::new()),
++        );
++        assert!(io.census().unwrap().is_empty());
++        emu.lock().unwrap().log.clear();
++        drop(io);
++        assert!(
++            emu.lock().unwrap().log.is_empty(),
++            "torque was never on: nothing written"
++        );
++    }
++
+     /// The journal's view of a tick: raw positions read (a silent servo as `null`), raw goals sent,
+     /// the voltage factor, and the timings.
+     #[test]
+diff --git a/duck-ipc-proto/src/lib.rs b/duck-ipc-proto/src/lib.rs
+index 6c6d201..a19b188 100644
+--- a/duck-ipc-proto/src/lib.rs
++++ b/duck-ipc-proto/src/lib.rs
+@@ -3759,6 +3759,13 @@ pub struct FeetechHealth {
+     pub adapt: f64,
+     /// Torque was cut for undervoltage and has not been switched on since.
+     pub cutoff: bool,
++    /// Torque was cut because no servo answered for 5 ticks (duck-brain P22) and has not been
++    /// switched on since.
++    #[serde(default)]
++    pub silent_cutoff: bool,
++    /// `robotd --dry-run` (P22): nothing is written to the servos.
++    #[serde(default)]
++    pub dry_run: bool,
+     /// Last torque state written, `None` before the first.
+     pub torque: Option<bool>,
+     /// Register writes that read back different and were rewritten; writes that never did.
+diff --git a/robotd/src/feetech_bus.rs b/robotd/src/feetech_bus.rs
+index 96dd8b3..d6a206f 100644
+--- a/robotd/src/feetech_bus.rs
++++ b/robotd/src/feetech_bus.rs
+@@ -51,6 +51,7 @@ pub fn config(params: &Params) -> FeetechConfig {
+         // About once a second.
+         temperature_every: params.control.hz.max(1),
+         battery_offset_v: f.battery_offset_v,
++        dry_run: false,
+     }
+ }
+ 
+@@ -63,8 +64,18 @@ pub async fn open_waiting(
+     params: &Params,
+     state: &RobotState,
+     imu: Arc<ImuFeed>,
++    dry_run: bool,
+ ) -> Option<FeetechIo> {
+-    let cfg = config(params);
++    let cfg = FeetechConfig {
++        dry_run,
++        ..config(params)
++    };
++    if dry_run {
++        tracing::warn!(
++            "--dry-run: the servos and the IMU are read, the policy runs and its targets go to the \
++             journal; nothing is written to the servos — no torque, no goal, no P/D"
++        );
++    }
+     let shared = Arc::new(FeetechShared::default());
+     let port = params.bus.port.as_str();
+     let mut io: Option<FeetechIo> = None;
+@@ -152,6 +163,8 @@ pub fn health(shared: &FeetechShared) -> proto::FeetechHealth {
+         volts_smoothed: s.v_smoothed,
+         adapt: s.adapt,
+         cutoff: s.cutoff,
++        silent_cutoff: s.silent_cutoff,
++        dry_run: s.dry_run,
+         torque: s.torque,
+         rewrites: s.rewrites,
+         write_failures: s.write_failures,
+diff --git a/robotd/src/main.rs b/robotd/src/main.rs
+index 6cf4872..9480509 100644
+--- a/robotd/src/main.rs
++++ b/robotd/src/main.rs
+@@ -303,6 +303,13 @@ struct Args {
+     #[arg(long)]
+     static_imu: bool,
+ 
++    /// With `[bus] driver = "feetech"`: read the servos and the IMU, run the loop and the policy,
++    /// journal the targets — and write nothing to the servos: no torque, no goal, no P/D (duck-brain
++    /// P22). `robot.enable` then ramps and steps the policy as usual over limp servos. Needs
++    /// `--journal`, which is where the targets go.
++    #[arg(long, requires = "journal", conflicts_with_all = ["fake", "sim"])]
++    dry_run: bool,
++
+     /// Write the tick journal to this file (duck-brain P13): one JSON line per control tick — the
+     /// policy's input and output, the targets, what the servos reported and were sent — for
+     /// replaying a run through the same network on a PC (`scripts/replay_journal.py`). About
+@@ -956,6 +963,15 @@ impl RobotState {
+             return degraded(format!("the last policy change did not take — {reason}"));
+         }
+ 
++        // A bus that went silent with torque on (duck-brain P22).
++        if self.feetech.get().is_some_and(|f| f.snapshot().silent_cutoff) {
++            return degraded(
++                "no servo answered for 5 ticks; torque was cut on every servo — check servo power \
++                 and the bus, then robotctl robot relax and init"
++                    .into(),
++            );
++        }
++
+         // The pack, not the release (duck-brain P11): degraded, like a missing servo.
+         if self.feetech.get().is_some_and(|f| f.snapshot().cutoff) {
+             return degraded(
+@@ -1105,6 +1121,13 @@ async fn main() -> ExitCode {
+         return body_imu::bench(&params, solve);
+     }
+ 
++    // P22: a dry run is the Feetech daemon's, nothing else's — a flag that silently did nothing on
++    // another bus or under a subcommand would be a robot moving that was meant not to.
++    if args.dry_run && (params.bus.driver != robotd_params::BusDriver::Feetech || args.command.is_some()) {
++        tracing::error!("--dry-run is for the daemon on [bus] driver = \"feetech\" only");
++        return ExitCode::FAILURE;
++    }
++
+     if let Some(Command::Init { duration }) = args.command {
+         // init opens the motor bus itself. Keep ownership until the whole ramp returns,
+         // so neither a daemon nor another init can join it partway through.
+@@ -1327,6 +1350,7 @@ fn spawn_control_thread(
+     let fake = args.fake;
+     let sim = args.sim.clone();
+     let static_imu = args.static_imu;
++    let dry_run = args.dry_run;
+     let bus = params.bus.clone();
+     let params = params.clone();
+     // So a reload can re-read `[policy]` without a restart. The path rather than the loaded
+@@ -1394,7 +1418,7 @@ fn spawn_control_thread(
+                 }));
+                 runtime.block_on(async move {
+                     let waiting_voice = WaitingVoice::start(&params, Arc::clone(&intents));
+-                    let io = feetech_bus::open_waiting(&params, &state, imu).await;
++                    let io = feetech_bus::open_waiting(&params, &state, imu, dry_run).await;
+                     drop(waiting_voice);
+                     if let Some(io) = io {
+                         control_loop(io, state, intents, params, params_path, period, poweroff).await;
+-- 
+2.43.0
+

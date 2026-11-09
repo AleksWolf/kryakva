@@ -1,0 +1,72 @@
+// Duck overlay for the Zero 3W: I2S3-M0 (amplifier and microphone, clocks always running), I2C4-M0 and I2C5-M0 (ToF).
+// Based on rk3568-i2s3-m0 from radxa-pkg/radxa-overlays, without its fragment
+// "&i2c3 { status = disabled }": the IMU is on I2C3.
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "radxa,zero3";
+
+	fragment@0 {
+		target-path = "/";
+		__overlay__ {
+			duck_dummy_codec: duck-dummy-codec {
+				compatible = "rockchip,dummy-codec";
+				#sound-dai-cells = <0>;
+			};
+
+			duck-sound {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				compatible = "simple-audio-card";
+				simple-audio-card,format = "i2s";
+				simple-audio-card,mclk-fs = <256>;
+				simple-audio-card,name = "duck-i2s3";
+
+				simple-audio-card,dai-link@0 {
+					reg = <0>;
+					format = "i2s";
+
+					cpu {
+						sound-dai = <&i2s3_2ch>;
+					};
+
+					codec {
+						sound-dai = <&duck_dummy_codec>;
+					};
+				};
+			};
+		};
+	};
+
+	fragment@1 {
+		target = <&i2s3_2ch>;
+		__overlay__ {
+			pinctrl-names = "default";
+			pinctrl-0 = <&i2s3m0_sclk &i2s3m0_lrck &i2s3m0_sdi &i2s3m0_sdo>;
+			rockchip,clk-trcm = <1>;
+			rockchip,always-on;	/* keep the clocks running: the amplifier SD is switched while the clocks run (duck_amp.py) */
+			status = "okay";
+		};
+	};
+
+	fragment@2 {
+		target = <&i2c4>;
+		__overlay__ {
+			pinctrl-names = "default";
+			pinctrl-0 = <&i2c4m0_xfer>;
+			clock-frequency = <400000>;
+			status = "okay";
+		};
+	};
+
+	fragment@3 {
+		target = <&i2c5>;
+		__overlay__ {
+			pinctrl-names = "default";
+			pinctrl-0 = <&i2c5m0_xfer>;
+			clock-frequency = <400000>;
+			status = "okay";
+		};
+	};
+};

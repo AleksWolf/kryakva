@@ -1,0 +1,352 @@
+From 71945829df943e6c38cae638efc25bfbe8cfdf8e Mon Sep 17 00:00:00 2001
+From: duck-brain <duck-brain@localhost>
+Date: Sun, 8 Nov 2026 16:23:10 +0000
+Subject: [PATCH] duck-brain P28: the tick journal never overwrites a run, and
+ is out within 2 s
+
+Alex, 08.11: a restart of robotd with the same --journal truncated a walk
+of 18 057 ticks.
+- A journal path that exists is never truncated: the new run goes to
+  <stem>-<UTC start time>.<ext> beside it (-2, -3 if taken), and robotd
+  logs the path it writes.
+- The batch period drops from 180 s to 2 s: the journal lives in RAM
+  (/run, /tmp) on the duck, where a batch costs nothing, and the 180 s was
+  for the SD card. A relax (any kind: torque off), a change of the fall
+  verdict and a change of the driving network write it out at once,
+  after that tick's line.
+A robotd that dies loses at most the last 2 s. A file in RAM is itself
+lost at power-off, whatever the batches.
+---
+ robotd/src/journal.rs | 181 ++++++++++++++++++++++++++++++++++++++----
+ robotd/src/main.rs    |  20 ++++-
+ 2 files changed, 182 insertions(+), 19 deletions(-)
+
+diff --git a/robotd/src/journal.rs b/robotd/src/journal.rs
+index 3cf41df..aafe0b1 100644
+--- a/robotd/src/journal.rs
++++ b/robotd/src/journal.rs
+@@ -11,10 +11,14 @@
+ //! and hands it over, and never waits on a disk. A full queue drops the line and counts it; the
+ //! count is written at the end, so a journal with holes says so.
+ //!
+-//! **To the card in batches** (duck-brain P14): lines collect in memory and go to the file, and
+-//! through `fdatasync` to the card, every `--journal-flush-s` seconds (180 by default) or when
+-//! [`BUFFER`] fills, whichever is first — and at the end. A power cut loses at most that batch;
+-//! the SD card sees a few large writes instead of one every second.
++//! **In batches** (duck-brain P14, P28): lines collect in memory and go to the file, through
++//! `fdatasync`, every `--journal-flush-s` seconds — 2 by default since P28, when the journal moved
++//! to RAM (`/run`, `/tmp`) and a batch costs nothing; it was 180 for the SD card — or when [`BUFFER`]
++//! fills, and at once on [`Journal::flush_now`] (a relax, a fall, a change of network), and at the
++//! end. What a robotd that dies loses is the last batch. A file in RAM is itself lost at power-off.
++//!
++//! **Never over an earlier run** (P28): a path that already exists is not truncated; the journal
++//! goes to `<stem>-<UTC start time>.<ext>` beside it instead ([`free_path`]).
+ 
+ use std::io::Write;
+ use std::path::Path;
+@@ -34,29 +38,96 @@ pub const BUFFER: usize = 16 << 20;
+ pub const MAX_BYTES: usize = 256 << 20;
+ 
+ /// The default batch period.
+-pub const FLUSH_EVERY: std::time::Duration = std::time::Duration::from_secs(180);
++pub const FLUSH_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
++
++/// What the control thread hands the writer.
++enum Msg {
++    Line(String),
++    /// Everything so far to the file now (P28).
++    Flush,
++}
++
++/// `path` if nothing is there; otherwise `<stem>-<YYYYMMDD-HHMMSS UTC>.<ext>` beside it, with
++/// `-2`, `-3`… if that is taken too (P28). A board without an RTC may say 1970 until NTP has run:
++/// the name is still new.
++pub fn free_path(path: &Path) -> std::path::PathBuf {
++    if !path.exists() {
++        return path.to_path_buf();
++    }
++    let stem = path
++        .file_stem()
++        .map(|s| s.to_string_lossy().into_owned())
++        .unwrap_or_default();
++    let ext = path
++        .extension()
++        .map(|e| format!(".{}", e.to_string_lossy()))
++        .unwrap_or_default();
++    let stamp = utc_stamp(std::time::SystemTime::now());
++    let mut n = 1;
++    loop {
++        let name = if n == 1 {
++            format!("{stem}-{stamp}{ext}")
++        } else {
++            format!("{stem}-{stamp}-{n}{ext}")
++        };
++        let candidate = path.with_file_name(name);
++        if !candidate.exists() {
++            return candidate;
++        }
++        n += 1;
++    }
++}
++
++/// `YYYYMMDD-HHMMSS`, UTC (days to a civil date: Howard Hinnant's `civil_from_days`).
++fn utc_stamp(t: std::time::SystemTime) -> String {
++    let secs = t
++        .duration_since(std::time::UNIX_EPOCH)
++        .map_or(0, |d| d.as_secs()) as i64;
++    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
++    let z = days + 719_468;
++    let era = z.div_euclid(146_097);
++    let doe = z - era * 146_097;
++    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
++    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
++    let mp = (5 * doy + 2) / 153;
++    let d = doy - (153 * mp + 2) / 5 + 1;
++    let m = if mp < 10 { mp + 3 } else { mp - 9 };
++    let y = yoe + era * 400 + i64::from(m <= 2);
++    format!(
++        "{y:04}{m:02}{d:02}-{:02}{:02}{:02}",
++        rem / 3600,
++        rem % 3600 / 60,
++        rem % 60
++    )
++}
+ 
+ pub struct Journal {
+-    tx: Option<SyncSender<String>>,
++    tx: Option<SyncSender<Msg>>,
++    /// Where it is being written — `free_path` of what was asked for.
++    pub path: std::path::PathBuf,
+     thread: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+     pub dropped: u64,
+     pub written: u64,
+ }
+ 
+ impl Journal {
+-    /// Create `path` (truncating) and write `header` as its first line; then a batch to the card
+-    /// every `flush_every`.
++    /// Create a new file at [`free_path`] of `path` — never truncating one — and write `header` as
++    /// its first line; then a batch every `flush_every`.
+     pub fn open(
+         path: &Path,
+         header: &serde_json::Value,
+         flush_every: std::time::Duration,
+     ) -> std::io::Result<Self> {
+-        let file = std::fs::File::create(path)?;
++        let path = free_path(path);
++        let file = std::fs::OpenOptions::new()
++            .write(true)
++            .create_new(true)
++            .open(&path)?;
+         let mut out = std::io::BufWriter::with_capacity(BUFFER, file);
+         serde_json::to_writer(&mut out, header)?;
+         out.write_all(b"\n")?;
+         batch(&mut out)?;
+-        let (tx, rx) = sync_channel::<String>(QUEUE);
++        let (tx, rx) = sync_channel::<Msg>(QUEUE);
+         let thread = std::thread::Builder::new()
+             .name("journal".into())
+             .spawn(move || {
+@@ -67,8 +138,9 @@ impl Journal {
+                 loop {
+                     let wait = due.saturating_duration_since(std::time::Instant::now());
+                     match rx.recv_timeout(wait) {
++                        Ok(Msg::Flush) => due = std::time::Instant::now(),
+                         // The end line always goes in, so the counts survive a full journal.
+-                        Ok(line)
++                        Ok(Msg::Line(line))
+                             if bytes + line.len() < MAX_BYTES || line.starts_with("{\"end\"") =>
+                         {
+                             // A full buffer goes to the file by itself (BufWriter); the
+@@ -77,7 +149,7 @@ impl Journal {
+                             out.write_all(line.as_bytes())?;
+                             out.write_all(b"\n")?;
+                         }
+-                        Ok(_) => {
++                        Ok(Msg::Line(_)) => {
+                             if !full {
+                                 full = true;
+                                 tracing::warn!(
+@@ -101,16 +173,25 @@ impl Journal {
+             })?;
+         Ok(Self {
+             tx: Some(tx),
++            path,
+             thread: Some(thread),
+             dropped: 0,
+             written: 0,
+         })
+     }
+ 
++    /// Everything queued so far to the file at once (P28): a relax, a fall, a change of network —
++    /// the moments a run is read back for. Never blocks; a full queue just waits for the batch.
++    pub fn flush_now(&self) {
++        if let Some(tx) = &self.tx {
++            let _ = tx.try_send(Msg::Flush);
++        }
++    }
++
+     /// Queue one record; never blocks.
+     pub fn write(&mut self, record: &serde_json::Value) {
+         let Some(tx) = &self.tx else { return };
+-        match tx.try_send(record.to_string()) {
++        match tx.try_send(Msg::Line(record.to_string())) {
+             Ok(()) => self.written += 1,
+             Err(TrySendError::Full(_)) => self.dropped += 1,
+             Err(TrySendError::Disconnected(_)) => {
+@@ -130,10 +211,10 @@ fn batch(out: &mut std::io::BufWriter<std::fs::File>) -> std::io::Result<()> {
+ impl Drop for Journal {
+     fn drop(&mut self) {
+         if let Some(tx) = self.tx.take() {
+-            let _ = tx.send(
++            let _ = tx.send(Msg::Line(
+                 serde_json::json!({ "end": { "written": self.written, "dropped": self.dropped } })
+                     .to_string(),
+-            );
++            ));
+         }
+         if let Some(thread) = self.thread.take() {
+             match thread.join() {
+@@ -200,4 +281,74 @@ mod tests {
+         drop(j);
+         assert_eq!(lines(&path), 12, "and the end line at the end");
+     }
++
++    /// P28: a journal never overwrites an earlier run. The path taken goes to a new file beside it,
++    /// named by the start time; the old one is left byte for byte.
++    #[test]
++    fn an_earlier_journal_is_never_overwritten() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("walk.jsonl");
++        std::fs::write(&path, "18057 ticks of a walk\n").unwrap();
++        let header = serde_json::json!({ "journal": 1 });
++        let first = Journal::open(&path, &header, FLUSH_EVERY).unwrap();
++        let second = Journal::open(&path, &header, FLUSH_EVERY).unwrap();
++        let (a, b) = (first.path.clone(), second.path.clone());
++        drop((first, second));
++        assert_eq!(
++            std::fs::read_to_string(&path).unwrap(),
++            "18057 ticks of a walk\n"
++        );
++        assert_ne!(a, path);
++        assert_ne!(a, b, "two in the same second do not share a name");
++        let name = a.file_name().unwrap().to_string_lossy().into_owned();
++        assert!(
++            name.starts_with("walk-")
++                && name.ends_with(".jsonl")
++                && name.len() == "walk-20261108-160155.jsonl".len(),
++            "{name}"
++        );
++        for p in [&a, &b] {
++            assert!(
++                std::fs::read_to_string(p)
++                    .unwrap()
++                    .starts_with("{\"journal\":1}")
++            );
++        }
++        // A free path is used as it is.
++        let fresh = dir.path().join("fresh.jsonl");
++        assert_eq!(free_path(&fresh), fresh);
++    }
++
++    #[test]
++    fn the_stamp_is_utc() {
++        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_794_153_715); // 2026-11-08T16:01:55Z
++        assert_eq!(utc_stamp(t), "20261108-160155");
++        assert_eq!(utc_stamp(std::time::UNIX_EPOCH), "19700101-000000");
++        let leap = std::time::UNIX_EPOCH + std::time::Duration::from_secs(951_782_400); // 2000-02-29
++        assert_eq!(utc_stamp(leap), "20000229-000000");
++    }
++
++    /// P28: `flush_now` writes what is queued at once, however long the batch period.
++    #[test]
++    fn flush_now_writes_at_once() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("j.jsonl");
++        let lines = |p: &Path| std::fs::read_to_string(p).unwrap().lines().count();
++        let mut j = Journal::open(
++            &path,
++            &serde_json::json!({ "journal": 1 }),
++            std::time::Duration::from_secs(600),
++        )
++        .unwrap();
++        for i in 0..5 {
++            j.write(&serde_json::json!({ "tick": i }));
++        }
++        j.flush_now();
++        std::thread::sleep(std::time::Duration::from_millis(200));
++        assert_eq!(
++            lines(&path),
++            6,
++            "header and the five, long before the period"
++        );
++    }
+ }
+diff --git a/robotd/src/main.rs b/robotd/src/main.rs
+index b4c8445..ad241ee 100644
+--- a/robotd/src/main.rs
++++ b/robotd/src/main.rs
+@@ -372,15 +372,17 @@ struct Args {
+     #[arg(long)]
+     lift_relax_load: Option<f64>,
+ 
+-    /// Write the tick journal to this file (duck-brain P13): one JSON line per control tick — the
++    /// Write the tick journal to this file (duck-brain P13; never over an earlier one — a path that
++    /// exists gets a `-<UTC start time>` name beside it, P28): one JSON line per control tick — the
+     /// policy's input and output, the targets, what the servos reported and were sent — for
+     /// replaying a run through the same network on a PC (`scripts/replay_journal.py`). About
+     /// 100 kB/s; for bench runs, not for every day.
+     #[arg(long)]
+     journal: Option<PathBuf>,
+ 
+-    /// How often the tick journal goes to the card, seconds (duck-brain P14): lines collect in
+-    /// memory and are written and synced in one batch, not one line at a time.
++    /// How often the tick journal goes to the file, seconds (duck-brain P14; 2 by default since P28,
++    /// when it moved to RAM): lines collect in memory and are written and synced in one batch.
++    /// A relax, a fall and a change of network write it out at once whatever this says.
+     #[arg(long, default_value_t = journal::FLUSH_EVERY.as_secs())]
+     journal_flush_s: u64,
+ 
+@@ -2441,6 +2443,9 @@ async fn control_loop<T: RobotIo>(
+     // The tick journal (duck-brain P13), when `--journal` asked for one.
+     let journal_started = Instant::now();
+     let mut journal_tick = 0u64;
++    // P28: what changes write the journal out at once — torque off (any relax), the fall verdict,
++    // the network driving.
++    let mut journal_seen: Option<(bool, bool, String)> = None;
+     // duck-brain P25: the stand-alone stops, and the lift rule's state.
+     let standalone = state.standalone.get().copied().unwrap_or_default();
+     let mut lift = LiftWatch::default();
+@@ -2461,7 +2466,7 @@ async fn control_loop<T: RobotIo>(
+         });
+         match journal::Journal::open(path, &header, *every) {
+             Ok(j) => {
+-                tracing::warn!(path = %path.display(), every_s = every.as_secs(), "writing the tick journal, in batches");
++                tracing::warn!(path = %j.path.display(), every_s = every.as_secs(), "writing the tick journal, in batches");
+                 Some(j)
+             }
+             Err(e) => {
+@@ -4263,6 +4268,9 @@ async fn control_loop<T: RobotIo>(
+         }
+ 
+         if let Some(j) = journal.as_mut() {
++            let now_seen = (bringup == Bringup::Limp, safety.fallen(), policy_label.to_string());
++            let flush_after = journal_seen.as_ref().is_some_and(|seen| *seen != now_seen);
++            journal_seen = Some(now_seen);
+             journal_tick += 1;
+             let read = fresh.as_ref();
+             j.write(&serde_json::json!({
+@@ -4282,6 +4290,10 @@ async fn control_loop<T: RobotIo>(
+                 })),
+                 "bus": safety.journal(),
+             }));
++            // After this tick's line, so the moment itself is in the file.
++            if flush_after {
++                j.flush_now();
++            }
+         }
+ 
+         vettally.tick(&vetbook::Facts {
+-- 
+2.43.0
+

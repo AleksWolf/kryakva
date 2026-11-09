@@ -1,0 +1,12 @@
+[Unit]
+Description=Amplifier MAX98357A: SD high only while sound is playing
+After=sound.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/duck_amp.py
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
