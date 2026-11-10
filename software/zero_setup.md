@@ -43,6 +43,17 @@ After the script, reboot the board (`sudo reboot`), and within 5 minutes after b
 Check after reboot: `i2cdetect -y 5` sees the ToF (0x29), `i2cdetect -y 3` — the IMU (0x6a), `aplay -l` — the `duck-i2s3` card,
 `ls /dev/video0` — the camera.
 
+**ToF calibration.** Without it the rangefinder shows everything closer than 60 cm as nearer than it is. Do it once, on the assembled duck:
+
+1. Put the duck 600 mm in front of a light, plain wall, with the ToF looking straight at it. Nothing else should be in its field of view.
+2. Run the calibration; it saves `xtalk.bin` next to `tof_check`:
+   ```
+   cd /home/duck/zero && TOF_CAL="80 600" ./tof_check 5 20
+   ```
+3. Check: `TOF_XTALK=1 ./tof_check 5 20` shows a center of about 600 mm.
+
+The duck page loads `xtalk.bin` by itself.
+
 A sound file starts with at least 50 ms of silence and ends with zeros.
 
 ## 2. DualSense gamepad

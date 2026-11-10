@@ -187,7 +187,10 @@ def cam_read(out):
 
 
 def tof():
-    feed("tof", [TOF, "5", "0"], tof_read)
+    # with the crosstalk calibration (zero_setup.md, ToF calibration) if it has been made
+    xtalk = os.path.exists(os.path.join(os.path.dirname(TOF), "xtalk.bin"))
+    argv = ["sh", "-c", f"cd {os.path.dirname(TOF)} && TOF_XTALK=1 exec {TOF} 5 0"] if xtalk else [TOF, "5", "0"]
+    feed("tof", argv, tof_read)
 
 
 def camera():

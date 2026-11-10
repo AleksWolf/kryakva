@@ -11,6 +11,9 @@
 #include <unistd.h>
 
 #include "vl53l8cx_api.h"
+#include "vl53l8cx_plugin_xtalk.h"
+
+#define XTALK_FILE "xtalk.bin"   /* crosstalk calibration (ST UM3109 §3.2), in the current folder */
 
 #define ADDR 0x29
 #define CHUNK 4096
@@ -117,6 +120,30 @@ int main(int argc, char **argv)
 	printf("firmware: status %u, %.1f s\n", status, now() - t0);
 	if (status)
 		return 3;
+	static uint8_t xt[VL53L8CX_XTALK_BUFFER_SIZE];
+	if (getenv("TOF_CAL")) {   /* TOF_CAL="<reflectance %> <distance mm>": target covers the whole field of view, at least 600 mm away */
+		int refl = 0, dist = 0;
+		sscanf(getenv("TOF_CAL"), "%d %d", &refl, &dist);
+		t0 = now();
+		status = vl53l8cx_calibrate_xtalk(&dev, (uint16_t)refl, 16, (uint16_t)dist);
+		printf("calibration: reflectance %d %%, %d mm, 16 samples, status %u, %.1f s\n", refl, dist, status, now() - t0);
+		if (status)
+			return 6;
+		status = vl53l8cx_get_caldata_xtalk(&dev, xt);
+		FILE *f = fopen(XTALK_FILE, "wb");
+		if (status || !f || fwrite(xt, 1, sizeof xt, f) != sizeof xt)
+			return 7;
+		fclose(f);
+		printf("saved %s, %zu bytes\n", XTALK_FILE, sizeof xt);
+	}
+	if (getenv("TOF_XTALK")) {   /* load the saved calibration before ranging */
+		FILE *f = fopen(XTALK_FILE, "rb");
+		if (!f || fread(xt, 1, sizeof xt, f) != sizeof xt)
+			return 8;
+		fclose(f);
+		status = vl53l8cx_set_caldata_xtalk(&dev, xt);
+		printf("calibration loaded: status %u\n", status);
+	}
 	status = vl53l8cx_set_resolution(&dev, VL53L8CX_RESOLUTION_8X8);
 	status |= vl53l8cx_set_ranging_frequency_hz(&dev, HZ);
 	status |= vl53l8cx_start_ranging(&dev);
