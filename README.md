@@ -11,7 +11,8 @@
   <a href="https://alekswolf.github.io/kryakva/docs/assembly/index.html">Assembly guide</a> ·
   <a href="hardware/wiring.md">Wiring</a> ·
   <a href="software/zero_setup.md">Zero setup</a> ·
-  <a href="training/policies/README.md">Policies</a>
+  <a href="training/policies/README.md">Policies</a> ·
+  <a href="https://discord.gg/8v45FD28s">Discord</a>
 </p>
 
 ---

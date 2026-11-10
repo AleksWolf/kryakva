@@ -11,7 +11,8 @@
   <a href="https://alekswolf.github.io/kryakva/docs/assembly/index.ru.html">Инструкция сборки</a> ·
   <a href="hardware/wiring.ru.md">Подключение</a> ·
   <a href="software/zero_setup.ru.md">Настройка Zero</a> ·
-  <a href="training/policies/README.ru.md">Политики</a>
+  <a href="training/policies/README.ru.md">Политики</a> ·
+  <a href="https://discord.gg/8v45FD28s">Discord</a>
 </p>
 
 ---
