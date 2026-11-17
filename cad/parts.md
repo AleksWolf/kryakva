@@ -57,7 +57,7 @@ Melt the inserts in before assembly, flush with the face.
 
 ## Fasteners
 
-M2 screws are hex socket unless stated otherwise. The layout by joint is in the assembly guide ([docs/assembly](../docs/assembly/index.html)).
+M2 screws are hex socket unless stated otherwise. The layout by joint is in the [assembly guide](https://alekswolf.github.io/kryakva/docs/assembly/index.html).
 
 | Fastener | Qty |
 |---|---|
